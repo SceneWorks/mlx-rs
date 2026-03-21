@@ -1,9 +1,9 @@
 [package]
 name = "pmetal-mlx-rs"
-version = "0.25.7"
+version = "0.25.8"
 authors.workspace = true
 edition.workspace = true
-repository = "https://github.com/oxiglade/mlx-rs"
+repository = "https://github.com/nicholasjpaterno/mlx-rs"
 keywords.workspace = true
 categories.workspace = true
 license.workspace = true
