@@ -63,6 +63,9 @@ pub fn quantize_device(
             group_size,
             bits,
             DEFAULT_MODE.as_ptr(),
+            // global_scale (mlx-c 0.6.0): null = unused for the default "affine" mode
+            // (it is only meaningful for the mxfp4/nvfp4 float-quant modes).
+            mlx_sys::mlx_array_new(),
             stream.as_ref().as_ptr(),
         )
     })?;
@@ -151,6 +154,8 @@ pub fn dequantize_device<'a>(
             group_size,
             bits,
             DEFAULT_MODE.as_ptr(),
+            // global_scale (mlx-c 0.6.0): null = unused for the default "affine" mode.
+            mlx_sys::mlx_array_new(),
             optional_dtype_none(),
             stream.as_ref().as_ptr(),
         )
