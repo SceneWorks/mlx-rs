@@ -87,11 +87,19 @@ fn prepare_mlx_c_source() -> PathBuf {
     //     f32/TF32 only so bf16/f16 fall through to the correct non-NAX kernel
     //     (sc-2714; remove once upstream MLX fixes steel_gemm_fused_nax). The
     //     mlx-gen tripwire `bf16_matmul_sweep.rs` verifies this actually applied.
+    //   - nax-16bit-sdpa-gate.patch : the SDPA twin of the dense-GEMM bug — the
+    //     NAX fused-attention kernel (sdpa_full_self_attention_nax) returns
+    //     garbage for 16-bit q/k/v, so gate it to f32/TF32 only; bf16/f16 fall
+    //     through to the correct non-NAX `sdpa_full` steel kernel (still fused +
+    //     memory-efficient, NOT the O(L²) fallback). Same dispatch condition as
+    //     the dense gate (sc-2770; remove once upstream MLX fixes it). The
+    //     mlx-gen tripwire `sdpa_nax_repro.rs` verifies this actually applied.
     let patches_dir = staged.join("patches");
     std::fs::create_dir_all(&patches_dir).expect("Failed to create patches dir");
     let patch_files = [
         "patches/metallib-search-path.patch",
         "patches/nax-16bit-dense-gate.patch",
+        "patches/nax-16bit-sdpa-gate.patch",
     ];
     let mut combined = String::new();
     for pf in patch_files {
