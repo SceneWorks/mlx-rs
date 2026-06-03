@@ -78,27 +78,50 @@ fn prepare_mlx_c_source() -> PathBuf {
     }
     copy_dir_recursive(&src, &staged).expect("Failed to copy mlx-c to staging");
 
-    // Copy our patch file into the staged source
+    // Copy our patch files into the staged source and concatenate them into a
+    // single multi-file patch. FetchContent allows only one PATCH_COMMAND, so we
+    // apply all MLX source patches with one `git apply` — structurally identical
+    // to the proven single-patch mechanism, and both apply atomically.
+    //   - metallib-search-path.patch : pmetal metallib resolver (device.cpp)
+    //   - nax-16bit-dense-gate.patch : gate the broken NAX 16-bit dense GEMM to
+    //     f32/TF32 only so bf16/f16 fall through to the correct non-NAX kernel
+    //     (sc-2714; remove once upstream MLX fixes steel_gemm_fused_nax). The
+    //     mlx-gen tripwire `bf16_matmul_sweep.rs` verifies this actually applied.
     let patches_dir = staged.join("patches");
     std::fs::create_dir_all(&patches_dir).expect("Failed to create patches dir");
-    std::fs::copy(
+    let patch_files = [
         "patches/metallib-search-path.patch",
-        patches_dir.join("metallib-search-path.patch"),
-    )
-    .expect("Failed to copy metallib patch");
+        "patches/nax-16bit-dense-gate.patch",
+    ];
+    let mut combined = String::new();
+    for pf in patch_files {
+        let name = std::path::Path::new(pf).file_name().unwrap();
+        std::fs::copy(pf, patches_dir.join(name))
+            .unwrap_or_else(|e| panic!("Failed to copy {pf}: {e}"));
+        let body =
+            std::fs::read_to_string(pf).unwrap_or_else(|e| panic!("Failed to read {pf}: {e}"));
+        combined.push_str(&body);
+        if !combined.ends_with('\n') {
+            combined.push('\n');
+        }
+    }
+    std::fs::write(patches_dir.join("combined.patch"), &combined)
+        .expect("Failed to write combined patch");
 
     // Inject PATCH_COMMAND into the FetchContent_Declare for MLX
     let cmake_path = staged.join("CMakeLists.txt");
     let cmake_content =
         std::fs::read_to_string(&cmake_path).expect("Failed to read CMakeLists.txt");
     let patched = cmake_content.replace(
-        "GIT_TAG v0.30.6)",
-        "GIT_TAG v0.30.6\n    PATCH_COMMAND git apply ${CMAKE_CURRENT_SOURCE_DIR}/patches/metallib-search-path.patch || true)",
+        "GIT_TAG v0.31.1)",
+        "GIT_TAG v0.31.1\n    PATCH_COMMAND git apply ${CMAKE_CURRENT_SOURCE_DIR}/patches/combined.patch || true)",
     );
     std::fs::write(&cmake_path, patched).expect("Failed to write patched CMakeLists.txt");
 
-    // Tell cargo to rerun if the patch changes
-    println!("cargo:rerun-if-changed=patches/metallib-search-path.patch");
+    // Tell cargo to rerun if any patch changes
+    for pf in patch_files {
+        println!("cargo:rerun-if-changed={pf}");
+    }
 
     staged
 }
@@ -224,9 +247,10 @@ fn build_and_link_mlx_c() {
                     dest.metadata()
                         .and_then(|d| {
                             metallib.metadata().map(|s| {
-                                s.modified().ok().zip(d.modified().ok()).is_some_and(
-                                    |(src_t, dst_t)| src_t > dst_t,
-                                )
+                                s.modified()
+                                    .ok()
+                                    .zip(d.modified().ok())
+                                    .is_some_and(|(src_t, dst_t)| src_t > dst_t)
                             })
                         })
                         .unwrap_or(false)
@@ -236,14 +260,10 @@ fn build_and_link_mlx_c() {
                 if should_copy {
                     let _ = std::fs::create_dir_all(&cache_dir);
                     match std::fs::copy(&metallib, &dest) {
-                        Ok(_) => println!(
-                            "cargo:warning=Cached mlx.metallib to {}",
-                            dest.display()
-                        ),
-                        Err(e) => println!(
-                            "cargo:warning=Failed to cache mlx.metallib: {}",
-                            e
-                        ),
+                        Ok(_) => {
+                            println!("cargo:warning=Cached mlx.metallib to {}", dest.display())
+                        }
+                        Err(e) => println!("cargo:warning=Failed to cache mlx.metallib: {}", e),
                     }
                 }
             }
