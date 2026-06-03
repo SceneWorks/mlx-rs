@@ -78,6 +78,31 @@ fn prepare_mlx_c_source() -> PathBuf {
     }
     copy_dir_recursive(&src, &staged).expect("Failed to copy mlx-c to staging");
 
+    // sc-2781: patch the STAGED mlx-c fft bindings so mlx-c 0.6.0 compiles against MLX 0.31.2.
+    // 0.31.2 inserted an `FFTNorm norm = FFTNorm::Backward` parameter before `StreamOrDevice s`
+    // across the fftn/ifftn/fft/ifft/rfft/irfft family; mlx-c 0.6.0 calls `fft*(... stream)`, so
+    // `stream` mis-binds to `norm` and won't compile. The patch passes `FFTNorm::Backward`
+    // explicitly at the 12 norm call sites (the 2 shift fns are unchanged), keeping the C API
+    // identical → no Rust-binding cascade. The submodule stays pristine at Apple upstream v0.6.0.
+    // TEMPORARY: drop once Apple tags an mlx-c release that supports 0.31.2 (main already does).
+    // Unlike the MLX combined.patch (applied to the fetched MLX git checkout via CMake
+    // PATCH_COMMAND), this targets the copied mlx-c source tree, so we apply it here with `patch`.
+    let fft_patch =
+        std::fs::canonicalize("patches/mlx-c-fft-norm.patch").expect("find mlx-c-fft-norm.patch");
+    let status = Command::new("patch")
+        .arg("-p1")
+        .arg("-d")
+        .arg(&staged)
+        .arg("-i")
+        .arg(&fft_patch)
+        .status()
+        .expect("Failed to run `patch` for mlx-c-fft-norm.patch");
+    assert!(
+        status.success(),
+        "mlx-c-fft-norm.patch failed to apply to staged mlx-c (sc-2781)"
+    );
+    println!("cargo:rerun-if-changed=patches/mlx-c-fft-norm.patch");
+
     // Copy our patch files into the staged source and concatenate them into a
     // single multi-file patch. FetchContent allows only one PATCH_COMMAND, so we
     // apply all MLX source patches with one `git apply` — structurally identical
@@ -112,13 +137,15 @@ fn prepare_mlx_c_source() -> PathBuf {
     std::fs::write(patches_dir.join("combined.patch"), &combined)
         .expect("Failed to write combined patch");
 
-    // Inject PATCH_COMMAND into the FetchContent_Declare for MLX
+    // Inject PATCH_COMMAND into the FetchContent_Declare for MLX, and bump the fetched MLX tag
+    // v0.31.1 -> v0.31.2 (sc-2781: byte-parity with the 0.31.2 production/golden environments).
+    // The MLX combined.patch (metallib-search-path) still applies via the single CMake PATCH_COMMAND.
     let cmake_path = staged.join("CMakeLists.txt");
     let cmake_content =
         std::fs::read_to_string(&cmake_path).expect("Failed to read CMakeLists.txt");
     let patched = cmake_content.replace(
         "GIT_TAG v0.31.1)",
-        "GIT_TAG v0.31.1\n    PATCH_COMMAND git apply ${CMAKE_CURRENT_SOURCE_DIR}/patches/combined.patch || true)",
+        "GIT_TAG v0.31.2\n    PATCH_COMMAND git apply ${CMAKE_CURRENT_SOURCE_DIR}/patches/combined.patch || true)",
     );
     std::fs::write(&cmake_path, patched).expect("Failed to write patched CMakeLists.txt");
 
