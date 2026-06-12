@@ -107,7 +107,12 @@ fn prepare_mlx_c_source() -> PathBuf {
     // single multi-file patch. FetchContent allows only one PATCH_COMMAND, so we
     // apply all MLX source patches with one `git apply` — structurally identical
     // to the proven single-patch mechanism, and both apply atomically.
-    //   - metallib-search-path.patch : pmetal metallib resolver (device.cpp)
+    //   - metallib-search-path.patch         : pmetal metallib resolver (device.cpp)
+    //   - command-buffer-recoverable.patch   : sc-5009 — turn an async Metal
+    //     command-buffer error (kIOGPUCommandBufferCallbackErrorTimeout / OOM),
+    //     which is reported from a completion handler on an internal Metal thread
+    //     where throwing would `std::terminate`, into a recoverable exception
+    //     surfaced synchronously on the waiting thread (eval -> Result::Err).
     //
     // The sc-2714 (dense GEMM) and sc-2770 (fast SDPA) NAX-dispatch gate patches were
     // REMOVED in sc-2772. Their root cause was never the dispatch or the MLX version: the
@@ -121,7 +126,10 @@ fn prepare_mlx_c_source() -> PathBuf {
     // still assert 16-bit correctness — now they guard the deployment-target fix.
     let patches_dir = staged.join("patches");
     std::fs::create_dir_all(&patches_dir).expect("Failed to create patches dir");
-    let patch_files = ["patches/metallib-search-path.patch"];
+    let patch_files = [
+        "patches/metallib-search-path.patch",
+        "patches/command-buffer-recoverable.patch",
+    ];
     let mut combined = String::new();
     for pf in patch_files {
         let name = std::path::Path::new(pf).file_name().unwrap();
