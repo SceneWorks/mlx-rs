@@ -29,57 +29,66 @@
  // Firstly, search for the metallib in the same path as this binary
  std::pair<MTL::Library*, NS::Error*> load_colocated_library(
      MTL::Device* device,
-@@ -134,38 +156,51 @@
+@@ -134,38 +156,55 @@
  }
 
  MTL::Library* load_default_library(MTL::Device* device) {
 -  NS::Error* error[5];
 +  NS::Error* error[7];
    MTL::Library* lib;
+-  // First try the colocated mlx.metallib
+-  std::tie(lib, error[0]) = load_colocated_library(device, "mlx");
 +
 +  // pmetal: Try env var override first (set by pmetal-cli resolver)
 +  std::tie(lib, error[0]) = load_env_override_library(device);
-+  if (lib) {
-+    return lib;
-+  }
-+
-+  // pmetal: Try user cache directory
-+  std::tie(lib, error[1]) = load_user_cache_library(device);
-+  if (lib) {
-+    return lib;
-+  }
-+
-   // First try the colocated mlx.metallib
--  std::tie(lib, error[0]) = load_colocated_library(device, "mlx");
-+  std::tie(lib, error[2]) = load_colocated_library(device, "mlx");
    if (lib) {
      return lib;
    }
 
 -  std::tie(lib, error[1]) = load_colocated_library(device, "Resources/mlx");
-+  std::tie(lib, error[3]) = load_colocated_library(device, "Resources/mlx");
++  // pmetal (sc-7898): Prefer the metallib built alongside THIS binary (the
++  // compiled-in METAL_PATH) over the shared user cache, so a stale/older
++  // pmetal build can never shadow the current build's own kernels. A
++  // `cargo install` binary has no build dir, so this path is absent and
++  // resolution falls through to the user cache below.
++  std::tie(lib, error[1]) = load_library_from_path(device, default_mtllib_path);
    if (lib) {
      return lib;
    }
 
-   // Then try default.metallib in a SwiftPM bundle if we have one
+-  // Then try default.metallib in a SwiftPM bundle if we have one
 -  std::tie(lib, error[2]) = load_swiftpm_library(device, "default");
-+  std::tie(lib, error[4]) = load_swiftpm_library(device, "default");
++  // pmetal: Try user cache directory (fallback for installed binaries)
++  std::tie(lib, error[2]) = load_user_cache_library(device);
    if (lib) {
      return lib;
    }
 
-   // Try lo load resources from Framework resources if SwiftPM wrapped as a
-   // dynamic framework.
+-  // Try lo load resources from Framework resources if SwiftPM wrapped as a
+-  // dynamic framework.
 -  std::tie(lib, error[3]) = load_colocated_library(device, "Resources/default");
-+  std::tie(lib, error[5]) = load_colocated_library(device, "Resources/default");
++  // First try the colocated mlx.metallib
++  std::tie(lib, error[3]) = load_colocated_library(device, "mlx");
++  if (lib) {
++    return lib;
++  }
++
++  std::tie(lib, error[4]) = load_colocated_library(device, "Resources/mlx");
++  if (lib) {
++    return lib;
++  }
++
++  // Then try default.metallib in a SwiftPM bundle if we have one
++  std::tie(lib, error[5]) = load_swiftpm_library(device, "default");
    if (lib) {
      return lib;
    }
 
-   // Finally try default_mtllib_path
+-  // Finally try default_mtllib_path
 -  std::tie(lib, error[4]) = load_library_from_path(device, default_mtllib_path);
-+  std::tie(lib, error[6]) = load_library_from_path(device, default_mtllib_path);
++  // Try lo load resources from Framework resources if SwiftPM wrapped as a
++  // dynamic framework.
++  std::tie(lib, error[6]) = load_colocated_library(device, "Resources/default");
    if (!lib) {
      std::ostringstream msg;
      msg << "Failed to load the default metallib. ";
