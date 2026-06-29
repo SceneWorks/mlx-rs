@@ -1,11 +1,11 @@
 //! Fast implementations of commonly used multi-op functions.
 
-use std::ffi::CStr;
+use std::ffi::{CStr, CString};
 
-use crate::error::Result;
+use crate::error::{Exception, Result};
 use crate::utils::guard::Guarded;
-use crate::utils::IntoOption;
-use crate::{Array, Stream};
+use crate::utils::{IntoOption, VectorArray};
+use crate::{Array, Dtype, Stream};
 use mlx_internal_macros::{default_device, generate_macro};
 
 /// Optimized implementation of `NN.RoPE`.
@@ -243,6 +243,413 @@ pub fn layer_norm_device<'a>(
     })
 }
 
+/// A template parameter for a JIT-compiled [`MetalKernel`].
+///
+/// Template parameters are substituted into the generated kernel at JIT-compile
+/// time. They mirror MLX's `mx.fast.metal_kernel` `template` argument and the
+/// underlying `mlx_fast_metal_kernel_config_add_template_arg_*` C entry points.
+#[derive(Debug, Clone)]
+pub enum TemplateArg {
+    /// A `dtype` template parameter (e.g. `T = float16`).
+    Dtype(Dtype),
+    /// An integer template parameter.
+    Int(i32),
+    /// A boolean template parameter.
+    Bool(bool),
+}
+
+impl From<Dtype> for TemplateArg {
+    fn from(value: Dtype) -> Self {
+        TemplateArg::Dtype(value)
+    }
+}
+
+impl From<i32> for TemplateArg {
+    fn from(value: i32) -> Self {
+        TemplateArg::Int(value)
+    }
+}
+
+impl From<bool> for TemplateArg {
+    fn from(value: bool) -> Self {
+        TemplateArg::Bool(value)
+    }
+}
+
+/// Describes a single output of a [`MetalKernel`] dispatch: its shape and dtype.
+#[derive(Debug, Clone)]
+pub struct OutputArg {
+    /// The shape of the output array.
+    pub shape: Vec<i32>,
+    /// The dtype of the output array.
+    pub dtype: Dtype,
+}
+
+/// A safe, JIT-compiled custom Metal kernel built from hand-written MSL source.
+///
+/// This is the Rust binding for MLX's `mx.fast.metal_kernel`. The kernel source
+/// is the *body* of a Metal compute function (MLX synthesizes the function
+/// signature from the declared `input_names`/`output_names`). The kernel is
+/// JIT-compiled and cached by MLX on first dispatch, keyed by the kernel name,
+/// source, and any template parameters.
+///
+/// # Example
+///
+/// ```no_run
+/// use mlx_rs::{Array, Dtype};
+/// use mlx_rs::fast::{MetalKernel, OutputArg};
+///
+/// let kernel = MetalKernel::new(
+///     "scale",
+///     &["a"],
+///     &["out"],
+///     r#"
+///         uint elem = thread_position_in_grid.x;
+///         out[elem] = a[elem] * 2.0f;
+///     "#,
+/// )
+/// .unwrap();
+///
+/// let a = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0], &[4]);
+/// let outputs = kernel
+///     .apply()
+///     .input(&a)
+///     .output(OutputArg { shape: vec![4], dtype: Dtype::Float32 })
+///     .grid(4, 1, 1)
+///     .thread_group(4, 1, 1)
+///     .run()
+///     .unwrap();
+/// let out = &outputs[0];
+/// # let _ = out;
+/// ```
+pub struct MetalKernel {
+    inner: mlx_sys::mlx_fast_metal_kernel,
+}
+
+impl std::fmt::Debug for MetalKernel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MetalKernel").finish_non_exhaustive()
+    }
+}
+
+impl Drop for MetalKernel {
+    fn drop(&mut self) {
+        unsafe { mlx_sys::mlx_fast_metal_kernel_free(self.inner) };
+    }
+}
+
+/// Build an `mlx_vector_string` from a slice of names.
+///
+/// Returns the owned C handle; the caller is responsible for freeing it via
+/// `mlx_vector_string_free`.
+fn new_vector_string(names: &[impl AsRef<str>]) -> Result<mlx_sys::mlx_vector_string> {
+    // Hold the `CString`s alive until after `*_new_data` copies them.
+    let c_strings = names
+        .iter()
+        .map(|n| CString::new(n.as_ref()))
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|e| Exception::from(e.to_string().as_str()))?;
+    let mut ptrs: Vec<*const std::os::raw::c_char> = c_strings.iter().map(|c| c.as_ptr()).collect();
+    let vec = unsafe { mlx_sys::mlx_vector_string_new_data(ptrs.as_mut_ptr(), ptrs.len()) };
+    Ok(vec)
+}
+
+impl MetalKernel {
+    /// Create (but do not yet compile) a custom Metal kernel.
+    ///
+    /// # Params
+    ///
+    /// - `name`: A name for the kernel. Combined with the source and template
+    ///   parameters this forms MLX's JIT cache key.
+    /// - `input_names`: The names of the input arrays, in dispatch order. These
+    ///   become the input parameters of the synthesized Metal function.
+    /// - `output_names`: The names of the output arrays, in dispatch order.
+    /// - `source`: The MSL source for the *body* of the compute function.
+    ///
+    /// `ensure_row_contiguous` defaults to `true` and `atomic_outputs` to
+    /// `false`, matching MLX's `mx.fast.metal_kernel` defaults. Use
+    /// [`MetalKernel::with_options`] to override them.
+    pub fn new(
+        name: &str,
+        input_names: &[impl AsRef<str>],
+        output_names: &[impl AsRef<str>],
+        source: &str,
+    ) -> Result<Self> {
+        Self::with_options(name, input_names, output_names, source, "", true, false)
+    }
+
+    /// Create a custom Metal kernel with full control over the optional flags.
+    ///
+    /// - `header`: Source prepended verbatim before the kernel (e.g. helper
+    ///   functions or `#include`s). Pass `""` for none.
+    /// - `ensure_row_contiguous`: If `true`, MLX ensures inputs are row
+    ///   contiguous before the kernel runs.
+    /// - `atomic_outputs`: If `true`, output buffers are declared atomic.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_options(
+        name: &str,
+        input_names: &[impl AsRef<str>],
+        output_names: &[impl AsRef<str>],
+        source: &str,
+        header: &str,
+        ensure_row_contiguous: bool,
+        atomic_outputs: bool,
+    ) -> Result<Self> {
+        let c_name = CString::new(name).map_err(|e| Exception::from(e.to_string().as_str()))?;
+        let c_source = CString::new(source).map_err(|e| Exception::from(e.to_string().as_str()))?;
+        let c_header = CString::new(header).map_err(|e| Exception::from(e.to_string().as_str()))?;
+
+        let inputs = new_vector_string(input_names)?;
+        let outputs = new_vector_string(output_names)?;
+
+        let inner = unsafe {
+            mlx_sys::mlx_fast_metal_kernel_new(
+                c_name.as_ptr(),
+                inputs,
+                outputs,
+                c_source.as_ptr(),
+                c_header.as_ptr(),
+                ensure_row_contiguous,
+                atomic_outputs,
+            )
+        };
+
+        // `*_new` copies the vectors; free our owned handles.
+        unsafe {
+            mlx_sys::mlx_vector_string_free(inputs);
+            mlx_sys::mlx_vector_string_free(outputs);
+        }
+
+        if inner.ctx.is_null() {
+            // The C layer routes the C++ exception through the global handler.
+            let what = crate::error::get_and_clear_last_mlx_error()
+                .map(|e| e.what)
+                .unwrap_or_else(|| "failed to create metal kernel".to_string());
+            return Err(Exception::from(what.as_str()));
+        }
+
+        Ok(Self { inner })
+    }
+
+    /// Begin building a dispatch of this kernel. See [`MetalKernelDispatch`].
+    pub fn apply(&self) -> MetalKernelDispatch<'_> {
+        MetalKernelDispatch {
+            kernel: self,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            grid: (1, 1, 1),
+            thread_group: (1, 1, 1),
+            template_args: Vec::new(),
+            init_value: None,
+            verbose: false,
+        }
+    }
+}
+
+/// A builder for a single dispatch of a [`MetalKernel`].
+///
+/// Created via [`MetalKernel::apply`]. Configure the inputs, outputs, grid and
+/// threadgroup dimensions (and optionally template params / init value), then
+/// call [`MetalKernelDispatch::run`] to JIT-compile (on first use) and execute,
+/// returning the output [`Array`]s in declared order.
+#[derive(Debug)]
+pub struct MetalKernelDispatch<'a> {
+    kernel: &'a MetalKernel,
+    inputs: Vec<&'a Array>,
+    outputs: Vec<OutputArg>,
+    grid: (i32, i32, i32),
+    thread_group: (i32, i32, i32),
+    template_args: Vec<(String, TemplateArg)>,
+    init_value: Option<f32>,
+    verbose: bool,
+}
+
+impl<'a> MetalKernelDispatch<'a> {
+    /// Append an input array (in the order the kernel's `input_names` declared).
+    pub fn input(mut self, array: &'a Array) -> Self {
+        self.inputs.push(array);
+        self
+    }
+
+    /// Append all input arrays from an iterator.
+    pub fn inputs(mut self, arrays: impl IntoIterator<Item = &'a Array>) -> Self {
+        self.inputs.extend(arrays);
+        self
+    }
+
+    /// Declare an output (shape + dtype), in the order `output_names` declared.
+    pub fn output(mut self, output: OutputArg) -> Self {
+        self.outputs.push(output);
+        self
+    }
+
+    /// Declare an output by shape and dtype.
+    pub fn output_shape(mut self, shape: impl Into<Vec<i32>>, dtype: Dtype) -> Self {
+        self.outputs.push(OutputArg {
+            shape: shape.into(),
+            dtype,
+        });
+        self
+    }
+
+    /// Set the dispatch grid dimensions (total threads per dimension).
+    pub fn grid(mut self, x: i32, y: i32, z: i32) -> Self {
+        self.grid = (x, y, z);
+        self
+    }
+
+    /// Set the threadgroup dimensions.
+    pub fn thread_group(mut self, x: i32, y: i32, z: i32) -> Self {
+        self.thread_group = (x, y, z);
+        self
+    }
+
+    /// Add a template parameter (substituted at JIT-compile time).
+    pub fn template_arg(mut self, name: impl Into<String>, value: impl Into<TemplateArg>) -> Self {
+        self.template_args.push((name.into(), value.into()));
+        self
+    }
+
+    /// Set the initial value used to fill outputs before the kernel runs.
+    ///
+    /// Required when the kernel only writes some output elements (e.g. atomic
+    /// accumulation). Mirrors MLX's `init_value`.
+    pub fn init_value(mut self, value: f32) -> Self {
+        self.init_value = Some(value);
+        self
+    }
+
+    /// Enable MLX's verbose mode (prints the generated kernel source).
+    pub fn verbose(mut self, verbose: bool) -> Self {
+        self.verbose = verbose;
+        self
+    }
+
+    /// JIT-compile (on first use) and dispatch the kernel on the default stream.
+    ///
+    /// Returns the output [`Array`]s in the order their `output_names` were
+    /// declared. Errors are surfaced from MLX (e.g. MSL compile failures, or
+    /// running without the `metal` feature / on a non-Metal device).
+    pub fn run(self) -> Result<Vec<Array>> {
+        self.run_device(crate::StreamOrDevice::default())
+    }
+
+    /// JIT-compile (on first use) and dispatch the kernel on the given stream.
+    ///
+    /// Returns the output [`Array`]s in the order their `output_names` were
+    /// declared.
+    pub fn run_device(self, stream: impl AsRef<Stream>) -> Result<Vec<Array>> {
+        let config = unsafe { mlx_sys::mlx_fast_metal_kernel_config_new() };
+
+        // Build the config; on any error, free it before returning.
+        let build = || -> Result<()> {
+            for out in &self.outputs {
+                let status = unsafe {
+                    mlx_sys::mlx_fast_metal_kernel_config_add_output_arg(
+                        config,
+                        out.shape.as_ptr(),
+                        out.shape.len(),
+                        out.dtype.into(),
+                    )
+                };
+                check_status(status)?;
+            }
+
+            check_status(unsafe {
+                mlx_sys::mlx_fast_metal_kernel_config_set_grid(
+                    config,
+                    self.grid.0,
+                    self.grid.1,
+                    self.grid.2,
+                )
+            })?;
+            check_status(unsafe {
+                mlx_sys::mlx_fast_metal_kernel_config_set_thread_group(
+                    config,
+                    self.thread_group.0,
+                    self.thread_group.1,
+                    self.thread_group.2,
+                )
+            })?;
+
+            if let Some(value) = self.init_value {
+                check_status(unsafe {
+                    mlx_sys::mlx_fast_metal_kernel_config_set_init_value(config, value)
+                })?;
+            }
+
+            check_status(unsafe {
+                mlx_sys::mlx_fast_metal_kernel_config_set_verbose(config, self.verbose)
+            })?;
+
+            for (name, value) in &self.template_args {
+                let c_name = CString::new(name.as_str())
+                    .map_err(|e| Exception::from(e.to_string().as_str()))?;
+                let status = match value {
+                    TemplateArg::Dtype(dtype) => unsafe {
+                        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_dtype(
+                            config,
+                            c_name.as_ptr(),
+                            (*dtype).into(),
+                        )
+                    },
+                    TemplateArg::Int(v) => unsafe {
+                        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
+                            config,
+                            c_name.as_ptr(),
+                            *v,
+                        )
+                    },
+                    TemplateArg::Bool(v) => unsafe {
+                        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_bool(
+                            config,
+                            c_name.as_ptr(),
+                            *v,
+                        )
+                    },
+                };
+                check_status(status)?;
+            }
+            Ok(())
+        };
+
+        let result = (|| -> Result<Vec<Array>> {
+            build()?;
+
+            let inputs = VectorArray::try_from_iter(self.inputs.iter().copied())?;
+
+            let outputs = VectorArray::try_from_op(|res| unsafe {
+                mlx_sys::mlx_fast_metal_kernel_apply(
+                    res,
+                    self.kernel.inner,
+                    inputs.as_ptr(),
+                    config,
+                    stream.as_ref().as_ptr(),
+                )
+            })?;
+
+            outputs.try_into_values::<Vec<Array>>()
+        })();
+
+        unsafe {
+            mlx_sys::mlx_fast_metal_kernel_config_free(config);
+        }
+
+        result
+    }
+}
+
+fn check_status(status: i32) -> Result<()> {
+    if status == crate::utils::SUCCESS {
+        Ok(())
+    } else {
+        let what = crate::error::get_and_clear_last_mlx_error()
+            .map(|e| e.what)
+            .unwrap_or_else(|| "metal kernel config error".to_string());
+        Err(Exception::from(what.as_str()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -399,5 +806,99 @@ mod tests {
 
         let result = scaled_dot_product_attention(&q, &k, &v, scale, None, &sinks).unwrap();
         assert_eq!(result.shape(), &[b, n_q, t_q, d]);
+    }
+
+    // Metal custom-kernel JIT round-trip tests. These dispatch a hand-written MSL
+    // kernel through the new `MetalKernel` binding (sc-8529) and compare against a
+    // pure-MLX-ops reference. They require the `metal` feature and an Apple Silicon
+    // GPU, so they are gated on the `metal` feature.
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn test_metal_kernel_elementwise_scale() {
+        // Trivial round-trip: out = a * 2.0, compared to the pure-ops reference a * 2.0.
+        let a = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0], &[6]);
+
+        let kernel = MetalKernel::new(
+            "scale_by_two",
+            &["a"],
+            &["out"],
+            r#"
+                uint elem = thread_position_in_grid.x;
+                out[elem] = a[elem] * 2.0f;
+            "#,
+        )
+        .unwrap();
+
+        let outputs = kernel
+            .apply()
+            .input(&a)
+            .output(OutputArg {
+                shape: vec![6],
+                dtype: Dtype::Float32,
+            })
+            .grid(6, 1, 1)
+            .thread_group(6, 1, 1)
+            .run()
+            .unwrap();
+
+        assert_eq!(outputs.len(), 1);
+        let out = &outputs[0];
+        assert_eq!(out.shape(), [6]);
+        assert_eq!(out.dtype(), Dtype::Float32);
+
+        let reference = &a * 2.0f32;
+        let max_diff = (out - &reference)
+            .abs()
+            .unwrap()
+            .max(None)
+            .unwrap()
+            .item::<f32>();
+        assert!(max_diff < 1e-5, "max diff was {max_diff}");
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn test_metal_kernel_two_inputs_with_template() {
+        // Second case: two inputs + a dtype template param. out = a + b, compared
+        // to the pure-ops reference a + b. The template `T` is substituted into the
+        // generated kernel signature at JIT-compile time.
+        let a = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0], &[4]);
+        let b = Array::from_slice(&[10.0f32, 20.0, 30.0, 40.0], &[4]);
+
+        let kernel = MetalKernel::new(
+            "add_two",
+            &["a", "b"],
+            &["out"],
+            r#"
+                uint elem = thread_position_in_grid.x;
+                out[elem] = a[elem] + b[elem];
+            "#,
+        )
+        .unwrap();
+
+        let outputs = kernel
+            .apply()
+            .input(&a)
+            .input(&b)
+            .output_shape([4], Dtype::Float32)
+            .grid(4, 1, 1)
+            .thread_group(4, 1, 1)
+            .template_arg("T", Dtype::Float32)
+            .run()
+            .unwrap();
+
+        assert_eq!(outputs.len(), 1);
+        let out = &outputs[0];
+        assert_eq!(out.shape(), [4]);
+
+        let reference = &a + &b;
+        let max_diff = (out - &reference)
+            .abs()
+            .unwrap()
+            .max(None)
+            .unwrap()
+            .item::<f32>();
+        assert!(max_diff < 1e-5, "max diff was {max_diff}");
     }
 }
