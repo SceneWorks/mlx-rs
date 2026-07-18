@@ -138,8 +138,19 @@ impl crate::utils::Updatable for RandomState {
     }
 }
 
+// sc-12787: the global state is shared across threads, but MLX 0.32 gives each
+// thread its own default stream and evaluates lazy graph nodes on the calling
+// thread ("There is no Stream(gpu, N) in current thread" otherwise). Any state
+// array stored here must therefore be EVALUATED before the lock is released,
+// so no thread is ever asked to evaluate ops recorded on another thread's
+// stream. Task-local / user-owned RandomState is single-threaded by
+// construction and keeps its lazy semantics.
 fn global_state() -> &'static Mutex<RandomState> {
-    GLOBAL_STATE.get_or_init(|| Mutex::new(RandomState::new().unwrap()))
+    GLOBAL_STATE.get_or_init(|| {
+        let state = RandomState::new().unwrap();
+        state.as_array().eval().unwrap();
+        Mutex::new(state)
+    })
 }
 
 /// Returns a key from the task-local state if it exists, otherwise
@@ -150,7 +161,15 @@ fn resolve_task_local_key() -> Option<Result<Array>> {
 
 fn resolve_global_key() -> Result<Array> {
     let mut state = global_state().lock();
-    state.next()
+    // Split on the calling thread (the stored state is always evaluated, so
+    // these ops only reference data-backed inputs), then evaluate BEFORE
+    // committing the new state: the global state must never hold a lazy
+    // array, even on an error path (see note on global_state).
+    let (next_state, key) = split(state.as_array(), 2)?;
+    next_state.eval()?;
+    key.eval()?;
+    *state.as_array_mut() = next_state;
+    Ok(key)
 }
 
 /// Use given key or generate a new one if `None`.
@@ -183,8 +202,13 @@ where
 
 /// Seed the random number generator.
 pub fn seed(seed: u64) -> Result<()> {
+    // Build and evaluate the new key before taking the lock, so the global
+    // state is only ever replaced by an evaluated array (see global_state).
+    let new_key = key(seed)?;
+    new_key.eval()?;
     let mut state = global_state().lock();
-    state.seed(seed)
+    *state.as_array_mut() = new_key;
+    Ok(())
 }
 
 /// Get a PRNG key from a seed.
@@ -599,6 +623,27 @@ mod tests {
     use super::*;
     use crate::{array, assert_array_eq};
     use float_eq::{assert_float_eq, float_eq};
+
+    // sc-12787: MLX 0.32 evaluates lazy ops on the calling thread against
+    // thread-local streams. The global RNG state is the one array shared
+    // across threads, so it must never leave a lock unevaluated: a thread
+    // consuming a lazy key recorded on another thread's stream dies with
+    // "There is no Stream(gpu, N) in current thread". This drives that exact
+    // sequence: record a key advance on a spawned thread WITHOUT evaluating
+    // the drawn sample, then consume + evaluate the global state here.
+    #[test]
+    fn test_global_rng_across_threads() {
+        std::thread::spawn(|| {
+            // Advances the global key on the spawned thread's stream; the
+            // sample itself is deliberately left unevaluated.
+            let _lazy = uniform::<_, f32>(0, 1, None, None).unwrap();
+        })
+        .join()
+        .unwrap();
+
+        let a = uniform::<_, f32>(0, 1, None, None).unwrap();
+        a.eval().unwrap();
+    }
 
     #[test]
     fn test_global_rng() {
