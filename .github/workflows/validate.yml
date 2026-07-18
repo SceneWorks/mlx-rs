@@ -4,14 +4,22 @@ on:
     branches:
       - main
   pull_request:
-    types: [opened, synchronize]
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 jobs:
   checks:
-    runs-on: blaze/macos-15
+    # SceneWorks fork: upstream targets paid blaze/* runners this fork has no
+    # subscription to (jobs never get picked up). Use GitHub-hosted macOS.
+    runs-on: macos-15
+    # Cold cache builds MLX C++ from source on a 3-core VM; guard against a
+    # wedged job eating the 6h default (macOS concurrency pool is only 5 jobs).
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v5
         with:
@@ -25,7 +33,9 @@ jobs:
       - run: cargo clippy -- -D warnings
 
   tests:
-    runs-on: blaze/${{ matrix.runner }}
+    runs-on: ${{ matrix.runner }}
+    # Cold MLX C++ build + single-threaded test suite; see checks job note.
+    timeout-minutes: 180
     strategy:
       matrix:
         runner: [macos-15]
