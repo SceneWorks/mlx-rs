@@ -5,25 +5,32 @@
 //! `std::terminate` (SIGABRT).
 //!
 //! In MLX core such an error is detected inside a `MTL::CommandBuffer`
-//! completion handler that runs on an internal Metal thread. The pmetal patch
-//! (`mlx-sys/patches/command-buffer-recoverable.patch`) makes that handler
-//! *record* the error instead of throwing, and re-throws it synchronously on
-//! the waiting (calling) thread (`Event::wait` / `CommandEncoder::synchronize`).
+//! completion handler that runs on an internal Metal thread. MLX 0.32.0 makes
+//! that recoverable UPSTREAM: `CommandEncoder::commit()` records the error into
+//! the per-encoder `error_` and poisons the signal events instead of throwing,
+//! and the error is re-thrown synchronously on the waiting (calling) thread via
+//! `CommandEncoder::synchronize()` / `EventImpl::check_error()`. (Before 0.32.0
+//! the pmetal fork carried its own record-not-throw patch; sc-12780 retired that
+//! as redundant once upstream provided the same behavior.)
 //!
 //! Actually tripping the real GPU watchdog is non-deterministic and can disrupt
-//! the host display, so this test drives the exact same recovery path through a
-//! debug-only C hook compiled into MLX core
-//! (`mlx_pmetal_test_inject_command_buffer_error`, gated on `!NDEBUG`) that
-//! records a synthetic error into the same slot a real fault would. Reaching any
-//! assertion below at all proves the process did NOT abort; the `Err` proves the
-//! error is recoverable.
+//! the host display, so this test drives that recovery path through a debug-only
+//! C hook compiled into MLX core
+//! (`mlx_pmetal_test_inject_command_buffer_error`, gated on `!NDEBUG`, added by
+//! `mlx-sys/patches/command-buffer-recoverable.patch`). The hook records a
+//! synthetic error into a slot that the host-blocking `Event::wait()` drains and
+//! re-throws — the same host-wait path a real poisoned event surfaces through.
+//! Reaching any assertion below at all proves the process did NOT abort; the
+//! `Err` proves the error is recoverable.
 
 use mlx_rs::array;
 
 extern "C" {
     /// Debug-only hook in MLX core (`mlx/backend/metal/eval.cpp`). Records a
-    /// synthetic async command-buffer error into the slot the completion
-    /// handler writes to. Present only in non-release (`!NDEBUG`) MLX builds.
+    /// synthetic async command-buffer error into a slot that the host-blocking
+    /// `Event::wait()` drains and re-throws on the calling thread — the same
+    /// host-wait path a real poisoned event surfaces through. Present only in
+    /// non-release (`!NDEBUG`) MLX builds.
     fn mlx_pmetal_test_inject_command_buffer_error(msg: *const std::os::raw::c_char);
 }
 

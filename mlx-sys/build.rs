@@ -110,16 +110,31 @@ fn prepare_mlx_c_source() -> PathBuf {
     );
     println!("cargo:rerun-if-changed=patches/mlx-c-fft-norm.patch");
 
-    // Copy our patch files into the staged source and concatenate them into a
-    // single multi-file patch. FetchContent allows only one PATCH_COMMAND, so we
-    // apply all MLX source patches with one `git apply` — structurally identical
-    // to the proven single-patch mechanism, and both apply atomically.
-    //   - metallib-search-path.patch         : pmetal metallib resolver (device.cpp)
-    //   - command-buffer-recoverable.patch   : sc-5009 — turn an async Metal
-    //     command-buffer error (kIOGPUCommandBufferCallbackErrorTimeout / OOM),
-    //     which is reported from a completion handler on an internal Metal thread
-    //     where throwing would `std::terminate`, into a recoverable exception
-    //     surfaced synchronously on the waiting thread (eval -> Result::Err).
+    // Copy our patch files into the staged source. FetchContent allows only one
+    // PATCH_COMMAND, so build.rs generates apply_patches.sh (below) which applies
+    // each MLX source patch individually and idempotently.
+    //   - metallib-search-path.patch         : pmetal metallib resolver (device.cpp
+    //     load_default_library). Adds a PMETAL_METALLIB_PATH env override, a
+    //     ~/.cache/pmetal/lib/mlx.metallib user-cache lookup, and (sc-7898) prefers
+    //     THIS build's colocated metallib over the shared user cache so a stale
+    //     cached metallib can never shadow the current build's kernels. sc-12780:
+    //     regenerated for MLX 0.32.0 — rebased onto the refactored resolver, which
+    //     now also carries upstream metal::set_metallib_path() (#3597); that single
+    //     explicit override is preserved (inert unless called) and does NOT provide
+    //     the env/user-cache/colocated-precedence behavior, so this patch is still
+    //     required.
+    //   - command-buffer-recoverable.patch   : sc-5009 — a recoverable Metal
+    //     command-buffer error (kIOGPUCommandBufferCallbackErrorTimeout / OOM)
+    //     reported from a completion handler on an internal Metal thread, where
+    //     throwing would `std::terminate`. sc-12780: MLX 0.32.0 implements this
+    //     recovery UPSTREAM (CommandEncoder::commit records the error into the
+    //     per-encoder error_ / poisons signal events instead of throwing, and it is
+    //     re-thrown synchronously on the waiting thread via synchronize() /
+    //     EventImpl::check_error). So the 0.31.2 production record-not-throw logic is
+    //     retired as redundant. This patch is regenerated to add ONLY the debug-only
+    //     (NDEBUG-gated) test hook mlx_pmetal_test_inject_command_buffer_error, which
+    //     lets mlx-tests/tests/command_buffer_recoverable.rs drive that upstream
+    //     recovery path deterministically (without tripping the real GPU watchdog).
     //   - pad-copy-int64.patch                : sc-12746 (epic 12742) — fix the
     //     copy_gpu_inplace dispatch gate in backend/metal/copy.cpp. pad() and
     //     concatenate() hand copy_gpu_inplace a slice-VIEW `out` whose
@@ -149,24 +164,37 @@ fn prepare_mlx_c_source() -> PathBuf {
     // (basename, required). `required = true` means the build MUST fail if the patch
     // does not apply; `false` means best-effort (a fully-failing patch is a safe no-op).
     //
-    // sc-12746: the MLX source patches are now applied INDIVIDUALLY, not concatenated into
+    // sc-12746: the MLX source patches are applied INDIVIDUALLY, not concatenated into
     // one `combined.patch`. `git apply` is atomic PER INVOCATION, so a single combined patch
     // meant ANY stale hunk silently dropped ALL patches (the previous `git apply combined.patch
-    // || true` swallowed the failure). Applying each patch on its own keeps a fully-failing
-    // patch a safe no-op while still applying the ones that do apply — critically, the
-    // pad-copy-int64 copy-gate fix (required) is no longer collateral damage of the two older
-    // 0.31.2-era patches, whose device.cpp/event.cpp context drifted in MLX 0.32.0 and which
-    // therefore no longer apply (tracked separately — regenerate them for 0.32.0). Per-file
-    // atomicity also prevents a dangerous half-apply of a partially-matching patch.
+    // || true` swallowed the failure). Applying each patch on its own keeps a genuine failure
+    // isolated to its own patch, and per-file atomicity prevents a dangerous half-apply of a
+    // partially-matching patch.
+    //
+    // sc-12780: ALL THREE patches are now `required = true`. The metallib and command-buffer
+    // patches were regenerated for MLX 0.32.0 (their 0.31.2 context had drifted and both were
+    // temporarily demoted to best-effort no-ops by sc-12746, which is exactly how the sc-12745
+    // bump silently shipped WITHOUT them). Re-arming them to required=true makes a future silent
+    // drop impossible: if a regenerated patch ever fails to apply again, the build aborts loudly
+    // instead of producing a binary missing pmetal's metallib resolver or the recoverable-error
+    // test hook. See the per-patch notes above and the idempotency guard below.
     let patch_files = [
-        ("patches/metallib-search-path.patch", false),
-        ("patches/command-buffer-recoverable.patch", false),
+        ("patches/metallib-search-path.patch", true),
+        ("patches/command-buffer-recoverable.patch", true),
         ("patches/pad-copy-int64.patch", true),
     ];
+    // sc-12780 idempotency guard: CMake FetchContent may re-run PATCH_COMMAND against an
+    // mlx-src that is ALREADY patched (e.g. an incremental rebuild that does not re-fetch).
+    // `git apply` is not idempotent — re-applying an applied patch fails "patch does not apply".
+    // So each patch is guarded: if it reverse-applies cleanly it is already present and we SKIP
+    // (no-op); otherwise we apply it forward. A `required` patch that genuinely cannot apply
+    // (neither already-present nor forward-applicable) aborts the build. This keeps re-runs a
+    // no-op while still hard-failing on a real apply failure — the whole point of required=true.
     let mut script = String::from(
         "#!/bin/sh\n\
-         # Generated by mlx-sys/build.rs. Apply each MLX source patch individually.\n\
-         # cwd is the fetched mlx-src (a git repo); patches live next to this script.\n\
+         # Generated by mlx-sys/build.rs. Apply each MLX source patch individually,\n\
+         # idempotently (sc-12780). cwd is the fetched mlx-src (a git repo); patches\n\
+         # live next to this script.\n\
          d=\"$(dirname \"$0\")\"\n",
     );
     for (pf, required) in patch_files {
@@ -180,13 +208,22 @@ fn prepare_mlx_c_source() -> PathBuf {
             .unwrap_or_else(|e| panic!("Failed to copy {pf}: {e}"));
         if required {
             script.push_str(&format!(
-                "git apply \"$d/{name}\" || {{ echo \"pmetal: FATAL required patch {name} \
-                 (sc-12746) failed to apply\" >&2; exit 1; }}\n"
+                "if git apply --reverse --check \"$d/{name}\" 2>/dev/null; then\n  \
+                 echo \"pmetal: {name} already applied; skipping\" >&2\n\
+                 elif git apply \"$d/{name}\"; then\n  :\n\
+                 else\n  \
+                 echo \"pmetal: FATAL required patch {name} (sc-12780) failed to apply\" >&2\n  \
+                 exit 1\n\
+                 fi\n"
             ));
         } else {
             script.push_str(&format!(
-                "git apply \"$d/{name}\" 2>/dev/null || echo \"pmetal: {name} did not apply \
-                 (stale for MLX 0.32.0; best-effort, skipped)\" >&2\n"
+                "if git apply --reverse --check \"$d/{name}\" 2>/dev/null; then\n  \
+                 echo \"pmetal: {name} already applied; skipping\" >&2\n\
+                 elif git apply \"$d/{name}\" 2>/dev/null; then\n  :\n\
+                 else\n  \
+                 echo \"pmetal: {name} did not apply (best-effort, skipped)\" >&2\n\
+                 fi\n"
             ));
         }
     }
