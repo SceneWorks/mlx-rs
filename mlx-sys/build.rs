@@ -154,6 +154,18 @@ fn prepare_mlx_c_source() -> PathBuf {
     //     onto the EXISTING int64 (`*large`) kernels — no copy.metal edit. This
     //     is exactly the follow-up MLX PR #3524 (0.32.0) deferred for pad/concat;
     //     an upstream ml-explore/mlx PR is prepared separately.
+    //   - thread-shared-streams.patch         : sc-12937 — MLX registers each
+    //     stream's command encoder in a thread_local map, so a stream is only
+    //     usable from the thread that created it and any cross-thread eval
+    //     throws "There is no Stream(gpu, N) in current thread." (metal
+    //     device.cpp get_command_encoder; same for cpu). Rust mlx-rs arrays
+    //     are Send — the test harness runs every #[test] on its own thread,
+    //     pmetal moves work across tokio workers, and MLX's global random key
+    //     state crosses threads by design — so gpu::new_stream/cpu::new_stream
+    //     are redirected to the global-map registration (upstream's own
+    //     new_thread_unsafe_stream, #3578), restoring cross-thread stream
+    //     visibility. Concurrent eval on the SAME stream from two threads
+    //     remains the caller's responsibility (unchanged from upstream).
     //
     // The sc-2714 (dense GEMM) and sc-2770 (fast SDPA) NAX-dispatch gate patches were
     // REMOVED in sc-2772. Their root cause was never the dispatch or the MLX version: the
@@ -177,7 +189,8 @@ fn prepare_mlx_c_source() -> PathBuf {
     // isolated to its own patch, and per-file atomicity prevents a dangerous half-apply of a
     // partially-matching patch.
     //
-    // sc-12780: ALL THREE patches are now `required = true`. The metallib and command-buffer
+    // sc-12780: ALL patches are `required = true` (three at the time; sc-12937
+    // adds a fourth under the same policy). The metallib and command-buffer
     // patches were regenerated for MLX 0.32.0 (their 0.31.2 context had drifted and both were
     // temporarily demoted to best-effort no-ops by sc-12746, which is exactly how the sc-12745
     // bump silently shipped WITHOUT them). Re-arming them to required=true makes a future silent
@@ -188,6 +201,7 @@ fn prepare_mlx_c_source() -> PathBuf {
         ("patches/metallib-search-path.patch", true),
         ("patches/command-buffer-recoverable.patch", true),
         ("patches/pad-copy-int64.patch", true),
+        ("patches/thread-shared-streams.patch", true),
     ];
     // sc-12780 idempotency guard: CMake FetchContent may re-run PATCH_COMMAND against an
     // mlx-src that is ALREADY patched (e.g. an incremental rebuild that does not re-fetch).

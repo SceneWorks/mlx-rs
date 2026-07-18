@@ -1,0 +1,45 @@
+diff --git a/mlx/backend/cpu/eval.cpp b/mlx/backend/cpu/eval.cpp
+index 354820f0..7d13fd2f 100644
+--- a/mlx/backend/cpu/eval.cpp
++++ b/mlx/backend/cpu/eval.cpp
+@@ -8,8 +8,11 @@
+ namespace mlx::core::cpu {
+ 
+ void new_stream(Stream s) {
+-  auto& encoders = get_command_encoders();
+-  encoders.try_emplace(s.index, s);
++  // pmetal (sc-12937): register in the GLOBAL encoder map (identical to
++  // new_thread_unsafe_stream below) so streams created on one thread are
++  // visible when a graph is evaluated from another thread. See the matching
++  // comment in backend/metal/eval.cpp for the full rationale.
++  new_thread_unsafe_stream(s);
+ }
+ 
+ void new_thread_unsafe_stream(Stream s) {
+diff --git a/mlx/backend/metal/eval.cpp b/mlx/backend/metal/eval.cpp
+index a047dcce..c3ed3118 100644
+--- a/mlx/backend/metal/eval.cpp
++++ b/mlx/backend/metal/eval.cpp
+@@ -65,10 +65,18 @@ namespace mlx::core::gpu {
+ void init() {}
+ 
+ void new_stream(Stream s) {
+-  assert(s.device == Device::gpu);
+-  auto& encoders = metal::get_command_encoders();
+-  auto& d = metal::device(s.device);
+-  encoders.try_emplace(s.index, d, s.index, d.residency_set());
++  // pmetal (sc-12937): register every stream's encoder in the GLOBAL encoder
++  // map (identical to new_thread_unsafe_stream below) instead of the creating
++  // thread's thread_local map. Rust mlx-rs arrays are Send: graphs built on
++  // one OS thread are routinely evaluated on another (Rust's test harness runs
++  // every #[test] on its own thread, pmetal's async runtime moves work between
++  // tokio workers, and MLX's global random key state crosses threads by
++  // design), so a thread_local-only registration makes get_command_encoder
++  // throw "There is no Stream(gpu, N) in current thread.". Global registration
++  // restores cross-thread stream visibility. SEQUENTIAL cross-thread eval is
++  // safe; CONCURRENT eval on the same stream from two threads remains the
++  // caller's responsibility, exactly as with upstream's thread-unsafe API.
++  new_thread_unsafe_stream(s);
+ }
+ 
+ void new_thread_unsafe_stream(Stream s) {
