@@ -1,144 +1,103 @@
---- a/mlx/backend/metal/device.h	2026-06-12 15:19:19
-+++ b/mlx/backend/metal/device.h	2026-06-12 15:19:29
-@@ -19,6 +19,17 @@
- using MTLFCList =
-     std::vector<std::tuple<const void*, MTL::DataType, NS::UInteger>>;
- 
-+// pmetal (sc-5009): Record / take an asynchronous Metal command-buffer error
-+// (e.g. kIOGPUCommandBufferCallbackErrorTimeout from the GPU watchdog, or an
-+// out-of-memory status) that is reported from a command-buffer completion
-+// handler. The handler runs on an internal Metal thread, where throwing would
-+// escape a noexcept boundary and `std::terminate` the whole process. Instead we
-+// stash the message here and re-throw it synchronously on the waiting (calling)
-+// thread, so it surfaces as a catchable exception (-> Result::Err) rather than
-+// a non-recoverable SIGABRT.
-+void record_command_buffer_error(const std::string& msg);
-+bool take_command_buffer_error(std::string& out);
-+
- class Device;
- 
- class MLX_API CommandEncoder {
---- a/mlx/backend/metal/eval.cpp	2026-06-12 15:19:19
-+++ b/mlx/backend/metal/eval.cpp	2026-06-12 15:28:54
-@@ -7,6 +7,52 @@
- #include "mlx/primitives.h"
+diff --git a/mlx/backend/metal/eval.cpp b/mlx/backend/metal/eval.cpp
+index e682625..a047dcc 100644
+--- a/mlx/backend/metal/eval.cpp
++++ b/mlx/backend/metal/eval.cpp
+@@ -8,6 +8,58 @@
  #include "mlx/scheduler.h"
+ #include "mlx/utils.h"
  
++// pmetal (sc-5009 / sc-12780): debug-only test hook for the recoverable
++// command-buffer path.
++//
++// MLX 0.32.0 already makes an asynchronous Metal command-buffer error
++// recoverable UPSTREAM: the completion handler in CommandEncoder::commit()
++// (device.cpp) RECORDS the error into the per-encoder error_ and poisons the
++// signal events instead of throwing — throwing there runs on an internal Metal
++// thread, crosses a noexcept boundary, and std::terminate()s (SIGABRT). The
++// recorded error is re-thrown synchronously on the waiting thread
++// (CommandEncoder::synchronize / EventImpl::check_error). This is exactly the
++// behavior the old 0.31.2 pmetal patch added by hand, so NO production
++// record-not-throw patch is required at 0.32.0.
++//
++// What upstream does NOT provide is a way to drive that path DETERMINISTICALLY
++// from a test without tripping the real GPU watchdog (non-deterministic, and it
++// can disrupt the host display). This hook records a synthetic error into a
++// debug-only slot that the host-blocking Event::wait() (event.cpp) drains and
++// re-throws — the same host-wait path a real poisoned event surfaces through.
++// It is compiled out of release builds via NDEBUG, so it adds no production
++// symbol. Tests declare it with `extern "C"`
++// (mlx-tests/tests/command_buffer_recoverable.rs).
++#ifndef NDEBUG
 +namespace mlx::core::metal {
-+
 +namespace {
-+// pmetal (sc-5009): a single slot for the first asynchronously-reported Metal
-+// command-buffer error. Written from a Metal completion-handler thread, read
-+// from the waiting (calling) thread, so it is mutex-guarded. We keep the FIRST
-+// error until it is taken so a later failure can't mask the original cause.
-+std::mutex g_cb_error_mtx;
-+bool g_cb_error_set = false;
-+std::string g_cb_error_msg;
++std::mutex g_injected_cb_error_mtx;
++bool g_injected_cb_error_set = false;
++std::string g_injected_cb_error_msg;
 +} // namespace
 +
-+void record_command_buffer_error(const std::string& msg) {
-+  std::lock_guard<std::mutex> lk(g_cb_error_mtx);
-+  if (!g_cb_error_set) {
-+    g_cb_error_set = true;
-+    g_cb_error_msg = msg;
-+  }
-+}
-+
-+bool take_command_buffer_error(std::string& out) {
-+  std::lock_guard<std::mutex> lk(g_cb_error_mtx);
-+  if (!g_cb_error_set) {
++// Drain a synthetically-injected command-buffer error (debug/test only). Returns
++// true and fills `out` if one was pending, and clears it so it is not sticky —
++// mirroring how a real command-buffer error is taken exactly once by the waiter.
++bool take_injected_command_buffer_error(std::string& out) {
++  std::lock_guard<std::mutex> lk(g_injected_cb_error_mtx);
++  if (!g_injected_cb_error_set) {
 +    return false;
 +  }
-+  out = g_cb_error_msg;
-+  g_cb_error_msg.clear();
-+  g_cb_error_set = false;
++  out = g_injected_cb_error_msg;
++  g_injected_cb_error_msg.clear();
++  g_injected_cb_error_set = false;
 +  return true;
 +}
-+
 +} // namespace mlx::core::metal
 +
-+// pmetal (sc-5009): debug-only test hook. Lets a test deterministically drive
-+// the async command-buffer-error surfacing path (record -> waiter re-throws ->
-+// catchable Result::Err) WITHOUT tripping the real GPU watchdog, which is
-+// non-deterministic and can disrupt the host display. Compiled out of release
-+// builds via NDEBUG so it adds no production symbol. Tests declare it with
-+// `extern "C"`.
-+#ifndef NDEBUG
 +extern "C" void mlx_pmetal_test_inject_command_buffer_error(const char* msg) {
-+  mlx::core::metal::record_command_buffer_error(
-+      msg != nullptr ? std::string(msg) : std::string("synthetic"));
++  std::lock_guard<std::mutex> lk(mlx::core::metal::g_injected_cb_error_mtx);
++  mlx::core::metal::g_injected_cb_error_set = true;
++  mlx::core::metal::g_injected_cb_error_msg =
++      msg != nullptr ? std::string(msg) : std::string("synthetic");
 +}
 +#endif
 +
  namespace mlx::core::gpu {
  
  void init() {}
-@@ -23,7 +69,13 @@
-     std::ostringstream msg;
-     msg << "[METAL] Command buffer execution failed: "
-         << cbuf->error()->localizedDescription()->utf8String();
--    throw std::runtime_error(msg.str());
-+    // pmetal (sc-5009): do NOT throw here. This runs inside a Metal
-+    // command-buffer completion handler on an internal Metal thread, where an
-+    // escaping exception crosses a noexcept boundary and calls
-+    // std::terminate() -> SIGABRT, killing the process non-recoverably. Stash
-+    // the message; the waiting thread (Event::wait / CommandEncoder::synchronize)
-+    // re-throws it synchronously where it can be caught.
-+    metal::record_command_buffer_error(msg.str());
-   }
- }
+diff --git a/mlx/backend/metal/event.cpp b/mlx/backend/metal/event.cpp
+index 77f48f0..c5b774c 100644
+--- a/mlx/backend/metal/event.cpp
++++ b/mlx/backend/metal/event.cpp
+@@ -3,6 +3,16 @@
+ #include "mlx/backend/metal/event.h"
+ #include "mlx/scheduler.h"
  
---- a/mlx/backend/metal/event.cpp	2026-06-12 15:19:19
-+++ b/mlx/backend/metal/event.cpp	2026-06-12 15:20:08
-@@ -21,10 +21,23 @@
++// pmetal (sc-5009 / sc-12780): defined in eval.cpp, debug/test builds only.
++// Drains a synthetically-injected command-buffer error so the recoverable-error
++// path can be exercised deterministically without tripping the real GPU
++// watchdog. See the block comment in eval.cpp.
++#ifndef NDEBUG
++namespace mlx::core::metal {
++bool take_injected_command_buffer_error(std::string& out);
++} // namespace mlx::core::metal
++#endif
++
+ namespace mlx::core {
+ 
+ ///////////////////////////////////////////////////////////////////////////////
+@@ -57,6 +67,18 @@ Event::Event(Stream stream) : stream_(stream) {
  }
  
  void Event::wait() {
--  if (!static_cast<MTL::SharedEvent*>(event_.get())
--           ->waitUntilSignaledValue(value(), -1)) {
--    throw std::runtime_error("[Event::wait] Timed out");
-+  // pmetal (sc-5009): poll in finite chunks instead of waiting forever. When a
-+  // command buffer is killed by the GPU watchdog (timeout) or hits an OOM, it
-+  // never signals its event, so an infinite wait would hang. Its completion
-+  // handler records the error via metal::record_command_buffer_error(); surface
-+  // it here, on the calling thread, as a catchable exception rather than letting
-+  // the handler's throw terminate the process.
-+  auto* ev = static_cast<MTL::SharedEvent*>(event_.get());
-+  std::string err;
-+  while (!ev->waitUntilSignaledValue(value(), 100 /* ms */)) {
-+    if (metal::take_command_buffer_error(err)) {
-+      throw std::runtime_error(err);
++#ifndef NDEBUG
++  // pmetal (sc-5009 / sc-12780): surface a synthetically-injected command-buffer
++  // error here, on the calling (host) thread, as a catchable std::runtime_error
++  // — the same host-wait path a real poisoned event surfaces through
++  // (EventImpl::check_error). Debug/test only; compiled out of release builds.
++  {
++    std::string injected;
++    if (metal::take_injected_command_buffer_error(injected)) {
++      throw std::runtime_error(injected);
 +    }
-   }
-+  // The buffer may have signaled and still reported an error after the fact.
-+  if (metal::take_command_buffer_error(err)) {
-+    throw std::runtime_error(err);
 +  }
++#endif
+   static_cast<metal::EventImpl*>(event_.get())->wait(value());
  }
  
- void Event::wait(Stream stream) {
---- a/mlx/backend/metal/device.cpp	2026-06-12 15:19:19
-+++ b/mlx/backend/metal/device.cpp	2026-06-12 15:20:20
-@@ -495,12 +495,22 @@
-   end_encoding();
-   commit();
-   cb->waitUntilCompleted();
-+  // pmetal (sc-5009): drain any error recorded by a completion handler so it
-+  // can't leak into a later operation, and surface it (or a direct status
-+  // error) synchronously on this (calling) thread as a catchable exception.
-+  // When exiting (destructor) we still drain but never throw — throwing from a
-+  // destructor would terminate.
-+  std::string async_err;
-+  bool had_async = take_command_buffer_error(async_err);
-   if (!exiting_) {
-     if (cb->status() == MTL::CommandBufferStatusError) {
-       throw std::runtime_error(
-           fmt::format(
-               "[METAL] Command buffer execution failed: {}.",
-               cb->error()->localizedDescription()->utf8String()));
-+    }
-+    if (had_async) {
-+      throw std::runtime_error(async_err);
-     }
-   }
- }
