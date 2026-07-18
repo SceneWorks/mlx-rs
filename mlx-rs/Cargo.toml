@@ -3,6 +3,7 @@ name = "pmetal-mlx-rs"
 version = "0.25.8"
 authors.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 repository = "https://github.com/nicholasjpaterno/mlx-rs"
 keywords.workspace = true
 categories.workspace = true
@@ -11,10 +12,11 @@ documentation.workspace = true
 description = "pmetal-maintained fork of mlx-rs: unofficial rust wrapper for Apple's mlx machine learning library."
 readme = "README.md"
 
-# sc-12940: the fork renamed the PACKAGE to pmetal-mlx-rs, but the lib target
-# must keep the upstream crate name. Dependents already import it as `mlx_rs`
-# via workspace aliasing; doctests, this crate's examples, and the publish-docs
-# redirect (target/doc/mlx_rs) all refer to `mlx_rs` and break without this.
+# The package was renamed for the fork (pmetal-mlx-rs), but the lib keeps the
+# upstream crate name: dependents import `mlx_rs`, the internal proc macros
+# emit `::mlx_rs` paths, and every doc example / crate example links it by
+# this name (doctests and a crate's own examples use the real lib name, not
+# the dependency-rename that workspace consumers get).
 [lib]
 name = "mlx_rs"
 
