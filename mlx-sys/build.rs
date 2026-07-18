@@ -87,6 +87,13 @@ fn prepare_mlx_c_source() -> PathBuf {
     // TEMPORARY: drop once Apple tags an mlx-c release that supports 0.31.2 (main already does).
     // Unlike the MLX combined.patch (applied to the fetched MLX git checkout via CMake
     // PATCH_COMMAND), this targets the copied mlx-c source tree, so we apply it here with `patch`.
+    //
+    // sc-12745 (MLX 0.31.2 -> 0.32.0) CARRY-FORWARD: this patch is NOT 0.31.2-specific and is
+    // NOT droppable at 0.32.0. sc-12744 measurement confirmed 0.32.0's mlx/fft.h STILL declares
+    // `FFTNorm norm = FFTNorm::Backward` before `StreamOrDevice s`, while Apple's pinned mlx-c
+    // 0.6.0 still calls `fft*(... stream)` — dropping the patch yields exactly 12 "no matching
+    // function" errors across the fft/ifft/rfft/irfft family. The patch targets the unchanged
+    // pinned mlx-c 0.6.0 source, so it applies cleanly to 0.32.0 as-is.
     let fft_patch =
         std::fs::canonicalize("patches/mlx-c-fft-norm.patch").expect("find mlx-c-fft-norm.patch");
     let status = Command::new("patch")
@@ -146,14 +153,15 @@ fn prepare_mlx_c_source() -> PathBuf {
         .expect("Failed to write combined patch");
 
     // Inject PATCH_COMMAND into the FetchContent_Declare for MLX, and bump the fetched MLX tag
-    // v0.31.1 -> v0.31.2 (sc-2781: byte-parity with the 0.31.2 production/golden environments).
-    // The MLX combined.patch (metallib-search-path) still applies via the single CMake PATCH_COMMAND.
+    // v0.31.1 -> v0.32.0 (sc-2781 pinned 0.31.2 for byte-parity; sc-12745 bumps to 0.32.0 —
+    // measured + audited GO in slice 2). The MLX combined.patch (metallib-search-path +
+    // command-buffer-recoverable) still applies cleanly to 0.32.0 via the single CMake PATCH_COMMAND.
     let cmake_path = staged.join("CMakeLists.txt");
     let cmake_content =
         std::fs::read_to_string(&cmake_path).expect("Failed to read CMakeLists.txt");
     let patched = cmake_content.replace(
         "GIT_TAG v0.31.1)",
-        "GIT_TAG v0.31.2\n    PATCH_COMMAND git apply ${CMAKE_CURRENT_SOURCE_DIR}/patches/combined.patch || true)",
+        "GIT_TAG v0.32.0\n    PATCH_COMMAND git apply ${CMAKE_CURRENT_SOURCE_DIR}/patches/combined.patch || true)",
     );
     std::fs::write(&cmake_path, patched).expect("Failed to write patched CMakeLists.txt");
 
