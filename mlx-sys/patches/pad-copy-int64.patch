@@ -1,0 +1,36 @@
+--- a/mlx/backend/metal/copy.cpp
++++ b/mlx/backend/metal/copy.cpp
+@@ -57,8 +57,31 @@
+   int ndim = shape.size();
+   bool large;
+   if (ctype == CopyType::General || ctype == CopyType::GeneralGeneral) {
+-    // Allow for negative strides
+-    large = in.data_size() > INT32_MAX || out.data_size() > INT32_MAX;
++    // The dispatch "large" flag must reflect the TRUE addressable element span
++    // the copy kernel's per-thread index arithmetic can reach, not
++    // out.data_size(). pad()/concatenate() hand copy_gpu_inplace a slice-VIEW
++    // `out` whose data_size() is only the small copied input-region count while
++    // its strides are the FULL destination's, so out.data_size() under-reports
++    // the destination offset range: the int32 `g`/`gg` kernels (IdxT=int) then
++    // overflow their int32 dst_idx above 2^31 and silently corrupt. Route to
++    // the int64 (`*large`) kernels whenever either side's max reachable element
++    // offset, offset + Sum_i (shape[i]-1) * |stride_i| (abs allows for negative
++    // strides), exceeds INT32_MAX. transpose/reshape/contiguous pass a
++    // full-array `out` whose data_size() already equals this span, so they are
++    // unaffected (kept as an OR term below, never relaxed).
++    auto max_offset = [](const Shape& shp,
++                         const Strides& strides,
++                         int64_t offset) {
++      int64_t span = offset;
++      for (int i = 0; i < static_cast<int>(shp.size()); ++i) {
++        int64_t st = strides[i] < 0 ? -strides[i] : strides[i];
++        span += static_cast<int64_t>(shp[i] - 1) * st;
++      }
++      return span;
++    };
++    large = in.data_size() > INT32_MAX || out.data_size() > INT32_MAX ||
++        max_offset(shape, strides_in_, inp_offset) > INT32_MAX ||
++        max_offset(shape, strides_out_, out_offset) > INT32_MAX;
+   } else {
+     large = out.data_size() > UINT32_MAX;
+   }
