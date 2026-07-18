@@ -131,10 +131,16 @@ fn prepare_mlx_c_source() -> PathBuf {
     //     per-encoder error_ / poisons signal events instead of throwing, and it is
     //     re-thrown synchronously on the waiting thread via synchronize() /
     //     EventImpl::check_error). So the 0.31.2 production record-not-throw logic is
-    //     retired as redundant. This patch is regenerated to add ONLY the debug-only
-    //     (NDEBUG-gated) test hook mlx_pmetal_test_inject_command_buffer_error, which
-    //     lets mlx-tests/tests/command_buffer_recoverable.rs drive that upstream
-    //     recovery path deterministically (without tripping the real GPU watchdog).
+    //     retired as redundant. The patch adds ONLY the debug-only (NDEBUG-gated)
+    //     test hook mlx_pmetal_test_inject_command_buffer_error, which lets
+    //     mlx-tests/tests/command_buffer_recoverable.rs drive that upstream recovery
+    //     path deterministically (without tripping the real GPU watchdog). sc-12786:
+    //     the hook now injects THROUGH the real upstream mechanism — Event::signal
+    //     drains it on the host thread and poisons the event via the real
+    //     EventImpl::set_error, so the error is re-raised by unpatched upstream code
+    //     (EventImpl::wait -> check_error). Previously it was drained by a patched-in
+    //     check in the outer Event::wait BEFORE EventImpl::wait, which could not
+    //     catch a regression of the real set_error/check_error plumbing.
     //   - pad-copy-int64.patch                : sc-12746 (epic 12742) — fix the
     //     copy_gpu_inplace dispatch gate in backend/metal/copy.cpp. pad() and
     //     concatenate() hand copy_gpu_inplace a slice-VIEW `out` whose

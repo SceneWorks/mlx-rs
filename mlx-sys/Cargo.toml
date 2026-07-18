@@ -12,6 +12,12 @@ categories.workspace = true
 license.workspace = true
 readme = "README.md"
 
+# sc-12940: the fork renamed the PACKAGE to pmetal-mlx-sys, but the lib target
+# must keep the upstream crate name. Dependents already import it as `mlx_sys`
+# via workspace aliasing, and this crate's own examples refer to `mlx_sys`.
+[lib]
+name = "mlx_sys"
+
 [package.metadata.docs.rs]
 targets = [
   "aarch64-apple-darwin",
