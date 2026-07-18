@@ -1,8 +1,8 @@
 name: publish-docs
-# SceneWorks fork: manual-dispatch only — GitHub Pages is not enabled on the
-# fork, so an auto-run on push to main would fail at the Setup Pages step.
-# Re-add the push trigger if/when Pages is enabled for this repo.
 on:
+  push:
+    branches:
+      - main
   workflow_dispatch:
 
 permissions:
