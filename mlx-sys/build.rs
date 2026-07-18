@@ -166,6 +166,24 @@ fn prepare_mlx_c_source() -> PathBuf {
     //     new_thread_unsafe_stream, #3578), restoring cross-thread stream
     //     visibility. Concurrent eval on the SAME stream from two threads
     //     remains the caller's responsibility (unchanged from upstream).
+    //   - thread-safe-eval.patch             : sc-12959 — closes the three
+    //     hazards the sc-12937 patch left open, making the fork's threading
+    //     model coherent ("streams visible everywhere, all eval serialized,
+    //     O(devices) streams"):
+    //     (1) process-global recursive eval lock (detail::eval_mutex) taken by
+    //         eval_impl and synchronize — concurrent cross-thread eval now
+    //         serializes instead of racing a shared command encoder into a
+    //         Metal SIGABRT. eval()'s host-side completion wait stays OUTSIDE
+    //         the lock (synchronize(Stream) drains under it by design). This
+    //         enforces the pmetal consumer contract (single eval thread,
+    //         batch-dimension concurrency) that was previously discipline-only.
+    //     (2) shared_mutex on the global encoder maps (metal + cpu) — the
+    //         fallback read in get_command_encoder no longer races another
+    //         thread's first-stream registration (unordered_map rehash UB).
+    //     (3) process-global default stream (was per-thread) — a dying worker
+    //         thread (tokio spawn_blocking churn) no longer strands one
+    //         CommandEncoder + MTLCommandQueue per thread in the global map;
+    //         stream count is O(devices). Safe because of (1).
     //
     // The sc-2714 (dense GEMM) and sc-2770 (fast SDPA) NAX-dispatch gate patches were
     // REMOVED in sc-2772. Their root cause was never the dispatch or the MLX version: the
@@ -202,6 +220,7 @@ fn prepare_mlx_c_source() -> PathBuf {
         ("patches/command-buffer-recoverable.patch", true),
         ("patches/pad-copy-int64.patch", true),
         ("patches/thread-shared-streams.patch", true),
+        ("patches/thread-safe-eval.patch", true),
     ];
     // sc-12780 idempotency guard: CMake FetchContent may re-run PATCH_COMMAND against an
     // mlx-src that is ALREADY patched (e.g. an incremental rebuild that does not re-fetch).

@@ -1,0 +1,281 @@
+diff --git a/mlx/backend/cpu/encoder.cpp b/mlx/backend/cpu/encoder.cpp
+index bb2c06ea..627c7a7c 100644
+--- a/mlx/backend/cpu/encoder.cpp
++++ b/mlx/backend/cpu/encoder.cpp
+@@ -10,13 +10,16 @@ CommandEncoder& get_command_encoder(Stream s) {
+   auto& encoders = get_command_encoders();
+   auto it = encoders.find(s.index);
+   if (it == encoders.end()) {
++    // pmetal (sc-12959): see the matching comment in metal/device.cpp.
++    std::shared_lock lock(get_global_command_encoders_mutex());
+     auto& global_encoders = get_global_command_encoders();
+-    it = global_encoders.find(s.index);
+-    if (it == global_encoders.end()) {
++    auto git = global_encoders.find(s.index);
++    if (git == global_encoders.end()) {
+       throw std::runtime_error(
+           fmt::format(
+               "There is no Stream(cpu, {}) in current thread.", s.index));
+     }
++    return git->second;
+   }
+   return it->second;
+ }
+@@ -31,4 +34,10 @@ std::unordered_map<int, CommandEncoder>& get_global_command_encoders() {
+   return encoders;
+ }
+ 
++std::shared_mutex& get_global_command_encoders_mutex() {
++  // Leaked like the scheduler singleton (see metal/device.cpp).
++  static auto* mtx = new std::shared_mutex();
++  return *mtx;
++}
++
+ } // namespace mlx::core::cpu
+diff --git a/mlx/backend/cpu/encoder.h b/mlx/backend/cpu/encoder.h
+index cd015623..b4080375 100644
+--- a/mlx/backend/cpu/encoder.h
++++ b/mlx/backend/cpu/encoder.h
+@@ -2,6 +2,7 @@
+ 
+ #pragma once
+ 
++#include <shared_mutex>
+ #include <unordered_map>
+ 
+ #include "mlx/array.h"
+@@ -66,5 +67,7 @@ MLX_API CommandEncoder& get_command_encoder(Stream s);
+ 
+ std::unordered_map<int, CommandEncoder>& get_command_encoders();
+ std::unordered_map<int, CommandEncoder>& get_global_command_encoders();
++// pmetal (sc-12959): see the matching comment in backend/metal/device.h.
++std::shared_mutex& get_global_command_encoders_mutex();
+ 
+ } // namespace mlx::core::cpu
+diff --git a/mlx/backend/cpu/eval.cpp b/mlx/backend/cpu/eval.cpp
+index 7d13fd2f..a76350f5 100644
+--- a/mlx/backend/cpu/eval.cpp
++++ b/mlx/backend/cpu/eval.cpp
+@@ -16,6 +16,8 @@ void new_stream(Stream s) {
+ }
+ 
+ void new_thread_unsafe_stream(Stream s) {
++  // pmetal (sc-12959): see the matching comment in metal/eval.cpp.
++  std::unique_lock lock(get_global_command_encoders_mutex());
+   auto& encoders = get_global_command_encoders();
+   encoders.try_emplace(s.index, s);
+ }
+diff --git a/mlx/backend/metal/device.cpp b/mlx/backend/metal/device.cpp
+index 2f4b007b..00d7a1f5 100644
+--- a/mlx/backend/metal/device.cpp
++++ b/mlx/backend/metal/device.cpp
+@@ -957,13 +957,19 @@ CommandEncoder& get_command_encoder(Stream s) {
+   auto& encoders = get_command_encoders();
+   auto it = encoders.find(s.index);
+   if (it == encoders.end()) {
++    // pmetal (sc-12959): the global map is written by any thread's first
++    // stream creation (sc-12937), so the fallback read takes a shared lock —
++    // an unguarded find during rehash is UB. Bind the element REFERENCE
++    // inside the locked scope: references survive rehash, iterators do not.
++    std::shared_lock lock(get_global_command_encoders_mutex());
+     auto& global_encoders = get_global_command_encoders();
+-    it = global_encoders.find(s.index);
+-    if (it == global_encoders.end()) {
++    auto git = global_encoders.find(s.index);
++    if (git == global_encoders.end()) {
+       throw std::runtime_error(
+           fmt::format(
+               "There is no Stream(gpu, {}) in current thread.", s.index));
+     }
++    return git->second;
+   }
+   return it->second;
+ }
+@@ -978,6 +984,13 @@ std::unordered_map<int, CommandEncoder>& get_global_command_encoders() {
+   return encoders;
+ }
+ 
++std::shared_mutex& get_global_command_encoders_mutex() {
++  // Leaked like the scheduler singleton: worker threads may still look up
++  // encoders during static destruction.
++  static auto* mtx = new std::shared_mutex();
++  return *mtx;
++}
++
+ NS::SharedPtr<NS::AutoreleasePool> new_scoped_memory_pool() {
+   return NS::TransferPtr(NS::AutoreleasePool::alloc()->init());
+ }
+diff --git a/mlx/backend/metal/device.h b/mlx/backend/metal/device.h
+index 871e95cc..02d5caa2 100644
+--- a/mlx/backend/metal/device.h
++++ b/mlx/backend/metal/device.h
+@@ -251,6 +251,11 @@ MLX_API CommandEncoder& get_command_encoder(Stream s);
+ 
+ std::unordered_map<int, CommandEncoder>& get_command_encoders();
+ std::unordered_map<int, CommandEncoder>& get_global_command_encoders();
++// pmetal (sc-12959): guards get_global_command_encoders() — readers take a
++// shared lock, writers (stream registration / clear) an exclusive one.
++// unordered_map element references remain valid after unlock (rehash never
++// invalidates references), so returning an encoder reference is safe.
++std::shared_mutex& get_global_command_encoders_mutex();
+ NS::SharedPtr<NS::AutoreleasePool> new_scoped_memory_pool();
+ 
+ bool is_nax_available();
+diff --git a/mlx/backend/metal/eval.cpp b/mlx/backend/metal/eval.cpp
+index 3d0c56ef..9e3e18cf 100644
+--- a/mlx/backend/metal/eval.cpp
++++ b/mlx/backend/metal/eval.cpp
+@@ -98,6 +98,9 @@ void new_stream(Stream s) {
+ 
+ void new_thread_unsafe_stream(Stream s) {
+   assert(s.device == Device::gpu);
++  // pmetal (sc-12959): exclusive lock — registration may race another
++  // thread's fallback read in get_command_encoder.
++  std::unique_lock lock(metal::get_global_command_encoders_mutex());
+   auto& encoders = metal::get_global_command_encoders();
+   auto& d = metal::device(s.device);
+   encoders.try_emplace(s.index, d, s.index, d.residency_set());
+@@ -160,6 +163,8 @@ void synchronize(Stream s) {
+ void clear_streams() {
+   metal::get_command_encoders().clear();
+   if (is_main_thread()) {
++    // pmetal (sc-12959): exclusive lock, same reason as registration.
++    std::unique_lock lock(metal::get_global_command_encoders_mutex());
+     metal::get_global_command_encoders().clear();
+   }
+ }
+diff --git a/mlx/scheduler.cpp b/mlx/scheduler.cpp
+index 7507917f..01e471f7 100644
+--- a/mlx/scheduler.cpp
++++ b/mlx/scheduler.cpp
+@@ -3,11 +3,16 @@
+ #include "mlx/scheduler.h"
+ #include "mlx/backend/cpu/eval.h"
+ #include "mlx/backend/gpu/eval.h"
++#include "mlx/transforms_impl.h"
+ #include "mlx/utils.h"
+ 
+ namespace mlx::core {
+ 
+ void synchronize(Stream s) {
++  // pmetal (sc-12959): CommandEncoder::synchronize() mutates encoder state
++  // (end_encoding + commit); take the process-global eval lock so it cannot
++  // race an in-flight eval encoding on the same encoder.
++  std::lock_guard<std::recursive_mutex> eval_lk(detail::eval_mutex());
+   if (s.device == mlx::core::Device::cpu) {
+     auto p = std::make_shared<std::promise<void>>();
+     std::future<void> f = p->get_future();
+diff --git a/mlx/stream.cpp b/mlx/stream.cpp
+index b78ee67d..987639bd 100644
+--- a/mlx/stream.cpp
++++ b/mlx/stream.cpp
+@@ -8,6 +8,7 @@
+ 
+ #include <array>
+ #include <map>
++#include <mutex>
+ #include <optional>
+ #include <shared_mutex>
+ 
+@@ -15,9 +16,25 @@ namespace mlx::core {
+ 
+ namespace {
+ 
++auto& default_stream_storage_mutex() {
++  // Leaked like the scheduler singleton: worker threads may still resolve
++  // the default stream during static destruction.
++  static auto* mtx = new std::mutex();
++  return *mtx;
++}
++
+ auto& default_stream_storage(Device d) {
+-  // Each device has its own default stream in each thread.
+-  static thread_local auto default_streams = []() {
++  // pmetal (sc-12959): the default stream is PROCESS-GLOBAL (upstream: one
++  // per thread). Per-thread defaults meant every OS thread that touched MLX
++  // lazily created its own stream whose CommandEncoder + MTLCommandQueue now
++  // live in the global encoder map for process lifetime (sc-12937) — a real
++  // leak under the pmetal worker's spawn_blocking-per-job pattern, where
++  // blocking-pool threads die on idle. One shared default stream per device
++  // caps stream/encoder count at O(devices) instead of O(threads). Safe
++  // because all evaluation is serialized by detail::eval_mutex() (see
++  // transforms_impl.h). Callers must hold default_stream_storage_mutex().
++  // ThreadLocalStream (new_thread_local_stream) keeps per-thread semantics.
++  static auto default_streams = []() {
+     std::array<std::vector<std::optional<Stream>>, 2> streams;
+     streams[static_cast<size_t>(Device::cpu)].resize(cpu::device_count());
+     streams[static_cast<size_t>(Device::gpu)].resize(gpu::device_count());
+@@ -43,6 +60,7 @@ Stream default_stream(Device d) {
+     throw std::invalid_argument(
+         "[default_stream] Cannot get gpu stream without gpu backend.");
+   }
++  std::lock_guard lock(default_stream_storage_mutex());
+   auto& s = default_stream_storage(d);
+   if (!s.has_value()) {
+     s = new_stream(d.type);
+@@ -55,6 +73,7 @@ void set_default_stream(Stream s) {
+     throw std::invalid_argument(
+         "[set_default_stream] Cannot set gpu stream without gpu backend.");
+   }
++  std::lock_guard lock(default_stream_storage_mutex());
+   default_stream_storage(s.device) = s;
+ }
+ 
+diff --git a/mlx/transforms.cpp b/mlx/transforms.cpp
+index 9a820733..a8585c95 100644
+--- a/mlx/transforms.cpp
++++ b/mlx/transforms.cpp
+@@ -77,7 +77,19 @@ int& detail::InExportTracing::counter() {
+ }
+ thread_local int detail::RetainGraph::tracing_counter{0};
+ 
++namespace detail {
++std::recursive_mutex& eval_mutex() {
++  // Leaked like the scheduler singleton: worker threads may still encode
++  // during static destruction.
++  static auto* mtx = new std::recursive_mutex();
++  return *mtx;
++}
++} // namespace detail
++
+ array eval_impl(std::vector<array> outputs, bool async) {
++  // pmetal (sc-12959): serialize all evaluation process-wide (see
++  // transforms_impl.h). Scope ends before the caller's host-side wait().
++  std::lock_guard<std::recursive_mutex> eval_lk(detail::eval_mutex());
+   std::deque<array> tape;
+ 
+   // Make an effort to choose a good output stream
+diff --git a/mlx/transforms_impl.h b/mlx/transforms_impl.h
+index 4fc78a1a..03a3194e 100644
+--- a/mlx/transforms_impl.h
++++ b/mlx/transforms_impl.h
+@@ -2,10 +2,29 @@
+ 
+ #pragma once
+ 
++#include <mutex>
++
+ #include "mlx/api.h"
+ 
+ namespace mlx::core::detail {
+ 
++// pmetal (sc-12959): process-global evaluation lock. MLX evaluation encodes
++// GPU work on per-stream command encoders and is not safe to run from two
++// threads at once; with the sc-12937 thread-shared-streams patch every stream
++// (including the process-global default stream) is visible from every thread,
++// so concurrent eval_impl calls could race the same encoder into a Metal
++// assertion (SIGABRT). The pmetal consumer contract is "single eval thread /
++// batch-dimension concurrency" (inference gen-core runtime.rs, schedule.rs);
++// this lock turns that documented discipline into an enforced invariant.
++// Recursive so an unexpected nested entry deadlocks nothing. eval()'s and
++// array::wait()'s host-side completion waits happen OUTSIDE the lock, so a
++// thread waiting on finished-encoding work does not starve other evals.
++// synchronize(Stream) intentionally drains the stream UNDER the lock, and
++// eval_impl can host-block under it in scheduler::wait_for_one (memory
++// backpressure) — both are safe: Metal completion handlers and cpu
++// StreamThread tasks never acquire this mutex.
++MLX_API std::recursive_mutex& eval_mutex();
++
+ MLX_API std::pair<std::vector<array>, std::vector<array>> vmap_trace(
+     const std::function<std::vector<array>(const std::vector<array>&)>& fun,
+     const std::vector<array>& inputs,
