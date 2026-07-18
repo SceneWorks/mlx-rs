@@ -1,31 +1,47 @@
 diff --git a/mlx/backend/metal/eval.cpp b/mlx/backend/metal/eval.cpp
-index e682625..a047dcc 100644
+index e682625..d923511 100644
 --- a/mlx/backend/metal/eval.cpp
 +++ b/mlx/backend/metal/eval.cpp
-@@ -8,6 +8,58 @@
+@@ -8,6 +8,75 @@
  #include "mlx/scheduler.h"
  #include "mlx/utils.h"
  
-+// pmetal (sc-5009 / sc-12780): debug-only test hook for the recoverable
-+// command-buffer path.
++// pmetal (sc-5009 / sc-12780 / sc-12786): debug-only test hook for the
++// recoverable command-buffer path.
 +//
-+// MLX 0.32.0 already makes an asynchronous Metal command-buffer error
-+// recoverable UPSTREAM: the completion handler in CommandEncoder::commit()
-+// (device.cpp) RECORDS the error into the per-encoder error_ and poisons the
-+// signal events instead of throwing — throwing there runs on an internal Metal
-+// thread, crosses a noexcept boundary, and std::terminate()s (SIGABRT). The
-+// recorded error is re-thrown synchronously on the waiting thread
-+// (CommandEncoder::synchronize / EventImpl::check_error). This is exactly the
-+// behavior the old 0.31.2 pmetal patch added by hand, so NO production
-+// record-not-throw patch is required at 0.32.0.
++// MLX 0.32.0 makes an asynchronous Metal command-buffer error recoverable
++// UPSTREAM: the completion handler in CommandEncoder::commit() (device.cpp)
++// RECORDS the error into the per-encoder error_ and POISONS the buffer's
++// signal events via EventImpl::set_error() instead of throwing — throwing
++// there runs on an internal Metal thread, crosses a noexcept boundary, and
++// std::terminate()s (SIGABRT). The poisoned error is re-thrown synchronously
++// on the waiting (host) thread by EventImpl::wait() -> check_error(), or by
++// CommandEncoder::synchronize(). This is the behavior the old 0.31.2 pmetal
++// patch added by hand, so NO production record-not-throw patch is required at
++// 0.32.0.
 +//
 +// What upstream does NOT provide is a way to drive that path DETERMINISTICALLY
 +// from a test without tripping the real GPU watchdog (non-deterministic, and it
-+// can disrupt the host display). This hook records a synthetic error into a
-+// debug-only slot that the host-blocking Event::wait() (event.cpp) drains and
-+// re-throws — the same host-wait path a real poisoned event surfaces through.
-+// It is compiled out of release builds via NDEBUG, so it adds no production
-+// symbol. Tests declare it with `extern "C"`
++// can disrupt the host display). This hook records a synthetic error that
++// Event::signal() (event.cpp) drains on the host thread at signal-encode time
++// and injects through the REAL upstream poison mechanism — the same
++// EventImpl::set_error() call the commit() completion handler's poison loop
++// makes. From there the error surfaces through UNPATCHED upstream code only
++// (EventImpl::wait -> check_error -> throw on the waiting thread), so the test
++// regression-guards the actual 0.32.0 poison/re-raise plumbing (sc-12786).
++//
++// The injection is deliberately NOT placed in the completion handler itself:
++// for a successfully-completed buffer the GPU signals the shared event BEFORE
++// the handler runs on Metal's callback thread, so a handler-side injection
++// races the waiter's check_error() and the test would flake. (A real
++// command-buffer ERROR has no such race: Metal does not signal the events, and
++// the handler poisons them before manually signaling.) Draining at
++// Event::signal() — on the host thread, strictly before the host-side wait can
++// begin — keeps the test deterministic while still exercising the real
++// set_error/check_error path.
++//
++// Compiled out of release builds via NDEBUG, so it adds no production symbol.
++// Tests declare it with `extern "C"`
 +// (mlx-tests/tests/command_buffer_recoverable.rs).
 +#ifndef NDEBUG
 +namespace mlx::core::metal {
@@ -35,9 +51,10 @@ index e682625..a047dcc 100644
 +std::string g_injected_cb_error_msg;
 +} // namespace
 +
-+// Drain a synthetically-injected command-buffer error (debug/test only). Returns
-+// true and fills `out` if one was pending, and clears it so it is not sticky —
-+// mirroring how a real command-buffer error is taken exactly once by the waiter.
++// Drain a synthetically-injected command-buffer error (debug/test only).
++// Returns true and fills `out` if one was pending, and clears it so exactly
++// one event is poisoned per injection — mirroring how a real command-buffer
++// error is taken exactly once by the waiter (check_error's atomic exchange).
 +bool take_injected_command_buffer_error(std::string& out) {
 +  std::lock_guard<std::mutex> lk(g_injected_cb_error_mtx);
 +  if (!g_injected_cb_error_set) {
@@ -62,17 +79,17 @@ index e682625..a047dcc 100644
  
  void init() {}
 diff --git a/mlx/backend/metal/event.cpp b/mlx/backend/metal/event.cpp
-index 77f48f0..c5b774c 100644
+index 77f48f0..1e76e8c 100644
 --- a/mlx/backend/metal/event.cpp
 +++ b/mlx/backend/metal/event.cpp
 @@ -3,6 +3,16 @@
  #include "mlx/backend/metal/event.h"
  #include "mlx/scheduler.h"
  
-+// pmetal (sc-5009 / sc-12780): defined in eval.cpp, debug/test builds only.
-+// Drains a synthetically-injected command-buffer error so the recoverable-error
-+// path can be exercised deterministically without tripping the real GPU
-+// watchdog. See the block comment in eval.cpp.
++// pmetal (sc-5009 / sc-12780 / sc-12786): defined in eval.cpp, debug/test
++// builds only. Drains a synthetically-injected command-buffer error so the
++// upstream recoverable-error path can be exercised deterministically without
++// tripping the real GPU watchdog. See the block comment in eval.cpp.
 +#ifndef NDEBUG
 +namespace mlx::core::metal {
 +bool take_injected_command_buffer_error(std::string& out);
@@ -82,22 +99,29 @@ index 77f48f0..c5b774c 100644
  namespace mlx::core {
  
  ///////////////////////////////////////////////////////////////////////////////
-@@ -57,6 +67,18 @@ Event::Event(Stream stream) : stream_(stream) {
- }
+@@ -74,6 +84,25 @@ void Event::wait(Stream stream) {
  
- void Event::wait() {
+ void Event::signal(Stream stream) {
+   auto impl = std::static_pointer_cast<metal::EventImpl>(event_);
 +#ifndef NDEBUG
-+  // pmetal (sc-5009 / sc-12780): surface a synthetically-injected command-buffer
-+  // error here, on the calling (host) thread, as a catchable std::runtime_error
-+  // — the same host-wait path a real poisoned event surfaces through
-+  // (EventImpl::check_error). Debug/test only; compiled out of release builds.
++  // pmetal (sc-12786): drain a synthetically-injected command-buffer error and
++  // poison this event through the REAL upstream mechanism — the same
++  // EventImpl::set_error() the CommandEncoder::commit() completion handler's
++  // poison loop calls on the buffer's signal events. Draining here (host
++  // thread, at signal-encode time, strictly before any host-side wait can
++  // observe this event) keeps the test deterministic; a handler-side injection
++  // would race the waiter's check_error() for a successfully-completed buffer.
++  // From here on the error travels through UNPATCHED upstream code only:
++  // EventImpl::wait() -> check_error() -> throw on the waiting thread. See the
++  // block comment in eval.cpp. Debug/test only; compiled out of release
++  // builds.
 +  {
 +    std::string injected;
 +    if (metal::take_injected_command_buffer_error(injected)) {
-+      throw std::runtime_error(injected);
++      impl->set_error(std::make_shared<std::string>(injected));
 +    }
 +  }
 +#endif
-   static_cast<metal::EventImpl*>(event_.get())->wait(value());
- }
- 
+   if (stream.device == Device::cpu) {
+     scheduler::enqueue(stream, [impl = std::move(impl), value = value()]() {
+       impl->signal(value);
