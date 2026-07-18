@@ -1,9 +1,11 @@
+diff --git a/mlx/backend/metal/device.cpp b/mlx/backend/metal/device.cpp
+index 29eecf5..2f4b007 100644
 --- a/mlx/backend/metal/device.cpp
 +++ b/mlx/backend/metal/device.cpp
-@@ -87,6 +87,28 @@
+@@ -189,8 +189,33 @@ std::pair<MTL::Library*, NS::Error*> load_swiftpm_library(
+   return {nullptr, nullptr};
  }
- #endif
-
+ 
 +// pmetal: Check PMETAL_METALLIB_PATH env var (set by pmetal-cli at startup)
 +std::pair<MTL::Library*, NS::Error*> load_env_override_library(
 +    MTL::Device* device) {
@@ -26,13 +28,19 @@
 +  return {nullptr, nullptr};
 +}
 +
- // Firstly, search for the metallib in the same path as this binary
- std::pair<MTL::Library*, NS::Error*> load_colocated_library(
-     MTL::Device* device,
-@@ -134,38 +156,55 @@
- }
-
  MTL::Library* load_default_library(MTL::Device* device) {
+-  // Check override path before automatic lookup
++  // Check override path before automatic lookup (upstream metal::set_metallib_path,
++  // ml-explore/mlx #3597). pmetal never calls set_metallib_path(), so this is inert
++  // by default and resolution falls through to the pmetal precedence chain below; it
++  // is preserved so an explicit upstream override still works and takes top priority.
+   if (!get_metallib_path().empty()) {
+     auto [lib, error] =
+         load_library_from_path(device, get_metallib_path().c_str());
+@@ -204,38 +229,55 @@ MTL::Library* load_default_library(MTL::Device* device) {
+     return lib;
+   }
+ 
 -  NS::Error* error[5];
 +  NS::Error* error[7];
    MTL::Library* lib;
@@ -44,7 +52,7 @@
    if (lib) {
      return lib;
    }
-
+ 
 -  std::tie(lib, error[1]) = load_colocated_library(device, "Resources/mlx");
 +  // pmetal (sc-7898): Prefer the metallib built alongside THIS binary (the
 +  // compiled-in METAL_PATH) over the shared user cache, so a stale/older
@@ -55,7 +63,7 @@
    if (lib) {
      return lib;
    }
-
+ 
 -  // Then try default.metallib in a SwiftPM bundle if we have one
 -  std::tie(lib, error[2]) = load_swiftpm_library(device, "default");
 +  // pmetal: Try user cache directory (fallback for installed binaries)
@@ -63,7 +71,7 @@
    if (lib) {
      return lib;
    }
-
+ 
 -  // Try lo load resources from Framework resources if SwiftPM wrapped as a
 -  // dynamic framework.
 -  std::tie(lib, error[3]) = load_colocated_library(device, "Resources/default");
@@ -83,7 +91,7 @@
    if (lib) {
      return lib;
    }
-
+ 
 -  // Finally try default_mtllib_path
 -  std::tie(lib, error[4]) = load_library_from_path(device, default_mtllib_path);
 +  // Try lo load resources from Framework resources if SwiftPM wrapped as a
