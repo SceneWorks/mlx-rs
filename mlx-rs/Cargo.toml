@@ -11,6 +11,13 @@ documentation.workspace = true
 description = "pmetal-maintained fork of mlx-rs: unofficial rust wrapper for Apple's mlx machine learning library."
 readme = "README.md"
 
+# sc-12940: the fork renamed the PACKAGE to pmetal-mlx-rs, but the lib target
+# must keep the upstream crate name. Dependents already import it as `mlx_rs`
+# via workspace aliasing; doctests, this crate's examples, and the publish-docs
+# redirect (target/doc/mlx_rs) all refer to `mlx_rs` and break without this.
+[lib]
+name = "mlx_rs"
+
 [package.metadata.docs.rs]
 targets = [
   "aarch64-apple-darwin",
