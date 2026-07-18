@@ -161,11 +161,14 @@ fn resolve_task_local_key() -> Option<Result<Array>> {
 
 fn resolve_global_key() -> Result<Array> {
     let mut state = global_state().lock();
-    let key = state.next()?;
-    // Evaluate the freshly split state and key on the thread that recorded
-    // them (see note on global_state); both are outputs of the same split op.
-    state.as_array().eval()?;
+    // Split on the calling thread (the stored state is always evaluated, so
+    // these ops only reference data-backed inputs), then evaluate BEFORE
+    // committing the new state: the global state must never hold a lazy
+    // array, even on an error path (see note on global_state).
+    let (next_state, key) = split(state.as_array(), 2)?;
+    next_state.eval()?;
     key.eval()?;
+    *state.as_array_mut() = next_state;
     Ok(key)
 }
 
@@ -199,10 +202,13 @@ where
 
 /// Seed the random number generator.
 pub fn seed(seed: u64) -> Result<()> {
+    // Build and evaluate the new key before taking the lock, so the global
+    // state is only ever replaced by an evaluated array (see global_state).
+    let new_key = key(seed)?;
+    new_key.eval()?;
     let mut state = global_state().lock();
-    state.seed(seed)?;
-    // Evaluate before the state can cross threads (see note on global_state).
-    state.as_array().eval()
+    *state.as_array_mut() = new_key;
+    Ok(())
 }
 
 /// Get a PRNG key from a seed.
