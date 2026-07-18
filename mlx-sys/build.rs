@@ -183,7 +183,8 @@ fn prepare_mlx_c_source() -> PathBuf {
     // isolated to its own patch, and per-file atomicity prevents a dangerous half-apply of a
     // partially-matching patch.
     //
-    // sc-12780: ALL THREE patches are now `required = true`. The metallib and command-buffer
+    // sc-12780: ALL patches are `required = true` (three at the time; sc-12937
+    // adds a fourth under the same policy). The metallib and command-buffer
     // patches were regenerated for MLX 0.32.0 (their 0.31.2 context had drifted and both were
     // temporarily demoted to best-effort no-ops by sc-12746, which is exactly how the sc-12745
     // bump silently shipped WITHOUT them). Re-arming them to required=true makes a future silent
