@@ -116,3 +116,51 @@ fn test_evaluated_array_used_from_other_thread() {
 
     assert_eq!(out, 14.0);
 }
+
+/// sc-12959: the default stream is process-global — every thread sees the
+/// same stream for the default device (upstream: one per thread). This is
+/// what caps encoder/queue count at O(devices) instead of O(threads that
+/// ever touched MLX). RED without the thread-safe-eval patch (per-thread
+/// defaults produce distinct stream indices).
+#[test]
+fn test_default_stream_shared_across_threads() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+
+    let here = mlx_rs::Stream::new().get_index().unwrap();
+    let there = std::thread::spawn(|| mlx_rs::Stream::new().get_index().unwrap())
+        .join()
+        .unwrap();
+    assert_eq!(
+        here, there,
+        "default stream must be process-global (sc-12959), got {here} vs {there}"
+    );
+}
+
+/// sc-12959: concurrent evaluation from many threads must be safe — the
+/// process-global eval lock serializes encoding, so this must neither SIGABRT
+/// ("A command encoder is already encoding") nor corrupt results. With the
+/// process-global default stream every thread contends on the SAME stream,
+/// making this the worst case. Deterministic assertions per thread.
+#[test]
+fn test_concurrent_eval_from_many_threads() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+
+    let handles: Vec<_> = (0..8)
+        .map(|i| {
+            std::thread::spawn(move || {
+                let scale = (i + 1) as f32;
+                for _ in 0..25 {
+                    let a = Array::from_slice(&[scale, scale, scale, scale], &[2, 2]);
+                    let b = ones::<f32>(&[2, 2]).unwrap();
+                    let sum = a.add(&b).unwrap().sum(None).unwrap();
+                    sum.eval().unwrap();
+                    assert_eq!(sum.item::<f32>(), 4.0 * (scale + 1.0));
+                }
+            })
+        })
+        .collect();
+
+    for h in handles {
+        h.join().unwrap();
+    }
+}
