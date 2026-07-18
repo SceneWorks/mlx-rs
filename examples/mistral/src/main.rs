@@ -6,7 +6,7 @@ use mlx_rs::{
     array,
     module::{Module, ModuleParametersExt},
     ops::indexing::{argmax_axis, IndexOp, NewAxis},
-    random::categorical,
+    random::{categorical, RandomState},
     transforms::eval,
     Array,
 };
@@ -79,12 +79,13 @@ fn load_model(repo: &ApiRepo) -> Result<Mistral> {
     Ok(model)
 }
 
-fn sample(logits: &Array, temp: f32) -> Result<Array> {
+fn sample(logits: &Array, temp: f32, random_state: &mut RandomState) -> Result<Array> {
     match temp {
         0.0 => argmax_axis(logits, -1, None).map_err(Into::into),
         _ => {
             let logits = logits.multiply(array!(1.0 / temp))?;
-            categorical(logits, None, None, None).map_err(Into::into)
+            let key = random_state.next_key()?;
+            categorical(logits, None, None, &key).map_err(Into::into)
         }
     }
 }
@@ -101,6 +102,7 @@ macro_rules! tri {
 struct Generate<'a> {
     model: &'a mut Mistral,
     temp: f32,
+    random_state: RandomState,
     state: GenerateState<'a>,
 }
 
@@ -115,12 +117,18 @@ enum GenerateState<'a> {
 }
 
 impl<'a> Generate<'a> {
-    pub fn new(model: &'a mut Mistral, prompt_token: &'a Array, temp: f32) -> Self {
-        Self {
+    pub fn new(
+        model: &'a mut Mistral,
+        prompt_token: &'a Array,
+        temp: f32,
+        seed: u64,
+    ) -> Result<Self> {
+        Ok(Self {
             model,
             temp,
+            random_state: RandomState::with_seed(seed)?,
             state: GenerateState::Prefill { prompt_token },
-        }
+        })
     }
 }
 
@@ -136,7 +144,11 @@ impl Iterator for Generate<'_> {
                     cache: &initial_cache,
                 };
                 let MistralOutput { logits, cache } = tri!(self.model.forward(input));
-                let y = tri!(sample(&logits.index((.., -1, ..)), self.temp));
+                let y = tri!(sample(
+                    &logits.index((.., -1, ..)),
+                    self.temp,
+                    &mut self.random_state,
+                ));
 
                 self.state = GenerateState::Decoding {
                     y: y.clone(),
@@ -157,7 +169,7 @@ impl Iterator for Generate<'_> {
                 } = tri!(self.model.forward(input));
 
                 let logits = tri!(logits.squeeze_axes(&[1]));
-                let y = tri!(sample(&logits, self.temp));
+                let y = tri!(sample(&logits, self.temp, &mut self.random_state));
 
                 self.state = GenerateState::Decoding {
                     y: y.clone(),
@@ -180,8 +192,6 @@ fn main() -> Result<()> {
     // Parse args
     let cli = Cli::parse();
 
-    mlx_rs::random::seed(cli.seed)?;
-
     // The model used in the original example is converted to safetensors and
     // uploaded to the huggingface hub
     let model_id = "minghuaw/Mistral-7B-v0.1".to_string();
@@ -196,7 +206,7 @@ fn main() -> Result<()> {
     let prompt_tokens = Array::from(encoding.get_ids()).index(NewAxis);
     print!("{}", cli.prompt);
 
-    let generate = Generate::new(&mut model, &prompt_tokens, cli.temp);
+    let generate = Generate::new(&mut model, &prompt_tokens, cli.temp, cli.seed)?;
     let mut tokens = Vec::with_capacity(cli.max_tokens);
     for (token, ntoks) in generate.zip(0..cli.max_tokens) {
         let token = token?;
