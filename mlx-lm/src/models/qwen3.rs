@@ -1,12 +1,11 @@
 use std::{
+    cell::RefCell,
     collections::{HashMap, HashSet},
     path::Path,
 };
 
 use mlx_rs::{
-    argmax_axis, array,
     builder::Builder,
-    categorical,
     error::Exception,
     macros::{ModuleParameters, Quantizable},
     module::{Module, ModuleParametersExt},
@@ -22,6 +21,7 @@ use tokenizers::Tokenizer;
 use crate::{
     cache::KeyValueCache,
     error::Error,
+    sampler::{DefaultSampler, Sampler},
     utils::{
         create_attention_mask,
         rope::{initialize_rope, FloatOrString},
@@ -537,20 +537,29 @@ pub fn load_qwen3_model(model_dir: impl AsRef<Path>) -> Result<Model, Error> {
     Ok(model)
 }
 
+thread_local! {
+    static SAMPLE_STATE: RefCell<DefaultSampler> = RefCell::new(DefaultSampler::new());
+}
+
+/// Sample a token using thread-local random state.
+///
+/// This retains the legacy free-function API without advancing the
+/// process-global RNG, whose MLX 0.32 safety invariant requires a synchronous
+/// state materialization for every keyless draw.
 pub fn sample(logits: &Array, temp: f32) -> Result<Array, Exception> {
-    match temp {
-        0.0 => argmax_axis!(logits, -1),
-        _ => {
-            let logits = logits.multiply(array!(1.0 / temp))?;
-            categorical!(logits)
-        }
-    }
+    SAMPLE_STATE.with_borrow_mut(|sampler| sampler.sample(logits, temp))
+}
+
+/// Reset the legacy free-function sampler to a reproducible seed.
+pub fn seed_sampler(seed: u64) -> Result<(), Exception> {
+    SAMPLE_STATE.with_borrow_mut(|sampler| sampler.seed(seed))
 }
 
 pub struct Generate<'a, C> {
     model: &'a mut Model,
     cache: &'a mut Vec<Option<C>>,
     temp: f32,
+    sampler: DefaultSampler,
     state: GenerateState<'a>,
 }
 
@@ -568,8 +577,26 @@ where
             model,
             cache,
             temp,
+            sampler: DefaultSampler::new(),
             state: GenerateState::Prefill { prompt_token },
         }
+    }
+
+    /// Construct a generator with reproducible sampler-owned random state.
+    pub fn new_with_seed(
+        model: &'a mut Model,
+        cache: &'a mut Vec<Option<C>>,
+        temp: f32,
+        prompt_token: &'a Array,
+        seed: u64,
+    ) -> Result<Self, Exception> {
+        Ok(Self {
+            model,
+            cache,
+            temp,
+            sampler: DefaultSampler::with_seed(seed)?,
+            state: GenerateState::Prefill { prompt_token },
+        })
     }
 }
 
@@ -602,7 +629,7 @@ where
                     cache: self.cache,
                 };
                 let logits = tri!(self.model.forward(input));
-                let y = tri!(sample(&logits.index((.., -1, ..)), self.temp));
+                let y = tri!(self.sampler.sample(&logits.index((.., -1, ..)), self.temp));
                 self.state = GenerateState::Decode { y: y.clone() };
 
                 Some(Ok(y))
@@ -615,7 +642,7 @@ where
                     cache: self.cache,
                 };
                 let logits = tri!(self.model.forward(input));
-                let y = tri!(sample(&logits, self.temp));
+                let y = tri!(self.sampler.sample(&logits, self.temp));
 
                 self.state = GenerateState::Decode { y: y.clone() };
 

@@ -30,7 +30,7 @@ impl Generate<(), ()> {
             prompt: (),
             temp: 0.0,
             max_tokens: 256,
-            sampler: DefaultSampler,
+            sampler: DefaultSampler::new(),
             cache_marker: PhantomData,
             state: (),
         }

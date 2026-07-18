@@ -1,6 +1,11 @@
 use crate::module::Module;
 use crate::Array;
-use crate::{array, error::Exception, ops::multiply, random::bernoulli};
+use crate::{
+    array,
+    error::Exception,
+    ops::multiply,
+    random::{bernoulli, RandomState},
+};
 use mlx_internal_macros::{Buildable, Builder};
 use mlx_macros::ModuleParameters;
 
@@ -30,6 +35,7 @@ fn build_dropout(builder: DropoutBuilder) -> Result<Dropout, DropoutBuildError> 
     Ok(Dropout {
         one_minus_p: 1.0 - p,
         training: Dropout::DEFAULT_TRAINING,
+        random_state: RandomState::default(),
     })
 }
 
@@ -49,6 +55,9 @@ pub struct Dropout {
     /// Whether the layer is in training mode. Default to [`Dropout::DEFAULT_TRAINING`] if not
     /// specified.
     pub training: bool,
+
+    #[param]
+    random_state: RandomState,
 }
 
 impl Dropout {
@@ -57,6 +66,12 @@ impl Dropout {
 
     /// Default value for the training mode.
     pub const DEFAULT_TRAINING: bool = true;
+
+    /// Set the layer-owned random state to a reproducible seed.
+    pub fn with_seed(mut self, seed: u64) -> Result<Self, Exception> {
+        self.random_state.seed(seed)?;
+        Ok(self)
+    }
 }
 
 impl Module<&Array> for Dropout {
@@ -69,7 +84,8 @@ impl Module<&Array> for Dropout {
         }
 
         let p1 = array!(self.one_minus_p);
-        let mask = bernoulli(&p1, x.shape(), None)?;
+        let key = self.random_state.next_key()?;
+        let mask = bernoulli(&p1, x.shape(), &key)?;
         multiply(multiply(array!(1.0 / self.one_minus_p), mask)?, x)
     }
 
@@ -102,6 +118,7 @@ fn build_dropout2d(builder: Dropout2dBuilder) -> Result<Dropout2d, DropoutBuildE
     Ok(Dropout2d {
         one_minus_p: 1.0 - p,
         training: Dropout2d::DEFAULT_TRAINING,
+        random_state: RandomState::default(),
     })
 }
 
@@ -133,6 +150,9 @@ pub struct Dropout2d {
     /// Whether the layer is in training mode. Default to [`Dropout2d::DEFAULT_TRAINING`] if not
     /// specified. Default to [`Dropout2d::DEFAULT_TRAINING`] if not specified.
     pub training: bool,
+
+    #[param]
+    random_state: RandomState,
 }
 
 impl Dropout2d {
@@ -141,6 +161,12 @@ impl Dropout2d {
 
     /// Default value for the training mode.
     pub const DEFAULT_TRAINING: bool = true;
+
+    /// Set the layer-owned random state to a reproducible seed.
+    pub fn with_seed(mut self, seed: u64) -> Result<Self, Exception> {
+        self.random_state.seed(seed)?;
+        Ok(self)
+    }
 }
 
 impl Module<&Array> for Dropout2d {
@@ -168,7 +194,8 @@ impl Module<&Array> for Dropout2d {
         mask_shape[len - 3] = 1;
 
         let p1 = array!(self.one_minus_p);
-        let mask = bernoulli(&p1, &mask_shape, None)?;
+        let key = self.random_state.next_key()?;
+        let mask = bernoulli(&p1, &mask_shape, &key)?;
 
         multiply(multiply(array!(1.0 / self.one_minus_p), mask)?, x)
     }
@@ -202,6 +229,7 @@ fn build_dropout3d(builder: Dropout3dBuilder) -> Result<Dropout3d, DropoutBuildE
     Ok(Dropout3d {
         one_minus_p: 1.0 - p,
         training: Dropout3d::DEFAULT_TRAINING,
+        random_state: RandomState::default(),
     })
 }
 
@@ -229,6 +257,9 @@ pub struct Dropout3d {
     /// Whether the layer is in training mode. Default to [`Dropout3d::DEFAULT_TRAINING`] if not
     /// specified.
     pub training: bool,
+
+    #[param]
+    random_state: RandomState,
 }
 
 impl Dropout3d {
@@ -237,6 +268,12 @@ impl Dropout3d {
 
     /// Default value for the training mode.
     pub const DEFAULT_TRAINING: bool = true;
+
+    /// Set the layer-owned random state to a reproducible seed.
+    pub fn with_seed(mut self, seed: u64) -> Result<Self, Exception> {
+        self.random_state.seed(seed)?;
+        Ok(self)
+    }
 }
 
 impl Module<&Array> for Dropout3d {
@@ -265,7 +302,8 @@ impl Module<&Array> for Dropout3d {
         mask_shape[len - 4] = 1;
 
         let p1 = array!(self.one_minus_p);
-        let mask = bernoulli(&p1, &mask_shape, None)?;
+        let key = self.random_state.next_key()?;
+        let mask = bernoulli(&p1, &mask_shape, &key)?;
 
         multiply(multiply(array!(1.0 / self.one_minus_p), mask)?, x)
     }
@@ -279,101 +317,143 @@ impl Module<&Array> for Dropout3d {
 // mlx-swift/Tests/MLXTests/IntegrationTests.swift
 #[cfg(test)]
 mod tests {
-    use crate::random::uniform;
+    use crate::module::ModuleParameters;
+    use crate::random::{key, uniform};
+    use crate::transforms::compile::compile_with_state;
     use float_eq::assert_float_eq;
 
     use super::*;
 
     #[test]
     fn test_dropout() {
-        crate::random::seed(959).unwrap();
-        let a = uniform::<_, f32>(0.0, 1.0, &[2, 8, 16], None).unwrap();
+        let a = uniform::<_, f32>(0.0, 1.0, &[2, 8, 16], &key(959).unwrap()).unwrap();
         assert_eq!(a.shape(), &[2, 8, 16]);
         assert_eq!(a.dtype(), crate::Dtype::Float32);
-        assert_float_eq!(
-            a.mean(None).unwrap().item::<f32>(),
-            0.511_429_2,
-            abs <= 0.010_228_584
-        );
-        assert_float_eq!(
-            a.sum(None).unwrap().item::<f32>(),
-            130.925_87,
-            abs <= 2.618_517_4
-        );
-        let result = Dropout::new().forward(&a).unwrap();
+        assert_float_eq!(a.mean(None).unwrap().item::<f32>(), 0.5, abs <= 0.06);
+        assert_float_eq!(a.sum(None).unwrap().item::<f32>(), 128.0, abs <= 15.36);
+        let result = Dropout::new().with_seed(959).unwrap().forward(&a).unwrap();
+        let repeated = Dropout::new().with_seed(959).unwrap().forward(&a).unwrap();
         assert_eq!(result.shape(), &[2, 8, 16]);
         assert_eq!(result.dtype(), crate::Dtype::Float32);
-        assert_float_eq!(
-            result.mean(None).unwrap().item::<f32>(),
-            0.477_913_62,
-            abs <= 0.009_558_273
-        );
-        assert_float_eq!(
-            result.sum(None).unwrap().item::<f32>(),
-            122.345_89,
-            abs <= 2.446_917_8
-        );
+        assert_float_eq!(result.mean(None).unwrap().item::<f32>(), 0.5, abs <= 0.1);
+        assert_float_eq!(result.sum(None).unwrap().item::<f32>(), 128.0, abs <= 25.6);
+        assert_eq!(result.as_slice::<f32>(), repeated.as_slice::<f32>());
     }
 
     #[test]
     fn test_dropout2d() {
-        crate::random::seed(695).unwrap();
-        let a = uniform::<_, f32>(0.0, 1.0, &[2, 8, 16], None).unwrap();
+        let a = uniform::<_, f32>(0.0, 1.0, &[2, 8, 16], &key(695).unwrap()).unwrap();
         assert_eq!(a.shape(), &[2, 8, 16]);
         assert_eq!(a.dtype(), crate::Dtype::Float32);
-        assert_float_eq!(
-            a.mean(None).unwrap().item::<f32>(),
-            0.457_839_9,
-            abs <= 0.009_156_798
-        );
-        assert_float_eq!(
-            a.sum(None).unwrap().item::<f32>(),
-            117.207_016,
-            abs <= 2.344_140_3
-        );
-        let result = Dropout2d::new().forward(&a).unwrap();
+        assert_float_eq!(a.mean(None).unwrap().item::<f32>(), 0.5, abs <= 0.06);
+        assert_float_eq!(a.sum(None).unwrap().item::<f32>(), 128.0, abs <= 15.36);
+        let result = Dropout2d::new()
+            .with_seed(695)
+            .unwrap()
+            .forward(&a)
+            .unwrap();
+        let repeated = Dropout2d::new()
+            .with_seed(695)
+            .unwrap()
+            .forward(&a)
+            .unwrap();
         assert_eq!(result.shape(), &[2, 8, 16]);
         assert_eq!(result.dtype(), crate::Dtype::Float32);
-        assert_float_eq!(
-            result.mean(None).unwrap().item::<f32>(),
-            0.368_284_34,
-            abs <= 0.007_365_687
-        );
-        assert_float_eq!(
-            result.sum(None).unwrap().item::<f32>(),
-            94.280_79,
-            abs <= 1.885_615_8
-        );
+        assert_float_eq!(result.mean(None).unwrap().item::<f32>(), 0.5, abs <= 0.25);
+        assert_float_eq!(result.sum(None).unwrap().item::<f32>(), 128.0, abs <= 64.0);
+        assert_eq!(result.as_slice::<f32>(), repeated.as_slice::<f32>());
     }
 
     #[test]
     fn test_dropout3d() {
-        crate::random::seed(23).unwrap();
-        let a = uniform::<_, f32>(0.0, 1.0, &[2, 8, 8, 4], None).unwrap();
+        let a = uniform::<_, f32>(0.0, 1.0, &[2, 8, 8, 4], &key(23).unwrap()).unwrap();
         assert_eq!(a.shape(), &[2, 8, 8, 4]);
         assert_eq!(a.dtype(), crate::Dtype::Float32);
-        assert_float_eq!(
-            a.mean(None).unwrap().item::<f32>(),
-            0.500_606_2,
-            abs <= 0.010_012_124
-        );
-        assert_float_eq!(
-            a.sum(None).unwrap().item::<f32>(),
-            256.310_36,
-            abs <= 5.126_207_4
-        );
-        let result = Dropout3d::new().forward(&a).unwrap();
+        assert_float_eq!(a.mean(None).unwrap().item::<f32>(), 0.5, abs <= 0.06);
+        assert_float_eq!(a.sum(None).unwrap().item::<f32>(), 256.0, abs <= 30.72);
+        let result = Dropout3d::new().with_seed(23).unwrap().forward(&a).unwrap();
+        let repeated = Dropout3d::new().with_seed(23).unwrap().forward(&a).unwrap();
         assert_eq!(result.shape(), &[2, 8, 8, 4]);
         assert_eq!(result.dtype(), crate::Dtype::Float32);
-        assert_float_eq!(
-            result.mean(None).unwrap().item::<f32>(),
-            0.237_284_15,
-            abs <= 0.004_745_683
+        assert_float_eq!(result.mean(None).unwrap().item::<f32>(), 0.5, abs <= 0.3);
+        assert_float_eq!(result.sum(None).unwrap().item::<f32>(), 256.0, abs <= 153.6);
+        assert_eq!(result.as_slice::<f32>(), repeated.as_slice::<f32>());
+    }
+
+    #[test]
+    fn dropout_layers_do_not_consume_global_rng() {
+        fn next_global() -> f32 {
+            uniform::<_, f32>(0.0, 1.0, None, None)
+                .unwrap()
+                .item::<f32>()
+        }
+
+        crate::random::seed(1234).unwrap();
+        let expected = next_global();
+
+        crate::random::seed(1234).unwrap();
+        Dropout::new()
+            .with_seed(1)
+            .unwrap()
+            .forward(&Array::ones::<f32>(&[2, 8, 16]).unwrap())
+            .unwrap()
+            .eval()
+            .unwrap();
+        assert_eq!(expected, next_global());
+
+        crate::random::seed(1234).unwrap();
+        Dropout2d::new()
+            .with_seed(2)
+            .unwrap()
+            .forward(&Array::ones::<f32>(&[2, 8, 16]).unwrap())
+            .unwrap()
+            .eval()
+            .unwrap();
+        assert_eq!(expected, next_global());
+
+        crate::random::seed(1234).unwrap();
+        Dropout3d::new()
+            .with_seed(3)
+            .unwrap()
+            .forward(&Array::ones::<f32>(&[2, 8, 8, 4]).unwrap())
+            .unwrap()
+            .eval()
+            .unwrap();
+        assert_eq!(expected, next_global());
+    }
+
+    #[test]
+    fn compiled_dropout_advances_and_replays_seeded_state() {
+        let x = Array::ones::<f32>(&[256]).unwrap();
+        let run = |seed| {
+            let mut layer = Dropout::new().with_seed(seed).unwrap();
+            let mut compiled =
+                compile_with_state(|layer: &mut Dropout, x: &Array| layer.forward(x), None);
+            let first = compiled(&mut layer, &x).unwrap();
+            let second = compiled(&mut layer, &x).unwrap();
+            first.eval().unwrap();
+            second.eval().unwrap();
+            (
+                first.as_slice::<f32>().to_vec(),
+                second.as_slice::<f32>().to_vec(),
+            )
+        };
+
+        let (first, second) = run(42);
+        assert_ne!(first, second, "compiled dropout must advance its RNG state");
+        assert_eq!(
+            (first, second),
+            run(42),
+            "the same seed must replay both masks"
         );
-        assert_float_eq!(
-            result.sum(None).unwrap().item::<f32>(),
-            121.489_49,
-            abs <= 2.429_789_8
-        );
+    }
+
+    #[test]
+    fn dropout_rng_state_is_frozen_and_non_trainable() {
+        let layer = Dropout::new().with_seed(42).unwrap();
+        assert_eq!(layer.num_parameters(), 1);
+        assert_eq!(layer.parameters().flatten().len(), 1);
+        assert!(layer.trainable_parameters().flatten().is_empty());
+        assert_eq!(layer.all_frozen(), Some(true));
     }
 }

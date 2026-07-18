@@ -1,14 +1,21 @@
-//! Collection of functions related to random number generation
+//! Collection of functions related to random number generation.
+//!
+//! Every random operation accepts an optional PRNG key. Keyless calls use a
+//! task-local state installed by [`with_random_state`] before falling back to
+//! the process-global RNG. The global fallback must synchronously materialize
+//! each state advance under MLX 0.32. Hot loops should therefore use task-local
+//! state or pass explicit keys; both retain lazy execution.
 
 use crate::ops::indexing::TryIndexOp;
 use crate::utils::guard::Guarded;
 use crate::utils::IntoOption;
-use crate::{error::Result, Array, ArrayElement, Stream};
+use crate::{error::Result, module::Parameter, nested::NestedValue, Array, ArrayElement, Stream};
 use mach_sys::mach_time;
 use mlx_internal_macros::{default_device, generate_macro};
 use parking_lot::Mutex;
 use std::borrow::Cow;
 use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::OnceLock;
 
 static GLOBAL_STATE: OnceLock<Mutex<RandomState>> = OnceLock::new();
@@ -124,6 +131,36 @@ impl Default for RandomState {
     }
 }
 
+impl Parameter for RandomState {
+    // Module compilation currently discovers mutable state through the
+    // parameter tree. Expose the PRNG key as frozen state so compiled modules
+    // advance it, while excluding it from gradients and optimizer updates.
+    // This also makes module checkpoints preserve reproducible RNG progress.
+    fn count(&self) -> usize {
+        1
+    }
+
+    fn freeze(&mut self, _recursive: bool) {}
+
+    fn unfreeze(&mut self, _recursive: bool) {}
+
+    fn is_frozen(&self) -> Option<bool> {
+        Some(true)
+    }
+
+    fn as_nested_value(&self) -> NestedValue<Rc<str>, &Array> {
+        NestedValue::Value(&self.state)
+    }
+
+    fn as_nested_value_mut(&mut self) -> NestedValue<Rc<str>, &mut Array> {
+        NestedValue::Value(&mut self.state)
+    }
+
+    fn as_trainable_nested_value(&self) -> Option<NestedValue<Rc<str>, &Array>> {
+        None
+    }
+}
+
 impl crate::utils::Updatable for RandomState {
     fn updatable_states_len(&self) -> usize {
         1
@@ -184,20 +221,29 @@ fn resolve<'a>(key: impl Into<Option<&'a Array>>) -> Result<Cow<'a, Array>> {
     )
 }
 
-/// Use the given random state for the scope of `f`
-pub fn with_random_state<F, T>(state: RandomState, f: F) -> T
+/// Use the given random state for the scope of `f`.
+///
+/// Keyless random operations inside `f` use `state`, avoiding the synchronous
+/// process-global state update. The previous task-local state is restored even
+/// if `f` panics.
+///
+/// This is the escape hatch for hot loops that cannot conveniently thread an
+/// explicit key through every random operation.
+pub fn with_random_state<F, T>(random_state: RandomState, f: F) -> T
 where
     F: FnOnce() -> T,
 {
-    let prev_state = TASK_LOCAL_STATE.with_borrow_mut(|s| s.replace(state));
+    struct Restore(Option<RandomState>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let previous = self.0.take();
+            TASK_LOCAL_STATE.with_borrow_mut(|state| *state = previous);
+        }
+    }
 
-    let result = f();
-
-    TASK_LOCAL_STATE.with_borrow_mut(|s| {
-        *s = prev_state;
-    });
-
-    result
+    let previous = TASK_LOCAL_STATE.with_borrow_mut(|state| state.replace(random_state));
+    let _restore = Restore(previous);
+    f()
 }
 
 /// Seed the random number generator.
