@@ -379,6 +379,13 @@ fn build_and_link_mlx_c() {
     config.very_verbose(true);
     config.define("CMAKE_INSTALL_PREFIX", ".");
 
+    // mlx-c's example .app targets are never linked into this crate, and they do not build for
+    // every Apple platform: on the iOS **simulator** they fail with undefined `_MTLIOErrorDomain`
+    // (MTLIO is absent from the simulator's Metal framework), which fails the whole cmake build
+    // even though libmlx/libmlxc themselves compiled cleanly. Skipping them is free everywhere and
+    // unblocks aarch64-apple-ios-sim.
+    config.define("MLX_C_BUILD_EXAMPLES", "OFF");
+
     if let Some(platform) = &platform {
         let target = resolve_deployment_target(platform);
         // CMAKE_OSX_DEPLOYMENT_TARGET is the knob for every Apple platform, not just macOS.
