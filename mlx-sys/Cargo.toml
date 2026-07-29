@@ -10,6 +10,11 @@ keywords.workspace = true
 categories.workspace = true
 license.workspace = true
 readme = "README.md"
+# Declares this crate as the sole owner of the native MLX libraries, which is also what lets
+# build.rs publish `cargo:metadata` keys to dependents (cargo only forwards DEP_* to crates
+# whose dependency declares `links`). Dependents read DEP_MLX_METALLIB to locate the built
+# mlx.metallib — required for iOS, where it must be copied into the .app bundle.
+links = "mlx"
 
 [package.metadata.docs.rs]
 targets = [

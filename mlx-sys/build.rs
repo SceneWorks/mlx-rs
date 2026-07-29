@@ -451,6 +451,21 @@ fn build_and_link_mlx_c() {
         }
     }
 
+    // Publish the built metallib's path to dependents as DEP_MLX_METALLIB (requires the `links`
+    // key in Cargo.toml). This is the supported way off the host: `~/.cache/pmetal/lib` does not
+    // exist inside an iOS app sandbox, and the compiled-in METAL_PATH points into the cargo
+    // target directory, which is not shipped. An iOS packaging step reads this and copies the
+    // metallib into the .app, where MLX's `load_colocated_library` finds it next to the
+    // executable. Emitted on every platform — it is just a path — so a macOS packager can use it
+    // too rather than reaching into target/ by hand.
+    #[cfg(feature = "metal")]
+    {
+        let metallib = dst.join("build/lib/mlx.metallib");
+        if metallib.exists() {
+            println!("cargo:metallib={}", metallib.display());
+        }
+    }
+
     // Cache mlx.metallib to ~/.cache/pmetal/lib/ so the binary works regardless
     // of where it's installed. This is critical for `cargo install` where the
     // build directory is cleaned up after the binary is placed.
