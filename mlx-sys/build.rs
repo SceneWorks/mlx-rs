@@ -66,24 +66,55 @@ fn find_clang_rt_path(variant: &str) -> Option<String> {
     None
 }
 
-/// Resolve the macOS deployment target.
+/// The Apple platform being built for, resolved from the **target**, not the host.
 ///
-/// Enforces a minimum of 14.0 (MLX's requirement for Metal support).
-/// If `MACOSX_DEPLOYMENT_TARGET` is set to a higher value, that is used instead.
-/// Cargo/Tauri often default to 10.13, which MLX's CMakeLists.txt rejects.
-#[cfg(target_os = "macos")]
-fn resolve_deployment_target() -> String {
-    const MLX_MIN_MACOS: (u32, u32) = (14, 0);
+/// Each variant carries the environment variable Apple's toolchain reads for that platform, the
+/// CMake system name (`None` for macOS — a native build sets no `CMAKE_SYSTEM_NAME`), and MLX's
+/// minimum version for Metal support.
+struct ApplePlatform {
+    deployment_env: &'static str,
+    cmake_system_name: Option<&'static str>,
+    min_version: (u32, u32),
+}
 
-    if let Ok(val) = env::var("MACOSX_DEPLOYMENT_TARGET") {
+/// Resolve the Apple platform from cargo's target environment.
+///
+/// Build scripts compile for the host, so `cfg!(target_os = ...)` here reports the *host* even
+/// when cross-compiling. `CARGO_CFG_TARGET_OS` is the target.
+fn apple_platform() -> Option<ApplePlatform> {
+    match env::var("CARGO_CFG_TARGET_OS").unwrap_or_default().as_str() {
+        // MLX requires macOS >= 14.0 for Metal. Cargo/Tauri often default to 10.13, which MLX's
+        // CMakeLists.txt rejects.
+        "macos" => Some(ApplePlatform {
+            deployment_env: "MACOSX_DEPLOYMENT_TARGET",
+            cmake_system_name: None,
+            min_version: (14, 0),
+        }),
+        // iOS 16 is the floor for the Metal 3 feature set MLX's kernels assume. Note this is a
+        // *different* knob from MACOSX_DEPLOYMENT_TARGET — leaking the macOS value in here (e.g.
+        // "26.2") silently sets an iOS floor that excludes almost every shipping device.
+        "ios" => Some(ApplePlatform {
+            deployment_env: "IPHONEOS_DEPLOYMENT_TARGET",
+            cmake_system_name: Some("iOS"),
+            min_version: (16, 0),
+        }),
+        _ => None,
+    }
+}
+
+/// Resolve the deployment target for `platform`, honoring a higher explicitly-set value.
+fn resolve_deployment_target(platform: &ApplePlatform) -> String {
+    let (min_major, min_minor) = platform.min_version;
+
+    if let Ok(val) = env::var(platform.deployment_env) {
         let parts: Vec<u32> = val.split('.').filter_map(|s| s.parse().ok()).collect();
         let major = parts.first().copied().unwrap_or(0);
         let minor = parts.get(1).copied().unwrap_or(0);
-        if (major, minor) >= MLX_MIN_MACOS {
+        if (major, minor) >= (min_major, min_minor) {
             return val;
         }
     }
-    format!("{}.{}", MLX_MIN_MACOS.0, MLX_MIN_MACOS.1)
+    format!("{min_major}.{min_minor}")
 }
 
 /// Copy src/mlx-c to a staging directory and inject the metallib search-path
@@ -302,14 +333,14 @@ fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> std::io::
 }
 
 fn build_and_link_mlx_c() {
-    // MLX requires macOS >= 14.0 for Metal support. Override the deployment
-    // target early so the cmake crate (and cc crate) don't inject a lower
-    // -mmacosx-version-min flag into CFLAGS/CXXFLAGS. Without this, Cargo's
-    // default target (10.13) causes MLX's CMakeLists.txt to reject the build.
-    #[cfg(target_os = "macos")]
-    {
-        let target = resolve_deployment_target();
-        env::set_var("MACOSX_DEPLOYMENT_TARGET", &target);
+    // Resolve and export the deployment target early so the cmake crate (and the cc crate) don't
+    // inject a lower -m<platform>-version-min into CFLAGS/CXXFLAGS. Without this, cargo's default
+    // (10.13 on macOS, 10.0 on iOS) causes MLX's CMakeLists.txt to reject the build — and on iOS
+    // an unset target also drops __chkstk_darwin (libSystem, iOS 12+) at link time.
+    let platform = apple_platform();
+    if let Some(platform) = &platform {
+        let target = resolve_deployment_target(platform);
+        env::set_var(platform.deployment_env, &target);
     }
 
     let mlx_c_src = prepare_mlx_c_source();
@@ -317,10 +348,18 @@ fn build_and_link_mlx_c() {
     config.very_verbose(true);
     config.define("CMAKE_INSTALL_PREFIX", ".");
 
-    #[cfg(target_os = "macos")]
-    {
-        let target = resolve_deployment_target();
+    if let Some(platform) = &platform {
+        let target = resolve_deployment_target(platform);
+        // CMAKE_OSX_DEPLOYMENT_TARGET is the knob for every Apple platform, not just macOS.
         config.define("CMAKE_OSX_DEPLOYMENT_TARGET", &target);
+        if let Some(system_name) = platform.cmake_system_name {
+            // Cross-compiling: tell CMake the target platform and architecture explicitly.
+            config.define("CMAKE_SYSTEM_NAME", system_name);
+            if let Ok(arch) = env::var("CARGO_CFG_TARGET_ARCH") {
+                let arch = if arch == "aarch64" { "arm64" } else { &arch };
+                config.define("CMAKE_OSX_ARCHITECTURES", arch);
+            }
+        }
     }
 
     // Use Xcode's clang to ensure compatibility with the macOS SDK
@@ -384,8 +423,18 @@ fn build_and_link_mlx_c() {
     // Cache mlx.metallib to ~/.cache/pmetal/lib/ so the binary works regardless
     // of where it's installed. This is critical for `cargo install` where the
     // build directory is cleaned up after the binary is placed.
+    //
+    // macOS ONLY. The cache is a single shared, platform-agnostic path, so a cross-compiled
+    // build would silently overwrite the host's metallib with kernels for another platform —
+    // and the resolver has no way to tell them apart. Local `cargo test`/`run` binaries have no
+    // compiled-in metallib and resolve *solely* through this cache, so poisoning it breaks every
+    // subsequent macOS test run until a native build repairs it. An iOS app bundles its metallib
+    // in the `.app` and never reads `$HOME` anyway (there is nothing useful there in the sandbox).
     #[cfg(feature = "metal")]
-    {
+    if matches!(
+        env::var("CARGO_CFG_TARGET_OS").as_deref(),
+        Ok("macos") | Err(_)
+    ) {
         let metallib = dst.join("build/lib/mlx.metallib");
         if metallib.exists() {
             if let Ok(home) = env::var("HOME") {
