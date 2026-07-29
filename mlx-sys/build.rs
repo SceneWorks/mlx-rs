@@ -90,13 +90,22 @@ fn apple_platform() -> Option<ApplePlatform> {
             cmake_system_name: None,
             min_version: (14, 0),
         }),
-        // iOS 16 is the floor for the Metal 3 feature set MLX's kernels assume. Note this is a
-        // *different* knob from MACOSX_DEPLOYMENT_TARGET — leaking the macOS value in here (e.g.
-        // "26.2") silently sets an iOS floor that excludes almost every shipping device.
+        // iOS 18.0, chosen to match Metal versions rather than picked for recency:
+        //   iOS 16 -> Metal 300, iOS 17 -> Metal 310, iOS 18 -> Metal 320.
+        // MLX's own macOS floor (14.0) is Metal 310, so iOS 16 would be *below* the baseline
+        // its kernels assume. 18.0 also keeps `fence` coherent: the kernel is only built when
+        // MLX_METAL_VERSION >= 320, while fence.cpp's runtime guard is
+        // `__builtin_available(macOS 15, iOS 18, *)`. Building at iOS 17 would satisfy the
+        // runtime check on an iOS 18 device while the kernel was never compiled in — a missing
+        // kernel at `get_kernel("fence_wait")`. Latent today (MLX_METAL_FAST_SYNCH defaults
+        // off) but a real trap.
+        // Note this is a *different* knob from MACOSX_DEPLOYMENT_TARGET — leaking the macOS
+        // value in here (e.g. "26.2") silently sets an iOS floor that excludes every shipping
+        // device.
         "ios" => Some(ApplePlatform {
             deployment_env: "IPHONEOS_DEPLOYMENT_TARGET",
             cmake_system_name: Some("iOS"),
-            min_version: (16, 0),
+            min_version: (18, 0),
         }),
         _ => None,
     }
@@ -201,6 +210,27 @@ fn prepare_mlx_c_source() -> PathBuf {
     //     onto the EXISTING int64 (`*large`) kernels — no copy.metal edit. This
     //     is exactly the follow-up MLX PR #3524 (0.32.0) deferred for pad/concat;
     //     an upstream ml-explore/mlx PR is prepared separately.
+    //   - ios-metal-sdk.patch                 : cross-compile the Metal kernels for iOS.
+    //     MLX's kernel rules hardcode `xcrun -sdk macosx metal` and
+    //     `-mmacosx-version-min`, so a CMAKE_SYSTEM_NAME=iOS build still emitted a
+    //     **macOS** metallib: the C++ cross-compiled, the binary linked, and the
+    //     artifact would have failed on device. (MLX's root CMakeLists already
+    //     guards its SDK probe on `CMAKE_SYSTEM_NAME STREQUAL "Darwin"` and falls
+    //     back to MLX_METAL_VERSION 0, so upstream anticipated non-macOS
+    //     configuration — the kernel rules just never got the matching branch.)
+    //     The patch selects the SDK and version-min flag by platform in both the
+    //     per-kernel compile and the metallib link, and adds an iOS arm to the root
+    //     probe so MLX_METAL_VERSION is detected rather than pinned to 0 (0 would
+    //     silently drop every MLX_METAL_VERSION-gated kernel).
+    //     Deployment target matters here: iOS 16 -> Metal 300, 17 -> 310, 18 -> 320.
+    //     MLX's macOS floor (14.0) is Metal 310, so iOS 16 is BELOW the baseline its
+    //     kernels assume; resolve_deployment_target() floors iOS at 18.0 (Metal 320).
+    //     That also keeps `fence` coherent — the kernel is built only at
+    //     MLX_METAL_VERSION >= 320 while fence.cpp's runtime guard is
+    //     `__builtin_available(macOS 15, iOS 18, *)`, so a lower floor could satisfy
+    //     the runtime check with the kernel absent.
+    //     The NAX gate fails safe on iOS: it needs Metal >= 400 AND
+    //     MACOS_SDK_VERSION >= 26.2, and the latter is unset off macOS.
     //
     // The sc-2714 (dense GEMM) and sc-2770 (fast SDPA) NAX-dispatch gate patches were
     // REMOVED in sc-2772. Their root cause was never the dispatch or the MLX version: the
@@ -235,6 +265,7 @@ fn prepare_mlx_c_source() -> PathBuf {
         ("patches/metallib-search-path.patch", true),
         ("patches/command-buffer-recoverable.patch", true),
         ("patches/pad-copy-int64.patch", true),
+        ("patches/ios-metal-sdk.patch", true),
     ];
     // sc-12780 idempotency guard: CMake FetchContent may re-run PATCH_COMMAND against an
     // mlx-src that is ALREADY patched (e.g. an incremental rebuild that does not re-fetch).
