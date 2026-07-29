@@ -3,8 +3,30 @@ extern crate cmake;
 use cmake::Config;
 use std::{env, path::PathBuf, process::Command};
 
-/// Find the clang runtime library path dynamically using xcrun
-fn find_clang_rt_path() -> Option<String> {
+/// The clang runtime variant to link, chosen for the **target**, not the host.
+///
+/// This link exists solely as a macOS 26+ workaround (see the call site): Xcode's clang runtime
+/// supplies `___isPlatformVersionAtLeast` when the bundled LLVM runtime is outdated. It is
+/// **macOS-specific**, so every other target gets `None`:
+///
+/// - `libclang_rt.osx.a` linked into an iOS binary is rejected with "Unsupported archive
+///   identifier", which is what made cross-compilation fail before this was target-aware;
+/// - the `ios` / `iossim` archives are rejected the same way *and* are not needed — the Rust
+///   toolchain supplies the equivalent on those targets.
+///
+/// Build scripts are compiled for the host, so `cfg!(target_os = ...)` in this file always reports
+/// the *host* platform when cross-compiling. Read cargo's target environment instead.
+fn clang_rt_variant() -> Option<&'static str> {
+    match env::var("CARGO_CFG_TARGET_OS").unwrap_or_default().as_str() {
+        "macos" => Some("osx"),
+        _ => None,
+    }
+}
+
+/// Find the clang runtime library path dynamically using xcrun.
+///
+/// `variant` is the platform suffix from [`clang_rt_variant`] — e.g. `osx`, `ios`, `iossim`.
+fn find_clang_rt_path(variant: &str) -> Option<String> {
     // Use xcrun to find the active toolchain path
     let output = Command::new("xcrun")
         .args(["--show-sdk-platform-path"])
@@ -35,7 +57,7 @@ fn find_clang_rt_path() -> Option<String> {
     let clang_dir = std::fs::read_dir(&toolchain_base).ok()?;
     for entry in clang_dir.flatten() {
         let darwin_path = entry.path().join("lib/darwin");
-        let clang_rt_lib = darwin_path.join("libclang_rt.osx.a");
+        let clang_rt_lib = darwin_path.join(format!("libclang_rt.{variant}.a"));
         if clang_rt_lib.exists() {
             return Some(darwin_path.to_string_lossy().to_string());
         }
@@ -352,9 +374,11 @@ fn build_and_link_mlx_c() {
     // Link against Xcode's clang runtime for ___isPlatformVersionAtLeast symbol
     // This is needed on macOS 26+ where the bundled LLVM runtime may be outdated
     // See: https://github.com/conda-forge/llvmdev-feedstock/issues/244
-    if let Some(clang_rt_path) = find_clang_rt_path() {
-        println!("cargo:rustc-link-search={}", clang_rt_path);
-        println!("cargo:rustc-link-lib=static=clang_rt.osx");
+    if let Some(clang_rt) = clang_rt_variant() {
+        if let Some(clang_rt_path) = find_clang_rt_path(clang_rt) {
+            println!("cargo:rustc-link-search={}", clang_rt_path);
+            println!("cargo:rustc-link-lib=static=clang_rt.{clang_rt}");
+        }
     }
 
     // Cache mlx.metallib to ~/.cache/pmetal/lib/ so the binary works regardless
