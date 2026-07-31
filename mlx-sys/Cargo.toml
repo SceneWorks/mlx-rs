@@ -3,6 +3,7 @@ name = "pmetal-mlx-sys"
 version = "0.2.4" # mlx-sys version should follow that of mlx-c
 authors.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 
 description = "pmetal-maintained fork of mlx-sys: low-level interface and binding generation for the mlx library"
 repository = "https://github.com/oxiglade/mlx-rs"
@@ -15,6 +16,12 @@ readme = "README.md"
 # whose dependency declares `links`). Dependents read DEP_MLX_METALLIB to locate the built
 # mlx.metallib — required for iOS, where it must be copied into the .app bundle.
 links = "mlx"
+
+# sc-12940: the fork renamed the PACKAGE to pmetal-mlx-sys, but the lib target
+# must keep the upstream crate name. Dependents already import it as `mlx_sys`
+# via workspace aliasing, and this crate's own examples refer to `mlx_sys`.
+[lib]
+name = "mlx_sys"
 
 [package.metadata.docs.rs]
 targets = [

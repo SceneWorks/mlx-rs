@@ -1,14 +1,21 @@
-//! Collection of functions related to random number generation
+//! Collection of functions related to random number generation.
+//!
+//! Every random operation accepts an optional PRNG key. Keyless calls use a
+//! task-local state installed by [`with_random_state`] before falling back to
+//! the process-global RNG. The global fallback must synchronously materialize
+//! each state advance under MLX 0.32. Hot loops should therefore use task-local
+//! state or pass explicit keys; both retain lazy execution.
 
 use crate::ops::indexing::TryIndexOp;
 use crate::utils::guard::Guarded;
 use crate::utils::IntoOption;
-use crate::{error::Result, Array, ArrayElement, Stream};
+use crate::{error::Result, module::Parameter, nested::NestedValue, Array, ArrayElement, Stream};
 use mach_sys::mach_time;
 use mlx_internal_macros::{default_device, generate_macro};
 use parking_lot::Mutex;
 use std::borrow::Cow;
 use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::OnceLock;
 
 static GLOBAL_STATE: OnceLock<Mutex<RandomState>> = OnceLock::new();
@@ -124,6 +131,36 @@ impl Default for RandomState {
     }
 }
 
+impl Parameter for RandomState {
+    // Module compilation currently discovers mutable state through the
+    // parameter tree. Expose the PRNG key as frozen state so compiled modules
+    // advance it, while excluding it from gradients and optimizer updates.
+    // This also makes module checkpoints preserve reproducible RNG progress.
+    fn count(&self) -> usize {
+        1
+    }
+
+    fn freeze(&mut self, _recursive: bool) {}
+
+    fn unfreeze(&mut self, _recursive: bool) {}
+
+    fn is_frozen(&self) -> Option<bool> {
+        Some(true)
+    }
+
+    fn as_nested_value(&self) -> NestedValue<Rc<str>, &Array> {
+        NestedValue::Value(&self.state)
+    }
+
+    fn as_nested_value_mut(&mut self) -> NestedValue<Rc<str>, &mut Array> {
+        NestedValue::Value(&mut self.state)
+    }
+
+    fn as_trainable_nested_value(&self) -> Option<NestedValue<Rc<str>, &Array>> {
+        None
+    }
+}
+
 impl crate::utils::Updatable for RandomState {
     fn updatable_states_len(&self) -> usize {
         1
@@ -138,8 +175,19 @@ impl crate::utils::Updatable for RandomState {
     }
 }
 
+// sc-12787: the global state is shared across threads, but MLX 0.32 gives each
+// thread its own default stream and evaluates lazy graph nodes on the calling
+// thread ("There is no Stream(gpu, N) in current thread" otherwise). Any state
+// array stored here must therefore be EVALUATED before the lock is released,
+// so no thread is ever asked to evaluate ops recorded on another thread's
+// stream. Task-local / user-owned RandomState is single-threaded by
+// construction and keeps its lazy semantics.
 fn global_state() -> &'static Mutex<RandomState> {
-    GLOBAL_STATE.get_or_init(|| Mutex::new(RandomState::new().unwrap()))
+    GLOBAL_STATE.get_or_init(|| {
+        let state = RandomState::new().unwrap();
+        state.as_array().eval().unwrap();
+        Mutex::new(state)
+    })
 }
 
 /// Returns a key from the task-local state if it exists, otherwise
@@ -150,7 +198,15 @@ fn resolve_task_local_key() -> Option<Result<Array>> {
 
 fn resolve_global_key() -> Result<Array> {
     let mut state = global_state().lock();
-    state.next()
+    // Split on the calling thread (the stored state is always evaluated, so
+    // these ops only reference data-backed inputs), then evaluate BEFORE
+    // committing the new state: the global state must never hold a lazy
+    // array, even on an error path (see note on global_state).
+    let (next_state, key) = split(state.as_array(), 2)?;
+    next_state.eval()?;
+    key.eval()?;
+    *state.as_array_mut() = next_state;
+    Ok(key)
 }
 
 /// Use given key or generate a new one if `None`.
@@ -165,26 +221,40 @@ fn resolve<'a>(key: impl Into<Option<&'a Array>>) -> Result<Cow<'a, Array>> {
     )
 }
 
-/// Use the given random state for the scope of `f`
-pub fn with_random_state<F, T>(state: RandomState, f: F) -> T
+/// Use the given random state for the scope of `f`.
+///
+/// Keyless random operations inside `f` use `state`, avoiding the synchronous
+/// process-global state update. The previous task-local state is restored even
+/// if `f` panics.
+///
+/// This is the escape hatch for hot loops that cannot conveniently thread an
+/// explicit key through every random operation.
+pub fn with_random_state<F, T>(random_state: RandomState, f: F) -> T
 where
     F: FnOnce() -> T,
 {
-    let prev_state = TASK_LOCAL_STATE.with_borrow_mut(|s| s.replace(state));
+    struct Restore(Option<RandomState>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let previous = self.0.take();
+            TASK_LOCAL_STATE.with_borrow_mut(|state| *state = previous);
+        }
+    }
 
-    let result = f();
-
-    TASK_LOCAL_STATE.with_borrow_mut(|s| {
-        *s = prev_state;
-    });
-
-    result
+    let previous = TASK_LOCAL_STATE.with_borrow_mut(|state| state.replace(random_state));
+    let _restore = Restore(previous);
+    f()
 }
 
 /// Seed the random number generator.
 pub fn seed(seed: u64) -> Result<()> {
+    // Build and evaluate the new key before taking the lock, so the global
+    // state is only ever replaced by an evaluated array (see global_state).
+    let new_key = key(seed)?;
+    new_key.eval()?;
     let mut state = global_state().lock();
-    state.seed(seed)
+    *state.as_array_mut() = new_key;
+    Ok(())
 }
 
 /// Get a PRNG key from a seed.
@@ -599,6 +669,27 @@ mod tests {
     use super::*;
     use crate::{array, assert_array_eq};
     use float_eq::{assert_float_eq, float_eq};
+
+    // sc-12787: MLX 0.32 evaluates lazy ops on the calling thread against
+    // thread-local streams. The global RNG state is the one array shared
+    // across threads, so it must never leave a lock unevaluated: a thread
+    // consuming a lazy key recorded on another thread's stream dies with
+    // "There is no Stream(gpu, N) in current thread". This drives that exact
+    // sequence: record a key advance on a spawned thread WITHOUT evaluating
+    // the drawn sample, then consume + evaluate the global state here.
+    #[test]
+    fn test_global_rng_across_threads() {
+        std::thread::spawn(|| {
+            // Advances the global key on the spawned thread's stream; the
+            // sample itself is deliberately left unevaluated.
+            let _lazy = uniform::<_, f32>(0, 1, None, None).unwrap();
+        })
+        .join()
+        .unwrap();
+
+        let a = uniform::<_, f32>(0, 1, None, None).unwrap();
+        a.eval().unwrap();
+    }
 
     #[test]
     fn test_global_rng() {

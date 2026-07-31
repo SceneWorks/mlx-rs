@@ -171,6 +171,7 @@ mod tests {
     fn test_set_cache_limit_roundtrip() {
         let original = get_memory_limit(); // cache limit defaults to memory limit
         let prev = set_cache_limit(512 * 1024 * 1024); // 512 MB
+
         // Restore (use max of prev and original to avoid going below default)
         set_cache_limit(prev.max(original));
     }

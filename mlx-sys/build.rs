@@ -193,10 +193,16 @@ fn prepare_mlx_c_source() -> PathBuf {
     //     per-encoder error_ / poisons signal events instead of throwing, and it is
     //     re-thrown synchronously on the waiting thread via synchronize() /
     //     EventImpl::check_error). So the 0.31.2 production record-not-throw logic is
-    //     retired as redundant. This patch is regenerated to add ONLY the debug-only
-    //     (NDEBUG-gated) test hook mlx_pmetal_test_inject_command_buffer_error, which
-    //     lets mlx-tests/tests/command_buffer_recoverable.rs drive that upstream
-    //     recovery path deterministically (without tripping the real GPU watchdog).
+    //     retired as redundant. The patch adds ONLY the debug-only (NDEBUG-gated)
+    //     test hook mlx_pmetal_test_inject_command_buffer_error, which lets
+    //     mlx-tests/tests/command_buffer_recoverable.rs drive that upstream recovery
+    //     path deterministically (without tripping the real GPU watchdog). sc-12786:
+    //     the hook now injects THROUGH the real upstream mechanism — Event::signal
+    //     drains it on the host thread and poisons the event via the real
+    //     EventImpl::set_error, so the error is re-raised by unpatched upstream code
+    //     (EventImpl::wait -> check_error). Previously it was drained by a patched-in
+    //     check in the outer Event::wait BEFORE EventImpl::wait, which could not
+    //     catch a regression of the real set_error/check_error plumbing.
     //   - pad-copy-int64.patch                : sc-12746 (epic 12742) — fix the
     //     copy_gpu_inplace dispatch gate in backend/metal/copy.cpp. pad() and
     //     concatenate() hand copy_gpu_inplace a slice-VIEW `out` whose
@@ -210,6 +216,36 @@ fn prepare_mlx_c_source() -> PathBuf {
     //     onto the EXISTING int64 (`*large`) kernels — no copy.metal edit. This
     //     is exactly the follow-up MLX PR #3524 (0.32.0) deferred for pad/concat;
     //     an upstream ml-explore/mlx PR is prepared separately.
+    //   - thread-shared-streams.patch         : sc-12937 — MLX registers each
+    //     stream's command encoder in a thread_local map, so a stream is only
+    //     usable from the thread that created it and any cross-thread eval
+    //     throws "There is no Stream(gpu, N) in current thread." (metal
+    //     device.cpp get_command_encoder; same for cpu). Rust mlx-rs arrays
+    //     are Send — the test harness runs every #[test] on its own thread,
+    //     pmetal moves work across tokio workers, and MLX's global random key
+    //     state crosses threads by design — so gpu::new_stream/cpu::new_stream
+    //     are redirected to the global-map registration (upstream's own
+    //     new_thread_unsafe_stream, #3578), restoring cross-thread stream
+    //     visibility. Concurrent eval on the SAME stream from two threads
+    //     remains the caller's responsibility (unchanged from upstream).
+    //   - thread-safe-eval.patch             : sc-12959 — closes the three
+    //     hazards the sc-12937 patch left open, making the fork's threading
+    //     model coherent ("streams visible everywhere, all eval serialized,
+    //     O(devices) streams"):
+    //     (1) process-global recursive eval lock (detail::eval_mutex) taken by
+    //         eval_impl and synchronize — concurrent cross-thread eval now
+    //         serializes instead of racing a shared command encoder into a
+    //         Metal SIGABRT. eval()'s host-side completion wait stays OUTSIDE
+    //         the lock (synchronize(Stream) drains under it by design). This
+    //         enforces the pmetal consumer contract (single eval thread,
+    //         batch-dimension concurrency) that was previously discipline-only.
+    //     (2) shared_mutex on the global encoder maps (metal + cpu) — the
+    //         fallback read in get_command_encoder no longer races another
+    //         thread's first-stream registration (unordered_map rehash UB).
+    //     (3) process-global default stream (was per-thread) — a dying worker
+    //         thread (tokio spawn_blocking churn) no longer strands one
+    //         CommandEncoder + MTLCommandQueue per thread in the global map;
+    //         stream count is O(devices). Safe because of (1).
     //   - ios-metal-sdk.patch                 : cross-compile the Metal kernels for iOS.
     //     MLX's kernel rules hardcode `xcrun -sdk macosx metal` and
     //     `-mmacosx-version-min`, so a CMAKE_SYSTEM_NAME=iOS build still emitted a
@@ -254,7 +290,8 @@ fn prepare_mlx_c_source() -> PathBuf {
     // isolated to its own patch, and per-file atomicity prevents a dangerous half-apply of a
     // partially-matching patch.
     //
-    // sc-12780: ALL THREE patches are now `required = true`. The metallib and command-buffer
+    // sc-12780: ALL patches are `required = true` (three at the time; sc-12937
+    // adds a fourth under the same policy). The metallib and command-buffer
     // patches were regenerated for MLX 0.32.0 (their 0.31.2 context had drifted and both were
     // temporarily demoted to best-effort no-ops by sc-12746, which is exactly how the sc-12745
     // bump silently shipped WITHOUT them). Re-arming them to required=true makes a future silent
@@ -265,6 +302,8 @@ fn prepare_mlx_c_source() -> PathBuf {
         ("patches/metallib-search-path.patch", true),
         ("patches/command-buffer-recoverable.patch", true),
         ("patches/pad-copy-int64.patch", true),
+        ("patches/thread-shared-streams.patch", true),
+        ("patches/thread-safe-eval.patch", true),
         ("patches/ios-metal-sdk.patch", true),
     ];
     // sc-12780 idempotency guard: CMake FetchContent may re-run PATCH_COMMAND against an
