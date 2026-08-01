@@ -1,0 +1,23 @@
+diff --git a/mlx/backend/cpu/CMakeLists.txt b/mlx/backend/cpu/CMakeLists.txt
+index 1a2b3c4d..5e6f7a8b 100644
+--- a/mlx/backend/cpu/CMakeLists.txt
++++ b/mlx/backend/cpu/CMakeLists.txt
+@@ -82,7 +82,17 @@ else()
+                              ${CMAKE_CURRENT_SOURCE_DIR}/gemms/simd_bf16.cpp)
+ endif()
+ 
+-if(IOS)
++# pmetal: upstream routes iOS to the no-op CPU compiler because jit_compiler.cpp calls
++# `std::system()` to shell out to a host compiler, and libc marks that
++# `__IOS_PROHIBITED __TVOS_PROHIBITED __WATCHOS_PROHIBITED`. The guard is written as
++# `if(IOS)`, but CMake only defines IOS — it leaves TVOS/WATCHOS unset even when
++# CMAKE_SYSTEM_NAME says tvOS/watchOS — so tvOS and watchOS still compiled the JIT path
++# and failed with
++#
++#   error: 'system' is unavailable: not available on tvOS
++#
++# Match on the system name so every sandboxed Apple platform takes the same branch as iOS.
++if(IOS OR CMAKE_SYSTEM_NAME MATCHES "^(tvOS|watchOS|visionOS)$")
+   target_sources(mlx PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../no_cpu/compiled.cpp)
+ else()
+   target_sources(mlx PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/compiled.cpp
