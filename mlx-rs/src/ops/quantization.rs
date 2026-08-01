@@ -250,7 +250,11 @@ pub fn gather_qmm_device<'b, 'lhs, 'rhs>(
 /// - `group_size`: The quantization group size (default depends on mode: 16 for nvfp4, 32 for mxfp8)
 /// - `bits`: The number of bits per element (default depends on mode: 4 for nvfp4, 8 for mxfp8)
 /// - `mode`: Quantization mode - either "nvfp4" or "mxfp8" (default: "nvfp4")
-#[cfg(not(target_os = "macos"))]
+// This op requires the CUDA backend, which MLX builds only on Linux. The gate was previously
+// `not(target_os = "macos")`, which also matched iOS/tvOS/watchOS — Apple targets that have no
+// CUDA backend at all — so the function was compiled there and its (stale) call site below broke
+// the build. Gate on the platform the doc comment actually describes.
+#[cfg(target_os = "linux")]
 #[allow(clippy::too_many_arguments)]
 #[generate_macro]
 #[default_device]
@@ -288,6 +292,12 @@ pub fn qqmm_device<'a>(
             group_size,
             bits,
             mode_cstr.as_ptr(),
+            // `global_scale_x` / `global_scale_w`: added to the C signature by the MLX 0.32 bump
+            // and never threaded through here, so this call had 8 of 10 arguments. Absent
+            // optional arrays are passed as a fresh empty array, matching `w_scales` above.
+            // Exposing them as `#[optional]` parameters is a separate, additive change.
+            mlx_sys::mlx_array_new(),
+            mlx_sys::mlx_array_new(),
             stream.as_ref().as_ptr(),
         )
     })

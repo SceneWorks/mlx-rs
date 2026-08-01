@@ -3,8 +3,30 @@ extern crate cmake;
 use cmake::Config;
 use std::{env, path::PathBuf, process::Command};
 
-/// Find the clang runtime library path dynamically using xcrun
-fn find_clang_rt_path() -> Option<String> {
+/// The clang runtime variant to link, chosen for the **target**, not the host.
+///
+/// This link exists solely as a macOS 26+ workaround (see the call site): Xcode's clang runtime
+/// supplies `___isPlatformVersionAtLeast` when the bundled LLVM runtime is outdated. It is
+/// **macOS-specific**, so every other target gets `None`:
+///
+/// - `libclang_rt.osx.a` linked into an iOS binary is rejected with "Unsupported archive
+///   identifier", which is what made cross-compilation fail before this was target-aware;
+/// - the `ios` / `iossim` archives are rejected the same way *and* are not needed — the Rust
+///   toolchain supplies the equivalent on those targets.
+///
+/// Build scripts are compiled for the host, so `cfg!(target_os = ...)` in this file always reports
+/// the *host* platform when cross-compiling. Read cargo's target environment instead.
+fn clang_rt_variant() -> Option<&'static str> {
+    match env::var("CARGO_CFG_TARGET_OS").unwrap_or_default().as_str() {
+        "macos" => Some("osx"),
+        _ => None,
+    }
+}
+
+/// Find the clang runtime library path dynamically using xcrun.
+///
+/// `variant` is the platform suffix from [`clang_rt_variant`] — e.g. `osx`, `ios`, `iossim`.
+fn find_clang_rt_path(variant: &str) -> Option<String> {
     // Use xcrun to find the active toolchain path
     let output = Command::new("xcrun")
         .args(["--show-sdk-platform-path"])
@@ -35,7 +57,7 @@ fn find_clang_rt_path() -> Option<String> {
     let clang_dir = std::fs::read_dir(&toolchain_base).ok()?;
     for entry in clang_dir.flatten() {
         let darwin_path = entry.path().join("lib/darwin");
-        let clang_rt_lib = darwin_path.join("libclang_rt.osx.a");
+        let clang_rt_lib = darwin_path.join(format!("libclang_rt.{variant}.a"));
         if clang_rt_lib.exists() {
             return Some(darwin_path.to_string_lossy().to_string());
         }
@@ -44,24 +66,64 @@ fn find_clang_rt_path() -> Option<String> {
     None
 }
 
-/// Resolve the macOS deployment target.
+/// The Apple platform being built for, resolved from the **target**, not the host.
 ///
-/// Enforces a minimum of 14.0 (MLX's requirement for Metal support).
-/// If `MACOSX_DEPLOYMENT_TARGET` is set to a higher value, that is used instead.
-/// Cargo/Tauri often default to 10.13, which MLX's CMakeLists.txt rejects.
-#[cfg(target_os = "macos")]
-fn resolve_deployment_target() -> String {
-    const MLX_MIN_MACOS: (u32, u32) = (14, 0);
+/// Each variant carries the environment variable Apple's toolchain reads for that platform, the
+/// CMake system name (`None` for macOS — a native build sets no `CMAKE_SYSTEM_NAME`), and MLX's
+/// minimum version for Metal support.
+struct ApplePlatform {
+    deployment_env: &'static str,
+    cmake_system_name: Option<&'static str>,
+    min_version: (u32, u32),
+}
 
-    if let Ok(val) = env::var("MACOSX_DEPLOYMENT_TARGET") {
+/// Resolve the Apple platform from cargo's target environment.
+///
+/// Build scripts compile for the host, so `cfg!(target_os = ...)` here reports the *host* even
+/// when cross-compiling. `CARGO_CFG_TARGET_OS` is the target.
+fn apple_platform() -> Option<ApplePlatform> {
+    match env::var("CARGO_CFG_TARGET_OS").unwrap_or_default().as_str() {
+        // MLX requires macOS >= 14.0 for Metal. Cargo/Tauri often default to 10.13, which MLX's
+        // CMakeLists.txt rejects.
+        "macos" => Some(ApplePlatform {
+            deployment_env: "MACOSX_DEPLOYMENT_TARGET",
+            cmake_system_name: None,
+            min_version: (14, 0),
+        }),
+        // iOS 18.0, chosen to match Metal versions rather than picked for recency:
+        //   iOS 16 -> Metal 300, iOS 17 -> Metal 310, iOS 18 -> Metal 320.
+        // MLX's own macOS floor (14.0) is Metal 310, so iOS 16 would be *below* the baseline
+        // its kernels assume. 18.0 also keeps `fence` coherent: the kernel is only built when
+        // MLX_METAL_VERSION >= 320, while fence.cpp's runtime guard is
+        // `__builtin_available(macOS 15, iOS 18, *)`. Building at iOS 17 would satisfy the
+        // runtime check on an iOS 18 device while the kernel was never compiled in — a missing
+        // kernel at `get_kernel("fence_wait")`. Latent today (MLX_METAL_FAST_SYNCH defaults
+        // off) but a real trap.
+        // Note this is a *different* knob from MACOSX_DEPLOYMENT_TARGET — leaking the macOS
+        // value in here (e.g. "26.2") silently sets an iOS floor that excludes every shipping
+        // device.
+        "ios" => Some(ApplePlatform {
+            deployment_env: "IPHONEOS_DEPLOYMENT_TARGET",
+            cmake_system_name: Some("iOS"),
+            min_version: (18, 0),
+        }),
+        _ => None,
+    }
+}
+
+/// Resolve the deployment target for `platform`, honoring a higher explicitly-set value.
+fn resolve_deployment_target(platform: &ApplePlatform) -> String {
+    let (min_major, min_minor) = platform.min_version;
+
+    if let Ok(val) = env::var(platform.deployment_env) {
         let parts: Vec<u32> = val.split('.').filter_map(|s| s.parse().ok()).collect();
         let major = parts.first().copied().unwrap_or(0);
         let minor = parts.get(1).copied().unwrap_or(0);
-        if (major, minor) >= MLX_MIN_MACOS {
+        if (major, minor) >= (min_major, min_minor) {
             return val;
         }
     }
-    format!("{}.{}", MLX_MIN_MACOS.0, MLX_MIN_MACOS.1)
+    format!("{min_major}.{min_minor}")
 }
 
 /// Copy src/mlx-c to a staging directory and inject the metallib search-path
@@ -184,6 +246,27 @@ fn prepare_mlx_c_source() -> PathBuf {
     //         thread (tokio spawn_blocking churn) no longer strands one
     //         CommandEncoder + MTLCommandQueue per thread in the global map;
     //         stream count is O(devices). Safe because of (1).
+    //   - ios-metal-sdk.patch                 : cross-compile the Metal kernels for iOS.
+    //     MLX's kernel rules hardcode `xcrun -sdk macosx metal` and
+    //     `-mmacosx-version-min`, so a CMAKE_SYSTEM_NAME=iOS build still emitted a
+    //     **macOS** metallib: the C++ cross-compiled, the binary linked, and the
+    //     artifact would have failed on device. (MLX's root CMakeLists already
+    //     guards its SDK probe on `CMAKE_SYSTEM_NAME STREQUAL "Darwin"` and falls
+    //     back to MLX_METAL_VERSION 0, so upstream anticipated non-macOS
+    //     configuration — the kernel rules just never got the matching branch.)
+    //     The patch selects the SDK and version-min flag by platform in both the
+    //     per-kernel compile and the metallib link, and adds an iOS arm to the root
+    //     probe so MLX_METAL_VERSION is detected rather than pinned to 0 (0 would
+    //     silently drop every MLX_METAL_VERSION-gated kernel).
+    //     Deployment target matters here: iOS 16 -> Metal 300, 17 -> 310, 18 -> 320.
+    //     MLX's macOS floor (14.0) is Metal 310, so iOS 16 is BELOW the baseline its
+    //     kernels assume; resolve_deployment_target() floors iOS at 18.0 (Metal 320).
+    //     That also keeps `fence` coherent — the kernel is built only at
+    //     MLX_METAL_VERSION >= 320 while fence.cpp's runtime guard is
+    //     `__builtin_available(macOS 15, iOS 18, *)`, so a lower floor could satisfy
+    //     the runtime check with the kernel absent.
+    //     The NAX gate fails safe on iOS: it needs Metal >= 400 AND
+    //     MACOS_SDK_VERSION >= 26.2, and the latter is unset off macOS.
     //
     // The sc-2714 (dense GEMM) and sc-2770 (fast SDPA) NAX-dispatch gate patches were
     // REMOVED in sc-2772. Their root cause was never the dispatch or the MLX version: the
@@ -221,6 +304,7 @@ fn prepare_mlx_c_source() -> PathBuf {
         ("patches/pad-copy-int64.patch", true),
         ("patches/thread-shared-streams.patch", true),
         ("patches/thread-safe-eval.patch", true),
+        ("patches/ios-metal-sdk.patch", true),
     ];
     // sc-12780 idempotency guard: CMake FetchContent may re-run PATCH_COMMAND against an
     // mlx-src that is ALREADY patched (e.g. an incremental rebuild that does not re-fetch).
@@ -319,14 +403,14 @@ fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> std::io::
 }
 
 fn build_and_link_mlx_c() {
-    // MLX requires macOS >= 14.0 for Metal support. Override the deployment
-    // target early so the cmake crate (and cc crate) don't inject a lower
-    // -mmacosx-version-min flag into CFLAGS/CXXFLAGS. Without this, Cargo's
-    // default target (10.13) causes MLX's CMakeLists.txt to reject the build.
-    #[cfg(target_os = "macos")]
-    {
-        let target = resolve_deployment_target();
-        env::set_var("MACOSX_DEPLOYMENT_TARGET", &target);
+    // Resolve and export the deployment target early so the cmake crate (and the cc crate) don't
+    // inject a lower -m<platform>-version-min into CFLAGS/CXXFLAGS. Without this, cargo's default
+    // (10.13 on macOS, 10.0 on iOS) causes MLX's CMakeLists.txt to reject the build — and on iOS
+    // an unset target also drops __chkstk_darwin (libSystem, iOS 12+) at link time.
+    let platform = apple_platform();
+    if let Some(platform) = &platform {
+        let target = resolve_deployment_target(platform);
+        env::set_var(platform.deployment_env, &target);
     }
 
     let mlx_c_src = prepare_mlx_c_source();
@@ -334,10 +418,25 @@ fn build_and_link_mlx_c() {
     config.very_verbose(true);
     config.define("CMAKE_INSTALL_PREFIX", ".");
 
-    #[cfg(target_os = "macos")]
-    {
-        let target = resolve_deployment_target();
+    // mlx-c's example .app targets are never linked into this crate, and they do not build for
+    // every Apple platform: on the iOS **simulator** they fail with undefined `_MTLIOErrorDomain`
+    // (MTLIO is absent from the simulator's Metal framework), which fails the whole cmake build
+    // even though libmlx/libmlxc themselves compiled cleanly. Skipping them is free everywhere and
+    // unblocks aarch64-apple-ios-sim.
+    config.define("MLX_C_BUILD_EXAMPLES", "OFF");
+
+    if let Some(platform) = &platform {
+        let target = resolve_deployment_target(platform);
+        // CMAKE_OSX_DEPLOYMENT_TARGET is the knob for every Apple platform, not just macOS.
         config.define("CMAKE_OSX_DEPLOYMENT_TARGET", &target);
+        if let Some(system_name) = platform.cmake_system_name {
+            // Cross-compiling: tell CMake the target platform and architecture explicitly.
+            config.define("CMAKE_SYSTEM_NAME", system_name);
+            if let Ok(arch) = env::var("CARGO_CFG_TARGET_ARCH") {
+                let arch = if arch == "aarch64" { "arm64" } else { &arch };
+                config.define("CMAKE_OSX_ARCHITECTURES", arch);
+            }
+        }
     }
 
     // Use Xcode's clang to ensure compatibility with the macOS SDK
@@ -391,16 +490,43 @@ fn build_and_link_mlx_c() {
     // Link against Xcode's clang runtime for ___isPlatformVersionAtLeast symbol
     // This is needed on macOS 26+ where the bundled LLVM runtime may be outdated
     // See: https://github.com/conda-forge/llvmdev-feedstock/issues/244
-    if let Some(clang_rt_path) = find_clang_rt_path() {
-        println!("cargo:rustc-link-search={}", clang_rt_path);
-        println!("cargo:rustc-link-lib=static=clang_rt.osx");
+    if let Some(clang_rt) = clang_rt_variant() {
+        if let Some(clang_rt_path) = find_clang_rt_path(clang_rt) {
+            println!("cargo:rustc-link-search={}", clang_rt_path);
+            println!("cargo:rustc-link-lib=static=clang_rt.{clang_rt}");
+        }
+    }
+
+    // Publish the built metallib's path to dependents as DEP_MLX_METALLIB (requires the `links`
+    // key in Cargo.toml). This is the supported way off the host: `~/.cache/pmetal/lib` does not
+    // exist inside an iOS app sandbox, and the compiled-in METAL_PATH points into the cargo
+    // target directory, which is not shipped. An iOS packaging step reads this and copies the
+    // metallib into the .app, where MLX's `load_colocated_library` finds it next to the
+    // executable. Emitted on every platform — it is just a path — so a macOS packager can use it
+    // too rather than reaching into target/ by hand.
+    #[cfg(feature = "metal")]
+    {
+        let metallib = dst.join("build/lib/mlx.metallib");
+        if metallib.exists() {
+            println!("cargo:metallib={}", metallib.display());
+        }
     }
 
     // Cache mlx.metallib to ~/.cache/pmetal/lib/ so the binary works regardless
     // of where it's installed. This is critical for `cargo install` where the
     // build directory is cleaned up after the binary is placed.
+    //
+    // macOS ONLY. The cache is a single shared, platform-agnostic path, so a cross-compiled
+    // build would silently overwrite the host's metallib with kernels for another platform —
+    // and the resolver has no way to tell them apart. Local `cargo test`/`run` binaries have no
+    // compiled-in metallib and resolve *solely* through this cache, so poisoning it breaks every
+    // subsequent macOS test run until a native build repairs it. An iOS app bundles its metallib
+    // in the `.app` and never reads `$HOME` anyway (there is nothing useful there in the sandbox).
     #[cfg(feature = "metal")]
-    {
+    if matches!(
+        env::var("CARGO_CFG_TARGET_OS").as_deref(),
+        Ok("macos") | Err(_)
+    ) {
         let metallib = dst.join("build/lib/mlx.metallib");
         if metallib.exists() {
             if let Ok(home) = env::var("HOME") {
