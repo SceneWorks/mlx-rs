@@ -25,7 +25,9 @@ fn clang_rt_variant() -> Option<&'static str> {
 
 /// Find the clang runtime library path dynamically using xcrun.
 ///
-/// `variant` is the platform suffix from [`clang_rt_variant`] — e.g. `osx`, `ios`, `iossim`.
+/// `variant` is the platform suffix from [`clang_rt_variant`], which only ever yields `osx` —
+/// every other Apple platform deliberately links no clang runtime (see that function). The
+/// parameter exists so the archive name and the platform decision stay in one place.
 fn find_clang_rt_path(variant: &str) -> Option<String> {
     // Use xcrun to find the active toolchain path
     let output = Command::new("xcrun")
@@ -67,13 +69,22 @@ fn find_clang_rt_path(variant: &str) -> Option<String> {
 }
 
 /// The Apple platform being built for, resolved from the **target**, not the host.
-///
-/// Each variant carries the environment variable Apple's toolchain reads for that platform, the
-/// CMake system name (`None` for macOS — a native build sets no `CMAKE_SYSTEM_NAME`), and MLX's
-/// minimum version for Metal support.
 struct ApplePlatform {
+    /// The environment variable Apple's toolchain reads for this platform's deployment target.
     deployment_env: &'static str,
+    /// `CMAKE_SYSTEM_NAME`. `None` for macOS — a native build sets none.
     cmake_system_name: Option<&'static str>,
+    /// The `xcrun -sdk` name, also used to resolve `CMAKE_OSX_SYSROOT`.
+    ///
+    /// Device and simulator are *different SDKs*, and the arch does not distinguish them: an
+    /// Apple-silicon simulator is `arm64`, exactly like the device. Selecting `iphoneos` for a
+    /// simulator build produces `air64-apple-ios` kernels that fail at `newLibraryWithURL`.
+    sdk: &'static str,
+    /// The `metal` version-min flag prefix matching [`Self::sdk`], or `None` on platforms with
+    /// no Metal framework at all (watchOS). Simulators take a *different* flag from their
+    /// device counterpart (`-mios-simulator-version-min=` vs `-mios-version-min=`).
+    metal_version_min_prefix: Option<&'static str>,
+    /// The minimum OS version this build targets.
     min_version: (u32, u32),
 }
 
@@ -81,34 +92,273 @@ struct ApplePlatform {
 ///
 /// Build scripts compile for the host, so `cfg!(target_os = ...)` here reports the *host* even
 /// when cross-compiling. `CARGO_CFG_TARGET_OS` is the target.
+///
+/// Returns `None` for non-Apple targets and **panics** for an Apple target with no arm below.
+/// The panic is deliberate: falling through to `None` leaves `CMAKE_SYSTEM_NAME` to cmake-rs,
+/// which sets e.g. `visionOS` on its own, and MLX's root probe then pins `MLX_METAL_VERSION` to
+/// 0 — silently dropping every version-gated kernel and producing a metallib that looks fine and
+/// is missing most of its kernels. A loud failure at configure time beats that.
 fn apple_platform() -> Option<ApplePlatform> {
-    match env::var("CARGO_CFG_TARGET_OS").unwrap_or_default().as_str() {
+    // MLX's Metal floors are stated as Metal *versions*, so each platform's minimum is the OS
+    // that first ships the required Metal version rather than a number picked for recency
+    // (measured with `echo __METAL_VERSION__ | xcrun -sdk <sdk> metal -m<plat>-version-min=<v>
+    // -E -x metal -P -`, Xcode 26.5):
+    //
+    //           Metal 300   Metal 310   Metal 320
+    //   macOS       13          14          15
+    //   iOS         16          17          18
+    //   tvOS        16          17          18
+    //
+    // MLX's own macOS floor (14.0) is Metal 310, so anything below the 310 row is *under* the
+    // baseline its kernels assume. 320 additionally keeps `fence` coherent: the kernel is only
+    // built when MLX_METAL_VERSION >= 320, while fence.cpp's runtime guard is
+    // `__builtin_available(macOS 15, iOS 18, *)`. Building at iOS 17 would satisfy the runtime
+    // check on an iOS 18 device while the kernel was never compiled in — a missing kernel at
+    // `get_kernel("fence_wait")`. Latent today (MLX_METAL_FAST_SYNCH defaults off) but a real
+    // trap, and worse on tvOS, where that guard's `*` arm makes the runtime check pass
+    // unconditionally.
+    //
+    // Each platform reads its *own* deployment-target variable. Leaking the macOS value into
+    // one of the others (e.g. "26.2") silently sets a floor that excludes every shipping device.
+    //
+    // Excluding iOS/tvOS 16 and 17 is a deliberate product decision, not a consequence of the
+    // Metal reasoning above: shipping iOS is 26.x, so an 18.0 floor is two majors back. Note
+    // this is stricter than mlx-swift upstream, which targets iOS 16. Lowering it to 17.0 would
+    // still satisfy MLX's Metal-310 baseline but reintroduces the `fence` hazard; 16.0 is below
+    // the baseline outright and apple-metal-sdk.patch will reject it at configure time.
+    const METAL_320: (u32, u32) = (18, 0);
+
+    let os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    // `sim` is how rustc spells "this Apple target runs in a simulator": aarch64-apple-ios-sim,
+    // x86_64-apple-ios, and the -sim variants for tvOS/watchOS all set it. Nothing else
+    // distinguishes a simulator target — in particular the arch does not.
+    let sim = env::var("CARGO_CFG_TARGET_ABI").as_deref() == Ok("sim");
+
+    match (os.as_str(), sim) {
         // MLX requires macOS >= 14.0 for Metal. Cargo/Tauri often default to 10.13, which MLX's
         // CMakeLists.txt rejects.
-        "macos" => Some(ApplePlatform {
+        ("macos", _) => Some(ApplePlatform {
             deployment_env: "MACOSX_DEPLOYMENT_TARGET",
             cmake_system_name: None,
+            sdk: "macosx",
+            metal_version_min_prefix: Some("-mmacosx-version-min="),
             min_version: (14, 0),
         }),
-        // iOS 18.0, chosen to match Metal versions rather than picked for recency:
-        //   iOS 16 -> Metal 300, iOS 17 -> Metal 310, iOS 18 -> Metal 320.
-        // MLX's own macOS floor (14.0) is Metal 310, so iOS 16 would be *below* the baseline
-        // its kernels assume. 18.0 also keeps `fence` coherent: the kernel is only built when
-        // MLX_METAL_VERSION >= 320, while fence.cpp's runtime guard is
-        // `__builtin_available(macOS 15, iOS 18, *)`. Building at iOS 17 would satisfy the
-        // runtime check on an iOS 18 device while the kernel was never compiled in — a missing
-        // kernel at `get_kernel("fence_wait")`. Latent today (MLX_METAL_FAST_SYNCH defaults
-        // off) but a real trap.
-        // Note this is a *different* knob from MACOSX_DEPLOYMENT_TARGET — leaking the macOS
-        // value in here (e.g. "26.2") silently sets an iOS floor that excludes every shipping
-        // device.
-        "ios" => Some(ApplePlatform {
+        ("ios", false) => Some(ApplePlatform {
             deployment_env: "IPHONEOS_DEPLOYMENT_TARGET",
             cmake_system_name: Some("iOS"),
-            min_version: (18, 0),
+            sdk: "iphoneos",
+            metal_version_min_prefix: Some("-mios-version-min="),
+            min_version: METAL_320,
         }),
-        _ => None,
+        ("ios", true) => Some(ApplePlatform {
+            deployment_env: "IPHONEOS_DEPLOYMENT_TARGET",
+            cmake_system_name: Some("iOS"),
+            sdk: "iphonesimulator",
+            metal_version_min_prefix: Some("-mios-simulator-version-min="),
+            min_version: METAL_320,
+        }),
+        ("tvos", false) => Some(ApplePlatform {
+            deployment_env: "TVOS_DEPLOYMENT_TARGET",
+            cmake_system_name: Some("tvOS"),
+            sdk: "appletvos",
+            metal_version_min_prefix: Some("-mtvos-version-min="),
+            min_version: METAL_320,
+        }),
+        ("tvos", true) => Some(ApplePlatform {
+            deployment_env: "TVOS_DEPLOYMENT_TARGET",
+            cmake_system_name: Some("tvOS"),
+            sdk: "appletvsimulator",
+            metal_version_min_prefix: Some("-mtvos-simulator-version-min="),
+            min_version: METAL_320,
+        }),
+        // watchOS ships **no Metal framework** — it is absent from both the WatchOS and
+        // WatchSimulator SDKs, so no deployment target makes MLX_BUILD_METAL work here.
+        // `metal_version_min_prefix: None` records that, and build_and_link_mlx_c() turns the
+        // `metal` feature into a hard error rather than letting the link fail on a missing
+        // framework. A CPU-only MLX is the whole available surface.
+        //
+        // 9.0 is not derived from a Metal version — there is none to derive one from. It is the
+        // oldest watchOS whose SDK carries the C++17 library features MLX's CPU backend uses
+        // unconditionally (`std::filesystem` is annotated watchOS 6+, aligned `operator new`
+        // watchOS 4+), with margin, and a real build confirms it: aarch64-apple-watchos-sim
+        // compiles libmlx and libmlxc at watchOS 9.0, CPU-only.
+        //
+        // Only that simulator works. No watchOS *device* target builds MLX — on either ABI, and
+        // for two unrelated upstream reasons — see the check in build_and_link_mlx_c(). Both
+        // arms are kept anyway so the failure is a one-line diagnosis instead of a wall of C++
+        // template errors, and so the SDK/deployment-target facts live in one place.
+        ("watchos", false) => Some(ApplePlatform {
+            deployment_env: "WATCHOS_DEPLOYMENT_TARGET",
+            cmake_system_name: Some("watchOS"),
+            sdk: "watchos",
+            metal_version_min_prefix: None,
+            min_version: (9, 0),
+        }),
+        ("watchos", true) => Some(ApplePlatform {
+            deployment_env: "WATCHOS_DEPLOYMENT_TARGET",
+            cmake_system_name: Some("watchOS"),
+            sdk: "watchsimulator",
+            metal_version_min_prefix: None,
+            min_version: (9, 0),
+        }),
+        (other, _) => {
+            assert!(
+                env::var("CARGO_CFG_TARGET_VENDOR").as_deref() != Ok("apple"),
+                "mlx-sys: no build configuration for Apple target_os `{other}`. Every Apple \
+                 platform needs an explicit SDK, deployment-target variable and Metal \
+                 version-min flag; without one, MLX silently configures MLX_METAL_VERSION=0 and \
+                 drops every version-gated kernel. Add an arm to apple_platform() (visionOS is \
+                 the known gap) or build for a supported target.",
+            );
+            None
+        }
     }
+}
+
+/// Apple's name for the target architecture, for `CMAKE_OSX_ARCHITECTURES`.
+///
+/// Derived from the target *triple* rather than `CARGO_CFG_TARGET_ARCH`, because the watchOS
+/// targets `arm64_32-apple-watchos` and `armv7k-apple-watchos` report `aarch64` and `arm` there
+/// respectively — both of which would select the wrong slice. Triple arch names are already
+/// Apple's own spellings, so only `aarch64` needs translating.
+fn apple_arch() -> Option<String> {
+    let triple = env::var("TARGET").ok()?;
+    let arch = triple.split('-').next()?;
+    Some(match arch {
+        "aarch64" => "arm64".to_string(),
+        other => other.to_string(),
+    })
+}
+
+/// Resolve `sdk` to an SDK path via `xcrun`, for an explicit `CMAKE_OSX_SYSROOT`.
+///
+/// Without this, CMake picks the sysroot itself from `CMAKE_SYSTEM_NAME` alone — and
+/// `CMAKE_SYSTEM_NAME=iOS` selects the **device** SDK, so a simulator build compiles its C++
+/// against iPhoneOS headers while cc-rs injects a simulator `-isysroot` into CXXFLAGS. The two
+/// halves then disagree about which platform they are building for.
+fn apple_sysroot(sdk: &str) -> Option<String> {
+    let output = Command::new("xcrun")
+        .args(["--sdk", sdk, "--show-sdk-path"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!path.is_empty()).then_some(path)
+}
+
+/// Whole-word search for a linker symbol in concatenated `.tbd` stub text.
+///
+/// Substring matching would let `_MTLIOErrorDomain` be "found" inside `_MTLIOErrorDomainKey`.
+fn tbd_exports(tbd: &str, symbol: &str) -> bool {
+    let ident = |c: char| c.is_alphanumeric() || c == '_';
+    tbd.match_indices(symbol).any(|(start, _)| {
+        let before = tbd[..start].chars().next_back();
+        let after = tbd[start + symbol.len()..].chars().next();
+        !before.is_some_and(ident) && !after.is_some_and(ident)
+    })
+}
+
+/// Define, as null, the metal-cpp constants the target SDK does not export.
+///
+/// `mlx/backend/metal/device.cpp` is metal-cpp's single `MTL_PRIVATE_IMPLEMENTATION` translation
+/// unit, so `libmlx.a` carries one reference per metal-cpp private constant — 48 of them at MLX
+/// 0.32. Built against a 26.x SDK, metal-cpp resolves those at **link** time:
+///
+///     _MTL_EXTERN type const MTLsymbol __attribute__((weak_import));
+///     type const MTL::symbol = (nullptr != &MTLsymbol) ? MTLsymbol : nullptr;
+///
+/// Only on an older SDK does it take its `dlsym(RTLD_DEFAULT, ...)` fallback. That choice is
+/// gated on SDK *version* (`__MAC_26_0` / `__IPHONE_26_0` / `__TVOS_26_0`) and not on the
+/// platform variant — but the iOS and tvOS **simulator** Metal frameworks export strictly fewer
+/// symbols than their device counterparts. `weak_import` permits a symbol to disappear at
+/// runtime, NOT at link time, so every simulator binary linking libmlx.a dies with
+///
+///     Undefined symbols: _MTLIOErrorDomain, _MTLTensorDomain
+///
+/// which is exactly the failure that made this PR turn `MLX_C_BUILD_EXAMPLES` off — the examples
+/// were the only final link in the build, so disabling them moved the error into the consuming
+/// app instead of fixing it. Correcting `CMAKE_OSX_SYSROOT` does not help: the objects are right,
+/// the simulator SDK genuinely has no such symbols.
+///
+/// A weak null definition reproduces exactly what metal-cpp's own dlsym path yields on these
+/// platforms (`MTL::IOErrorDomain == nullptr`), and MLX references neither constant. `weak` so a
+/// future SDK that does export them wins the tie instead of colliding.
+///
+/// The set is derived from the archive and the SDK rather than hardcoded, so a new metal-cpp
+/// constant, MLX version or Xcode release cannot silently reintroduce the link failure.
+fn shim_unexported_metal_cpp_symbols(platform: &ApplePlatform, lib_dir: &std::path::Path) {
+    let archive = lib_dir.join("libmlx.a");
+    // The frameworks metal-cpp's private constants live in, which are also the only ones MLX
+    // links. A `.tbd` is the linker's view of a framework, so this is the same set of symbols
+    // `ld` will be able to resolve.
+    let sdk_root = apple_sysroot(platform.sdk).unwrap_or_default();
+    let exports: String = ["Metal", "Foundation", "QuartzCore"]
+        .iter()
+        .filter_map(|fw| {
+            std::fs::read_to_string(format!(
+                "{sdk_root}/System/Library/Frameworks/{fw}.framework/{fw}.tbd"
+            ))
+            .ok()
+        })
+        .collect();
+    let nm = Command::new("nm").arg("-m").arg(&archive).output();
+
+    // Any failure here means "we cannot tell which constants this SDK is missing". Carrying on
+    // regardless just defers an undefined-symbol error to the consumer's link, naming a symbol
+    // nothing in MLX uses — so stop where the cause is still visible.
+    assert!(
+        !exports.is_empty() && nm.as_ref().is_ok_and(|out| out.status.success()),
+        "mlx-sys: could not read the {} SDK stubs under {sdk_root:?} or run `nm` on {}, so the \
+         metal-cpp constants this SDK does not export cannot be determined.",
+        platform.sdk,
+        archive.display(),
+    );
+    let output = nm.expect("checked by the assert above");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut missing: Vec<&str> = stdout
+        .lines()
+        .filter(|line| line.contains("(undefined) weak external"))
+        .filter_map(|line| line.split_whitespace().next_back())
+        .filter(|sym| ["_MTL", "_NS", "_CA"].iter().any(|p| sym.starts_with(p)))
+        .filter(|sym| !tbd_exports(&exports, sym))
+        .collect();
+    missing.sort_unstable();
+    missing.dedup();
+    if missing.is_empty() {
+        return;
+    }
+
+    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+    let shim = out_dir.join("metal_cpp_absent_symbols.c");
+    let mut src = String::from(
+        "/* Generated by mlx-sys/build.rs — see shim_unexported_metal_cpp_symbols(). */\n",
+    );
+    for sym in &missing {
+        // Drop the Mach-O leading underscore; the C identifier is what the compiler mangles.
+        let name = sym.strip_prefix('_').unwrap_or(sym);
+        src.push_str(&format!("__attribute__((weak)) const void *{name} = 0;\n"));
+    }
+    std::fs::write(&shim, src).expect("Failed to write metal-cpp symbol shim");
+
+    println!(
+        "cargo:warning=Defining as null {} metal-cpp constant(s) that the {} SDK does not export: \
+         {}. MLX never reads them; without this, linking any binary against MLX for this target \
+         fails with an undefined-symbol error.",
+        missing.len(),
+        platform.sdk,
+        missing.join(", "),
+    );
+
+    // Emitted after the `mlx`/`mlxc` link directives so the definitions follow the references on
+    // the link line.
+    cc::Build::new()
+        .file(&shim)
+        .warnings(false)
+        .compile("mlx_metal_cpp_absent");
 }
 
 /// Resolve the deployment target for `platform`, honoring a higher explicitly-set value.
@@ -246,27 +496,52 @@ fn prepare_mlx_c_source() -> PathBuf {
     //         thread (tokio spawn_blocking churn) no longer strands one
     //         CommandEncoder + MTLCommandQueue per thread in the global map;
     //         stream count is O(devices). Safe because of (1).
-    //   - ios-metal-sdk.patch                 : cross-compile the Metal kernels for iOS.
-    //     MLX's kernel rules hardcode `xcrun -sdk macosx metal` and
-    //     `-mmacosx-version-min`, so a CMAKE_SYSTEM_NAME=iOS build still emitted a
-    //     **macOS** metallib: the C++ cross-compiled, the binary linked, and the
-    //     artifact would have failed on device. (MLX's root CMakeLists already
-    //     guards its SDK probe on `CMAKE_SYSTEM_NAME STREQUAL "Darwin"` and falls
-    //     back to MLX_METAL_VERSION 0, so upstream anticipated non-macOS
-    //     configuration — the kernel rules just never got the matching branch.)
-    //     The patch selects the SDK and version-min flag by platform in both the
-    //     per-kernel compile and the metallib link, and adds an iOS arm to the root
-    //     probe so MLX_METAL_VERSION is detected rather than pinned to 0 (0 would
-    //     silently drop every MLX_METAL_VERSION-gated kernel).
-    //     Deployment target matters here: iOS 16 -> Metal 300, 17 -> 310, 18 -> 320.
-    //     MLX's macOS floor (14.0) is Metal 310, so iOS 16 is BELOW the baseline its
-    //     kernels assume; resolve_deployment_target() floors iOS at 18.0 (Metal 320).
+    //   - apple-metal-sdk.patch               : cross-compile the Metal kernels for
+    //     non-macOS Apple platforms. MLX's kernel rules hardcode
+    //     `xcrun -sdk macosx metal` and `-mmacosx-version-min`, so a
+    //     CMAKE_SYSTEM_NAME=iOS build still emitted a **macOS** metallib: the C++
+    //     cross-compiled, the binary linked, and the artifact would have failed at
+    //     `newLibraryWithURL` on device. (MLX's root CMakeLists already guards its
+    //     SDK probe on `CMAKE_SYSTEM_NAME STREQUAL "Darwin"` and falls back to
+    //     MLX_METAL_VERSION 0, so upstream anticipated non-macOS configuration —
+    //     the kernel rules just never got the matching branch.)
+    //     The patch takes the SDK and version-min flag from MLX_METAL_SDK /
+    //     MLX_METAL_VERSION_MIN_PREFIX (set by apple_platform() above) in both the
+    //     per-kernel compile and the metallib link, and adds an Apple-cross arm to
+    //     the root probe so MLX_METAL_VERSION is detected rather than pinned to 0.
+    //     Those two variables are deliberately NOT derived inside CMake: device and
+    //     simulator are different SDKs taking different flags
+    //     (iphoneos/-mios-version-min= vs iphonesimulator/-mios-simulator-version-min=)
+    //     and CMAKE_SYSTEM_NAME is `iOS` for both, so CMake cannot tell them apart.
+    //     A simulator build driven off CMAKE_SYSTEM_NAME alone produces
+    //     air64-apple-ios kernels that will not load in the simulator.
+    //     Both defaults stay `macosx`/`-mmacosx-version-min=`, so a plain macOS
+    //     build is byte-identical to upstream; a non-macOS Apple build that reaches
+    //     the kernel rules without them set is a FATAL_ERROR rather than a silent
+    //     MLX_METAL_VERSION 0 (which would drop every version-gated kernel).
+    //     Deployment target matters here: iOS/tvOS 16 -> Metal 300, 17 -> 310,
+    //     18 -> 320. MLX's macOS floor (14.0) is Metal 310, so 16 is BELOW the
+    //     baseline its kernels assume; apple_platform() floors both at 18.0 (Metal
+    //     320) and the patch asserts >= 310 after probing.
     //     That also keeps `fence` coherent — the kernel is built only at
     //     MLX_METAL_VERSION >= 320 while fence.cpp's runtime guard is
     //     `__builtin_available(macOS 15, iOS 18, *)`, so a lower floor could satisfy
     //     the runtime check with the kernel absent.
-    //     The NAX gate fails safe on iOS: it needs Metal >= 400 AND
-    //     MACOS_SDK_VERSION >= 26.2, and the latter is unset off macOS.
+    //     The NAX gate fails safe off macOS: it needs Metal >= 400 AND
+    //     MACOS_SDK_VERSION >= 26.2, and the latter is unset there.
+    //     watchOS is not covered: its SDKs ship no Metal framework at all, so
+    //     build.rs rejects the `metal` feature there before cmake runs.
+    //   - apple-cpu-no-jit.patch              : route tvOS/watchOS/visionOS to the
+    //     same no-op CPU compiler upstream already uses for iOS.
+    //     mlx/backend/cpu/jit_compiler.cpp shells out to a host compiler via
+    //     `std::system()`, which libc marks __IOS_PROHIBITED __TVOS_PROHIBITED
+    //     __WATCHOS_PROHIBITED — there is no process spawning in these sandboxes.
+    //     Upstream guards it with `if(IOS)`, but CMake defines only IOS and leaves
+    //     TVOS/WATCHOS unset even when CMAKE_SYSTEM_NAME is tvOS/watchOS, so those
+    //     platforms still compiled the JIT path and failed with
+    //     "'system' is unavailable: not available on tvOS". The patch matches on
+    //     CMAKE_SYSTEM_NAME instead. macOS and iOS take exactly the branch they did
+    //     before.
     //
     // The sc-2714 (dense GEMM) and sc-2770 (fast SDPA) NAX-dispatch gate patches were
     // REMOVED in sc-2772. Their root cause was never the dispatch or the MLX version: the
@@ -304,7 +579,8 @@ fn prepare_mlx_c_source() -> PathBuf {
         ("patches/pad-copy-int64.patch", true),
         ("patches/thread-shared-streams.patch", true),
         ("patches/thread-safe-eval.patch", true),
-        ("patches/ios-metal-sdk.patch", true),
+        ("patches/apple-metal-sdk.patch", true),
+        ("patches/apple-cpu-no-jit.patch", true),
     ];
     // sc-12780 idempotency guard: CMake FetchContent may re-run PATCH_COMMAND against an
     // mlx-src that is ALREADY patched (e.g. an incremental rebuild that does not re-fetch).
@@ -408,9 +684,74 @@ fn build_and_link_mlx_c() {
     // (10.13 on macOS, 10.0 on iOS) causes MLX's CMakeLists.txt to reject the build — and on iOS
     // an unset target also drops __chkstk_darwin (libSystem, iOS 12+) at link time.
     let platform = apple_platform();
-    if let Some(platform) = &platform {
+    let deployment_target = platform.as_ref().map(|platform| {
         let target = resolve_deployment_target(platform);
+        // `env::set_var` reaches the cmake/cc child processes, but NOT rustc's link of a
+        // downstream binary — that is a separate cargo invocation with its own environment. Off
+        // macOS an unset deployment target there drops __chkstk_darwin (libSystem, iOS 12+) and
+        // surfaces as a bare undefined-symbol error in the consuming crate, with nothing
+        // pointing back to here. Say so while the cause is still identifiable.
+        if platform.cmake_system_name.is_some() && env::var(platform.deployment_env).is_err() {
+            println!(
+                "cargo:warning={env} is not set. MLX is being built at {target}, but cargo will \
+                 not pass that to the final link — set {env}={target} in your environment or \
+                 .cargo/config.toml, or expect an undefined `___chkstk_darwin` when linking.",
+                env = platform.deployment_env,
+            );
+        }
         env::set_var(platform.deployment_env, &target);
+        target
+    });
+
+    // watchOS has no Metal framework in either its device or simulator SDK, so MLX_BUILD_METAL
+    // cannot work there at all. Fail here with the reason rather than at link time with a
+    // missing-framework error.
+    #[cfg(feature = "metal")]
+    if let Some(platform) = &platform {
+        assert!(
+            platform.metal_version_min_prefix.is_some(),
+            "mlx-sys: the `metal` feature is enabled, but the {} SDK ships no Metal framework. \
+             Build with `--no-default-features` (plus any other features you need) for a \
+             CPU-only MLX on this target.",
+            platform.sdk,
+        );
+    }
+
+    // No watchOS *device* target builds MLX, and the two ABIs fail for unrelated reasons — so
+    // neither "it's the 32-bit ABI" nor "it's the SIMD layer" is the whole story. Measured
+    // against MLX 0.32 / Xcode 26.5, CPU-only, with and without the `accelerate` feature:
+    //
+    //   arm64_32, armv7k (ILP32)     mlx/backend/cpu/simd/ assumes LP64 — `simd::Vector<long,
+    //                                N>` has no `packed_t` and `simd::Simd<long long, N>` has
+    //                                no valid construction. ~30 errors in binary.h, reduce.cpp
+    //                                and accelerate_simd.h.
+    //   aarch64-apple-watchos (LP64) compiles past that and dies on MLX's half-precision types:
+    //                                the watchOS SDK makes `__bf16` and `__fp16` distinct
+    //                                native types, so compiled.h has an ambiguous `operator<<`
+    //                                and libc++ `copy()` rejects the assignment.
+    //
+    // Both are upstream MLX ports. The watchOS *simulator* is unaffected and does build, which
+    // is why the watchOS arms above exist at all.
+    if let Some(platform) = &platform {
+        assert!(
+            platform.sdk != "watchos",
+            "mlx-sys: MLX does not build for watchOS devices on any ABI — the ILP32 targets \
+             (arm64_32, armv7k) fail in MLX's LP64-only CPU SIMD layer, and the LP64 target \
+             (aarch64-apple-watchos) fails on its `__bf16`/`__fp16` handling. Both need fixing \
+             upstream in MLX. `aarch64-apple-watchos-sim` does build, CPU-only.",
+        );
+    }
+
+    // Separately from watchOS: MLX's CPU SIMD layer is LP64-only, so no 32-bit Apple target can
+    // work. Beyond the watchOS ABIs above this only catches targets Apple retired years ago
+    // (i386/armv7s-apple-ios, i686-apple-darwin), but it costs nothing and keeps the failure a
+    // one-line diagnosis instead of a ten-minute build ending in C++ template errors.
+    if platform.is_some() {
+        assert!(
+            env::var("CARGO_CFG_TARGET_POINTER_WIDTH").as_deref() != Ok("32"),
+            "mlx-sys: MLX does not build for 32-bit-pointer Apple targets — its CPU SIMD layer \
+             (mlx/backend/cpu/simd/) assumes LP64 and does not compile under ILP32.",
+        );
     }
 
     let mlx_c_src = prepare_mlx_c_source();
@@ -418,23 +759,53 @@ fn build_and_link_mlx_c() {
     config.very_verbose(true);
     config.define("CMAKE_INSTALL_PREFIX", ".");
 
-    // mlx-c's example .app targets are never linked into this crate, and they do not build for
-    // every Apple platform: on the iOS **simulator** they fail with undefined `_MTLIOErrorDomain`
-    // (MTLIO is absent from the simulator's Metal framework), which fails the whole cmake build
-    // even though libmlx/libmlxc themselves compiled cleanly. Skipping them is free everywhere and
-    // unblocks aarch64-apple-ios-sim.
+    // mlx-c's example .app targets are never linked into this crate, so building them is pure
+    // cost on every platform.
+    //
+    // They were originally turned off because they failed on the iOS simulator with undefined
+    // `_MTLIOErrorDomain` — but that was the examples correctly reporting a real defect in what
+    // this crate ships, not a problem with the examples: they were the only final link in the
+    // build, and every consumer binary hit the same error.
+    // shim_unexported_metal_cpp_symbols() fixes the cause, so this is now only about build time.
+    // The cross-apple CI workflow links a real binary per target to keep that honest.
     config.define("MLX_C_BUILD_EXAMPLES", "OFF");
 
     if let Some(platform) = &platform {
-        let target = resolve_deployment_target(platform);
         // CMAKE_OSX_DEPLOYMENT_TARGET is the knob for every Apple platform, not just macOS.
-        config.define("CMAKE_OSX_DEPLOYMENT_TARGET", &target);
+        config.define(
+            "CMAKE_OSX_DEPLOYMENT_TARGET",
+            deployment_target.as_deref().unwrap_or_default(),
+        );
+
+        // Hand MLX the SDK and version-min flag for THIS platform. apple-metal-sdk.patch reads
+        // both: the per-kernel compile, the metallib link and the root MLX_METAL_VERSION probe
+        // all default to `-sdk macosx` / `-mmacosx-version-min` upstream, which cross-compiles
+        // to a macOS metallib that loads nowhere else. The patch hard-errors on a non-macOS
+        // Apple system with these unset rather than falling back to MLX_METAL_VERSION 0.
+        if let Some(prefix) = platform.metal_version_min_prefix {
+            config.define("MLX_METAL_SDK", platform.sdk);
+            config.define("MLX_METAL_VERSION_MIN_PREFIX", prefix);
+        }
+
         if let Some(system_name) = platform.cmake_system_name {
-            // Cross-compiling: tell CMake the target platform and architecture explicitly.
+            // Cross-compiling. cmake-rs sets CMAKE_SYSTEM_NAME/CMAKE_SYSTEM_PROCESSOR itself,
+            // but only when neither we nor the environment already defined the former — and it
+            // sets *both or neither*. Since we need the platform decision here anyway (for the
+            // sysroot and the Metal SDK), set both explicitly rather than leaving
+            // CMAKE_SYSTEM_PROCESSOR unset as a side effect of naming the system.
             config.define("CMAKE_SYSTEM_NAME", system_name);
-            if let Ok(arch) = env::var("CARGO_CFG_TARGET_ARCH") {
-                let arch = if arch == "aarch64" { "arm64" } else { &arch };
-                config.define("CMAKE_OSX_ARCHITECTURES", arch);
+            if let Some(arch) = apple_arch() {
+                config.define("CMAKE_SYSTEM_PROCESSOR", &arch);
+                config.define("CMAKE_OSX_ARCHITECTURES", &arch);
+            }
+            // CMAKE_SYSTEM_NAME alone does not distinguish device from simulator — CMake maps
+            // `iOS` to the iPhoneOS SDK either way — so name the sysroot explicitly.
+            if let Some(sysroot) = apple_sysroot(platform.sdk) {
+                config.define("CMAKE_OSX_SYSROOT", &sysroot);
+            } else {
+                // Fall back to the SDK name, which CMake also accepts, so a failing xcrun does
+                // not silently leave the device SDK selected.
+                config.define("CMAKE_OSX_SYSROOT", platform.sdk);
             }
         }
     }
@@ -480,6 +851,13 @@ fn build_and_link_mlx_c() {
     #[cfg(feature = "metal")]
     {
         println!("cargo:rustc-link-lib=framework=Metal");
+
+        // Must come after the Metal/mlx link directives — see the function's doc comment.
+        if let Some(platform) = &platform {
+            if platform.cmake_system_name.is_some() {
+                shim_unexported_metal_cpp_symbols(platform, &dst.join("build/lib"));
+            }
+        }
     }
 
     #[cfg(feature = "accelerate")]
@@ -523,10 +901,7 @@ fn build_and_link_mlx_c() {
     // subsequent macOS test run until a native build repairs it. An iOS app bundles its metallib
     // in the `.app` and never reads `$HOME` anyway (there is nothing useful there in the sandbox).
     #[cfg(feature = "metal")]
-    if matches!(
-        env::var("CARGO_CFG_TARGET_OS").as_deref(),
-        Ok("macos") | Err(_)
-    ) {
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
         let metallib = dst.join("build/lib/mlx.metallib");
         if metallib.exists() {
             if let Ok(home) = env::var("HOME") {

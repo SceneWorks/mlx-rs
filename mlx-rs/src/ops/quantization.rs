@@ -240,7 +240,7 @@ pub fn gather_qmm_device<'b, 'lhs, 'rhs>(
 /// This function supports `nvfp4` and `mxfp8` quantization modes.
 ///
 /// Note: This function is only supported on GPU with the CUDA backend (Linux with NVIDIA GPU).
-/// It is not available on macOS.
+/// It is compiled on Linux only — MLX builds no CUDA backend on any Apple platform.
 ///
 /// # Params
 ///
@@ -293,8 +293,14 @@ pub fn qqmm_device<'a>(
             bits,
             mode_cstr.as_ptr(),
             // `global_scale_x` / `global_scale_w`: added to the C signature by the MLX 0.32 bump
-            // and never threaded through here, so this call had 8 of 10 arguments. Absent
-            // optional arrays are passed as a fresh empty array, matching `w_scales` above.
+            // and never threaded through here, so this call had 8 of 10 arguments.
+            //
+            // `mlx_array_new()` is how the C API spells an ABSENT optional, not an empty array:
+            // it returns `mlx_array_{.ctx = nullptr}`, and the shim does
+            // `arr.ctx ? std::make_optional(...) : std::nullopt`, so a null ctx reaches
+            // `mlx::core::qqmm` as `nullopt`. That is the same convention `w_scales` uses above.
+            // Do NOT "fix" these into a real zero-size array — an empty array and `nullopt` are
+            // different arguments to qqmm. Nothing is allocated, so nothing leaks.
             // Exposing them as `#[optional]` parameters is a separate, additive change.
             mlx_sys::mlx_array_new(),
             mlx_sys::mlx_array_new(),

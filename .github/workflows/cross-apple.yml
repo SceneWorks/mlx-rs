@@ -1,0 +1,131 @@
+# Cross-compile checks for the non-macOS Apple targets.
+#
+# Deliberately NOT on every PR: each leg is a cold MLX C++ + ~15k-kernel metallib build on a
+# 3-core runner, and the macOS concurrency pool is only 5 jobs. Runs nightly, on demand, and on
+# any PR labelled `apple-cross` — label a PR that touches mlx-sys/build.rs or the Apple patches.
+#
+# Without this, every iOS/tvOS claim in the build script is unverifiable and rots silently: the
+# failure mode these targets have is a build that SUCCEEDS and produces a metallib for the wrong
+# platform, which only surfaces at `newLibraryWithURL` on a device. So each leg asserts the
+# target triple recorded inside the built metallib, not just that the build exited 0.
+name: cross-apple
+
+on:
+  schedule:
+    - cron: "0 7 * * *"
+  workflow_dispatch:
+  pull_request:
+    types: [labeled, synchronize, reopened]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    if: >-
+      github.event_name != 'pull_request' ||
+      contains(github.event.pull_request.labels.*.name, 'apple-cross')
+    runs-on: macos-15
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-ios
+            # Device and simulator differ only in the `-simulator` suffix — which is exactly the
+            # bug this matrix exists to catch, since nothing else about an arm64 simulator build
+            # distinguishes it from the device.
+            metallib_triple: air64_v27-apple-ios18.0.0
+            sdk: iphoneos
+            clang_target: arm64-apple-ios18.0
+            toolchain: stable
+            build_std: ""
+          - target: aarch64-apple-ios-sim
+            metallib_triple: air64_v27-apple-ios18.0.0-simulator
+            sdk: iphonesimulator
+            clang_target: arm64-apple-ios18.0-simulator
+            toolchain: stable
+            build_std: ""
+          # tvOS is a tier-3 Rust target with no prebuilt std, so it needs -Z build-std on
+          # nightly. That is also the only way anyone can consume this crate on tvOS, so the
+          # nightly pin mirrors reality rather than working around CI. It does mean these legs
+          # can break for reasons unrelated to this repo — which is part of why the whole
+          # workflow is nightly/label-gated rather than a PR requirement.
+          - target: aarch64-apple-tvos
+            metallib_triple: air64_v27-apple-tvos18.0.0
+            sdk: appletvos
+            clang_target: arm64-apple-tvos18.0
+            toolchain: nightly
+            build_std: "-Z build-std=std,panic_abort"
+          - target: aarch64-apple-tvos-sim
+            metallib_triple: air64_v27-apple-tvos18.0.0-simulator
+            sdk: appletvsimulator
+            clang_target: arm64-apple-tvos18.0-simulator
+            toolchain: nightly
+            build_std: "-Z build-std=std,panic_abort"
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: true
+      - run: sudo xcodes select 16.4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: false
+          toolchain: ${{ matrix.toolchain }}
+          # A tier-3 target has no prebuilt std to install; rust-src is what build-std needs.
+          target: ${{ matrix.build_std == '' && matrix.target || '' }}
+          components: ${{ matrix.build_std == '' && '' || 'rust-src' }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}-${{ hashFiles('**/Cargo.toml') }}
+      - run: cargo build ${{ matrix.build_std }} -p pmetal-mlx-sys --target ${{ matrix.target }}
+
+      - name: Assert the metallib targets ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          # `-print -quit` rather than `| head -1`: under `pipefail` a closed pipe can fail the
+          # step on find's exit status instead of on anything real.
+          metallib=$(find target/${{ matrix.target }} -name mlx.metallib -path '*/build/lib/*' -print -quit)
+          if [ -z "$metallib" ]; then
+            echo "::error::no mlx.metallib was produced for ${{ matrix.target }}"
+            exit 1
+          fi
+          echo "metallib: $metallib"
+          # The AIR objects record their full target triple and it survives into the metallib.
+          # `|| true` so an empty result is reported by the comparison below rather than as a
+          # bare grep exit code.
+          found=$(LC_ALL=C strings -a "$metallib" \
+                  | grep -oE 'air64[_a-z0-9]*-apple-[a-z0-9.]+(-simulator)?' \
+                  | sort -u || true)
+          echo "triples: $found"
+          if [ "$found" != "${{ matrix.metallib_triple }}" ]; then
+            echo "::error::expected ${{ matrix.metallib_triple }}, got '$found'"
+            exit 1
+          fi
+
+      # `cargo build -p pmetal-mlx-sys` only produces static archives — nothing in it performs a
+      # final link, so an undefined symbol in libmlx.a passes unnoticed and detonates in the
+      # consumer's app instead. That is exactly how the simulator's missing `_MTLIOErrorDomain`
+      # went unseen. Link a real binary so the failure lands here.
+      - name: Link a real binary for ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          # `*pmetal-mlx-sys*/out`, not `*/pmetal-mlx-sys-*/out`: a -Z build-std run nests the
+          # build dir one level deeper (pmetal-mlx-sys/<hash>/out) than a normal one
+          # (pmetal-mlx-sys-<hash>/out), and the stricter glob silently matches neither.
+          out=$(find target/${{ matrix.target }} -type d -path '*pmetal-mlx-sys*/out' -print -quit)
+          sdk=$(xcrun --sdk ${{ matrix.sdk }} --show-sdk-path)
+          # Empty on the device SDKs, which export everything metal-cpp references.
+          shim=$(find "$out" -name 'libmlx_metal_cpp_absent.a' -print -quit)
+          xcrun --sdk ${{ matrix.sdk }} clang \
+            -target ${{ matrix.clang_target }} -isysroot "$sdk" \
+            "$out/mlx-c-staged/examples/example.c" -I"$out/mlx-c-staged" -o link-probe \
+            "$out/build/lib/libmlxc.a" "$out/build/lib/libmlx.a" \
+            "$out/build/_deps/mlx-build/mlx/io/libgguflib.a" $shim \
+            -lc++ -lobjc \
+            -framework Metal -framework Foundation -framework QuartzCore -framework Accelerate
+          file link-probe
