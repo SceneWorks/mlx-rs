@@ -422,6 +422,27 @@ fn prepare_mlx_c_source() -> PathBuf {
     );
     println!("cargo:rerun-if-changed=patches/mlx-c-fft-norm.patch");
 
+    // sc-18316: retained Rust compile handles may outlive MLX's C++ thread-local compiler cache
+    // when both are first initialized in the opposite order. Expose a non-mutating cache touch so
+    // downstream Rust TLS owners can establish safe reverse-destruction order before creating
+    // their own slot. Keep the pinned upstream mlx-c submodule pristine; this is a pmetal-specific
+    // lifecycle bridge until mlx-c exposes an equivalent API.
+    let cache_init_patch = std::fs::canonicalize("patches/compile-cache-initialize.patch")
+        .expect("find compile-cache-initialize.patch");
+    let status = Command::new("patch")
+        .arg("-p1")
+        .arg("-d")
+        .arg(&staged)
+        .arg("-i")
+        .arg(&cache_init_patch)
+        .status()
+        .expect("Failed to run `patch` for compile-cache-initialize.patch");
+    assert!(
+        status.success(),
+        "compile-cache-initialize.patch failed to apply to staged mlx-c (sc-18316)"
+    );
+    println!("cargo:rerun-if-changed=patches/compile-cache-initialize.patch");
+
     // Copy our patch files into the staged source. FetchContent allows only one
     // PATCH_COMMAND, so build.rs generates apply_patches.sh (below) which applies
     // each MLX source patch individually and idempotently.

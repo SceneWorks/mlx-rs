@@ -45,12 +45,12 @@
 //!
 //! The first time you call a compiled function, MLX will build the compute
 //! graph, optimize it, and generate and compile code. This can be relatively
-//! slow. However, MLX will cache compiled functions, so calling a compiled
-//! function multiple times will not initiate a new compilation. This means you
-//! should typically compile functions that you plan to use more than once.
+//! slow. However, MLX will cache a retained compiled function, so calling that
+//! handle multiple times will not initiate a new compilation. This means you
+//! should typically retain compiled functions that you plan to use more than once.
 //!
 //! ```rust
-//! use mlx_rs::{Array, array, transforms::compile::compile};
+//! use mlx_rs::{Array, array, transforms::compile::compile_retained};
 //!
 //! let fun = |(x, y): (&Array, &Array)| {
 //!    mlx_rs::exp!(x.negative()?)?.add(y)
@@ -59,16 +59,13 @@
 //! let x = array!(1.0);
 //! let y = array!(2.0);
 //!
-//! let mut compiled_fun = compile(fun, None);
+//! let mut compiled_fun = compile_retained(fun, None);
 //!
 //! // Compiled here
-//! let result = compiled_fun((&x, &y)).unwrap();
+//! let result = compiled_fun.call_mut((&x, &y)).unwrap();
 //!
 //! // Not compiled again
-//! let result = compiled_fun((&x, &y)).unwrap();
-//!
-//! // Not compiled again
-//! let compiled_fun2 = compile(fun, None);
+//! let result = compiled_fun.call_mut((&x, &y)).unwrap();
 //! ```
 //!
 //! There are some important cases to be aware of that can cause a function to
@@ -142,8 +139,10 @@
 //! See mlx-rs/mlx-tests/tests/test_compile_with_state.rs for more examples.
 //!
 
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
+use std::{
+    rc::Rc,
+    sync::atomic::{AtomicU64, AtomicUsize, Ordering},
+};
 
 use super::{Closure, Guarded, VectorArray};
 use crate::Array;
@@ -154,6 +153,44 @@ mod compile_with_state;
 
 pub use compile::*;
 pub use compile_with_state::*;
+
+static NEXT_COMPILE_ID: AtomicUsize = AtomicUsize::new(1);
+static CACHE_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// Shared ownership of one backend compiler-cache identity.
+///
+/// `Compiled` is cloneable, so erasing from the backend in `CompiledState::drop` let the first
+/// clone invalidate every sibling. Keeping the identity behind an `Rc` makes the erase happen
+/// exactly once, after the final Rust handle is gone. The backend cache is thread-local, so the
+/// lease deliberately remains bound to the thread that created it.
+#[derive(Debug)]
+struct CompileLease {
+    id: usize,
+    cache_token: *mut std::ffi::c_void,
+}
+
+impl Drop for CompileLease {
+    fn drop(&mut self) {
+        unsafe {
+            // The token outlives both the MLX compiler cache and this lease. It erases immediately
+            // during an ordinary drop, but only releases its retained token reference when a Rust
+            // TLS destructor runs after MLX has already destroyed the owning thread's cache.
+            let _ = mlx_sys::mlx_detail_compile_erase_with_cache_token(self.cache_token, self.id);
+        }
+    }
+}
+
+fn new_compile_lease() -> Rc<CompileLease> {
+    let id = NEXT_COMPILE_ID
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+        .expect("exhausted process-local MLX compile identities");
+    let cache_token = unsafe { mlx_sys::mlx_detail_compile_acquire_cache_token() };
+    assert!(
+        !cache_token.is_null(),
+        "MLX failed to acquire the current thread's compiler-cache lifetime token"
+    );
+    Rc::new(CompileLease { id, cache_token })
+}
 
 /// Globally enable the compilation of functions.
 ///
@@ -178,6 +215,28 @@ pub fn clear_cache() {
     unsafe {
         mlx_sys::mlx_detail_compile_clear_cache();
     }
+    CACHE_GENERATION.fetch_add(1, Ordering::AcqRel);
+}
+
+/// Process-local generation of MLX's compiler cache.
+///
+/// Retained-callable diagnostics use this to distinguish the first invocation after an explicit
+/// [`clear_cache`] from a true cache hit. It is monotonic for the process lifetime.
+pub fn cache_generation() -> u64 {
+    CACHE_GENERATION.load(Ordering::Acquire)
+}
+
+/// Initialize MLX's per-thread compiler cache and its retained-handle lifetime token.
+///
+/// Rust and C++ thread-local destructors are not guaranteed to share one cross-language ordering.
+/// The native lifetime token therefore remains valid until every Rust lease has dropped and marks
+/// the cache unavailable before C++ destroys it. Calling this function before accessing a
+/// downstream TLS cache remains recommended and is harmless; repeated calls neither clear nor
+/// otherwise mutate compiled entries.
+pub fn prepare_retained_compilation_thread() {
+    unsafe {
+        mlx_sys::mlx_detail_compile_initialize_cache();
+    }
 }
 
 /// A compiled function that can be called.
@@ -191,27 +250,7 @@ pub struct Compiled<F, G> {
 struct CompiledState<F> {
     f: F,
     shapeless: bool,
-    id: usize,
-}
-
-impl<F> Drop for CompiledState<F> {
-    fn drop(&mut self) {
-        unsafe {
-            // remove the compiled structure from the back end
-            mlx_sys::mlx_detail_compile_erase(self.id);
-        }
-    }
-}
-
-fn type_id_to_usize<T>(_val: &T) -> usize
-where
-    T: 'static,
-{
-    // hash type id to usize
-    let type_id = std::any::TypeId::of::<T>();
-    let mut hasher = DefaultHasher::new();
-    type_id.hash(&mut hasher);
-    hasher.finish() as usize
+    lease: Rc<CompileLease>,
 }
 
 fn update_by_replace_with_ref_to_new_array(src: &mut Array, new_array: &Array) {
