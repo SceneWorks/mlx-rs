@@ -180,6 +180,19 @@ pub fn clear_cache() {
     }
 }
 
+/// Initialize MLX's per-thread compiler cache before installing retained callables in thread-local
+/// storage.
+///
+/// MLX and Rust both destroy thread-local values in reverse initialization order. A downstream TLS
+/// cache that owns [`compile_retained`] handles must call this function *before* accessing that TLS
+/// slot, so the Rust handles are destroyed before MLX's compiler cache. Calling it repeatedly is
+/// harmless and does not clear or otherwise mutate existing compiled entries.
+pub fn prepare_retained_compilation_thread() {
+    unsafe {
+        mlx_sys::mlx_detail_compile_initialize_cache();
+    }
+}
+
 /// A compiled function that can be called.
 #[derive(Debug, Clone)]
 pub struct Compiled<F, G> {

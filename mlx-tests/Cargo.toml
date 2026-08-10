@@ -6,8 +6,8 @@ version.workspace = true
 authors.workspace = true
 
 [dependencies]
+mlx-rs.workspace = true
 
 [dev-dependencies]
 mlx-internal-macros.workspace = true
-mlx-rs.workspace = true
 tempfile.workspace = true

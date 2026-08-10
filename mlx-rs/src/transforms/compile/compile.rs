@@ -6,7 +6,10 @@ use std::marker::PhantomData;
 
 use crate::{error::Exception, Array};
 
-use super::{type_id_to_usize, Closure, Compiled, CompiledState, Guarded, VectorArray};
+use super::{
+    prepare_retained_compilation_thread, type_id_to_usize, Closure, Compiled, CompiledState,
+    Guarded, VectorArray,
+};
 
 /// Returns a compiled function that produces the same output as `f`.
 ///
@@ -60,6 +63,7 @@ pub fn compile_retained<F, A, O, E>(f: F, shapeless: impl Into<Option<bool>>) ->
 where
     F: CompileRetained<A, O, E>,
 {
+    prepare_retained_compilation_thread();
     f.compile_retained(shapeless.into().unwrap_or(false))
 }
 

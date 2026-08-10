@@ -1,0 +1,34 @@
+diff --git a/mlx/c/compile.cpp b/mlx/c/compile.cpp
+index bc7b864..3d1ec5f 100644
+--- a/mlx/c/compile.cpp
++++ b/mlx/c/compile.cpp
+@@ -49,6 +49,17 @@ extern "C" int mlx_detail_compile_clear_cache(void) {
+   }
+   return 0;
+ }
++extern "C" int mlx_detail_compile_initialize_cache(void) {
++  try {
++    // Touch, but do not mutate, MLX's thread-local cache. Retained Rust callables use this to make
++    // the cache's TLS destructor older than their own, so compile_erase remains valid at exit.
++    (void)mlx::core::detail::compile_cache_empty();
++  } catch (std::exception& e) {
++    mlx_error(e.what());
++    return 1;
++  }
++  return 0;
++}
+ extern "C" int mlx_detail_compile_erase(uintptr_t fun_id) {
+   try {
+     mlx::core::detail::compile_erase(fun_id);
+diff --git a/mlx/c/compile.h b/mlx/c/compile.h
+index 04567fb..f03e6d4 100644
+--- a/mlx/c/compile.h
++++ b/mlx/c/compile.h
+@@ -43,6 +43,7 @@ int mlx_detail_compile(
+     const uint64_t* constants,
+     size_t constants_num);
+ int mlx_detail_compile_clear_cache(void);
++int mlx_detail_compile_initialize_cache(void);
+ int mlx_detail_compile_erase(uintptr_t fun_id);
+ int mlx_disable_compile(void);
+ int mlx_enable_compile(void);
