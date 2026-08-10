@@ -14,7 +14,7 @@ use std::{
 
 use crate::{
     error::Exception,
-    transforms::compile::{type_id_to_usize, CompiledState},
+    transforms::compile::{new_compile_lease, CompiledState},
     utils::Updatable,
     Array,
 };
@@ -72,11 +72,10 @@ where
         self,
         shapeless: bool,
     ) -> impl CallMutWithState<U, Self::Args<'args>, Vec<Array>, ()> {
-        let id = type_id_to_usize(&self);
         let state = CompiledState {
             f: self,
             shapeless,
-            id,
+            lease: new_compile_lease(),
         };
         Compiled {
             f_marker: PhantomData::<F>,
@@ -96,12 +95,15 @@ where
         mut self,
         shapeless: bool,
     ) -> impl CallMutWithState<U, Self::Args<'args>, Array, ()> {
-        let id = type_id_to_usize(&self);
         let f = move |state: &mut U, args: &[Array]| -> Vec<Array> {
             let result = (self)(state, &args[0]);
             vec![result]
         };
-        let state = CompiledState { f, shapeless, id };
+        let state = CompiledState {
+            f,
+            shapeless,
+            lease: new_compile_lease(),
+        };
         Compiled {
             f_marker: PhantomData::<F>,
             state,
@@ -120,12 +122,15 @@ where
         mut self,
         shapeless: bool,
     ) -> impl CallMutWithState<U, Self::Args<'args>, Array, ()> {
-        let id = type_id_to_usize(&self);
         let f = move |state: &mut U, args: &[Array]| -> Vec<Array> {
             let result = (self)(state, (&args[0], &args[1]));
             vec![result]
         };
-        let state = CompiledState { f, shapeless, id };
+        let state = CompiledState {
+            f,
+            shapeless,
+            lease: new_compile_lease(),
+        };
         Compiled {
             f_marker: PhantomData::<F>,
             state,
@@ -144,12 +149,15 @@ where
         mut self,
         shapeless: bool,
     ) -> impl CallMutWithState<U, Self::Args<'args>, Array, ()> {
-        let id = type_id_to_usize(&self);
         let f = move |state: &mut U, args: &[Array]| -> Vec<Array> {
             let result = (self)(state, (&args[0], &args[1], &args[2]));
             vec![result]
         };
-        let state = CompiledState { f, shapeless, id };
+        let state = CompiledState {
+            f,
+            shapeless,
+            lease: new_compile_lease(),
+        };
         Compiled {
             f_marker: PhantomData::<F>,
             state,
@@ -168,11 +176,10 @@ where
         self,
         shapeless: bool,
     ) -> impl CallMutWithState<U, Self::Args<'args>, Vec<Array>, Exception> {
-        let id = type_id_to_usize(&self);
         let state = CompiledState {
             f: self,
             shapeless,
-            id,
+            lease: new_compile_lease(),
         };
         Compiled {
             f_marker: PhantomData::<F>,
@@ -192,12 +199,15 @@ where
         mut self,
         shapeless: bool,
     ) -> impl CallMutWithState<U, Self::Args<'args>, Array, Exception> {
-        let id = type_id_to_usize(&self);
         let f = move |state: &mut U, args: &[Array]| -> Result<Vec<Array>, Exception> {
             let result = (self)(state, &args[0])?;
             Ok(vec![result])
         };
-        let state = CompiledState { f, shapeless, id };
+        let state = CompiledState {
+            f,
+            shapeless,
+            lease: new_compile_lease(),
+        };
         Compiled {
             f_marker: PhantomData::<F>,
             state,
@@ -216,12 +226,15 @@ where
         mut self,
         shapeless: bool,
     ) -> impl CallMutWithState<U, Self::Args<'args>, Array, Exception> {
-        let id = type_id_to_usize(&self);
         let f = move |state: &mut U, args: &[Array]| -> Result<Vec<Array>, Exception> {
             let result = (self)(state, (&args[0], &args[1]))?;
             Ok(vec![result])
         };
-        let state = CompiledState { f, shapeless, id };
+        let state = CompiledState {
+            f,
+            shapeless,
+            lease: new_compile_lease(),
+        };
         Compiled {
             f_marker: PhantomData::<F>,
             state,
@@ -240,12 +253,15 @@ where
         mut self,
         shapeless: bool,
     ) -> impl CallMutWithState<U, Self::Args<'args>, Array, Exception> {
-        let id = type_id_to_usize(&self);
         let f = move |state: &mut U, args: &[Array]| -> Result<Vec<Array>, Exception> {
             let result = (self)(state, (&args[0], &args[1], &args[2]))?;
             Ok(vec![result])
         };
-        let state = CompiledState { f, shapeless, id };
+        let state = CompiledState {
+            f,
+            shapeless,
+            lease: new_compile_lease(),
+        };
         Compiled {
             f_marker: PhantomData::<F>,
             state,
@@ -563,7 +579,7 @@ impl<F> CompiledState<F> {
         let inner_closure = Closure::new(inner);
         call_mut_with_state_inner(
             inner_closure,
-            self.id,
+            self.lease.id,
             self.shapeless,
             state,
             args,
@@ -647,7 +663,7 @@ impl<F> CompiledState<F> {
         let inner_closure = Closure::new_fallible(inner);
         call_mut_with_state_inner(
             inner_closure,
-            self.id,
+            self.lease.id,
             self.shapeless,
             state,
             args,

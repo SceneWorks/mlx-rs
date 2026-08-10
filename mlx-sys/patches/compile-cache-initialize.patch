@@ -1,34 +1,124 @@
 diff --git a/mlx/c/compile.cpp b/mlx/c/compile.cpp
-index bc7b864..3d1ec5f 100644
+index bc7b864..e028c2d 100644
 --- a/mlx/c/compile.cpp
 +++ b/mlx/c/compile.cpp
-@@ -49,6 +49,17 @@ extern "C" int mlx_detail_compile_clear_cache(void) {
+@@ -5,0 +6,3 @@
++#include <atomic>
++#include <thread>
++
+@@ -49,6 +52,100 @@ extern "C" int mlx_detail_compile_clear_cache(void) {
    }
    return 0;
  }
++namespace {
++
++struct CompileCacheToken {
++  std::atomic<size_t> references{1};
++  std::atomic<bool> alive{true};
++  std::thread::id owner{std::this_thread::get_id()};
++};
++
++void retain_compile_cache_token(CompileCacheToken* token) {
++  token->references.fetch_add(1, std::memory_order_relaxed);
++}
++
++void release_compile_cache_token(CompileCacheToken* token) {
++  if (token->references.fetch_sub(1, std::memory_order_acq_rel) == 1) {
++    delete token;
++  }
++}
++
++class CompileCacheLifetime {
++ public:
++  CompileCacheLifetime() : token_(new CompileCacheToken{}) {}
++
++  ~CompileCacheLifetime() {
++    // This object is initialized after MLX's CompilerCache, so its TLS destructor runs first.
++    // Rust TLS destructors may run later still; their retained token remains valid but observes
++    // `alive == false` and therefore never dereferences the already-destroyed CompilerCache.
++    token_->alive.store(false, std::memory_order_release);
++    release_compile_cache_token(token_);
++  }
++
++  CompileCacheToken* acquire() const {
++    retain_compile_cache_token(token_);
++    return token_;
++  }
++
++ private:
++  CompileCacheToken* token_;
++};
++
++CompileCacheLifetime& compile_cache_lifetime() {
++  // Every caller initializes MLX's function-local CompilerCache immediately before entering here.
++  // Reverse TLS destruction therefore marks this token dead before CompilerCache storage is freed.
++  static thread_local CompileCacheLifetime lifetime;
++  return lifetime;
++}
++
++void ensure_compile_cache_lifetime() {
++  (void)mlx::core::detail::compile_cache_empty();
++  (void)compile_cache_lifetime();
++}
++
++} // namespace
++
 +extern "C" int mlx_detail_compile_initialize_cache(void) {
 +  try {
-+    // Touch, but do not mutate, MLX's thread-local cache. Retained Rust callables use this to make
-+    // the cache's TLS destructor older than their own, so compile_erase remains valid at exit.
-+    (void)mlx::core::detail::compile_cache_empty();
++    ensure_compile_cache_lifetime();
 +  } catch (std::exception& e) {
 +    mlx_error(e.what());
 +    return 1;
 +  }
 +  return 0;
 +}
++
++extern "C" void* mlx_detail_compile_acquire_cache_token(void) {
++  try {
++    ensure_compile_cache_lifetime();
++    return compile_cache_lifetime().acquire();
++  } catch (std::exception& e) {
++    mlx_error(e.what());
++    return nullptr;
++  }
++}
++
++extern "C" int mlx_detail_compile_erase_with_cache_token(
++    void* raw_token,
++    uintptr_t fun_id) {
++  auto* token = static_cast<CompileCacheToken*>(raw_token);
++  if (token == nullptr) {
++    mlx_error("compile cache token is null");
++    return 1;
++  }
++  int result = 0;
++  try {
++    if (token->alive.load(std::memory_order_acquire) &&
++        token->owner == std::this_thread::get_id()) {
++      mlx::core::detail::compile_erase(fun_id);
++    }
++  } catch (std::exception& e) {
++    mlx_error(e.what());
++    result = 1;
++  }
++  release_compile_cache_token(token);
++  return result;
++}
  extern "C" int mlx_detail_compile_erase(uintptr_t fun_id) {
    try {
      mlx::core::detail::compile_erase(fun_id);
 diff --git a/mlx/c/compile.h b/mlx/c/compile.h
-index 04567fb..f03e6d4 100644
+index 04567fb..1db5bda 100644
 --- a/mlx/c/compile.h
 +++ b/mlx/c/compile.h
-@@ -43,6 +43,7 @@ int mlx_detail_compile(
+@@ -43,6 +43,10 @@ int mlx_detail_compile(
      const uint64_t* constants,
      size_t constants_num);
  int mlx_detail_compile_clear_cache(void);
 +int mlx_detail_compile_initialize_cache(void);
++void* mlx_detail_compile_acquire_cache_token(void);
++int mlx_detail_compile_erase_with_cache_token(
++    void* token, uintptr_t fun_id);
  int mlx_detail_compile_erase(uintptr_t fun_id);
  int mlx_disable_compile(void);
  int mlx_enable_compile(void);

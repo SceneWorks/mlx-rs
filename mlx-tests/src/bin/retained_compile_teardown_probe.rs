@@ -14,6 +14,20 @@ thread_local! {
 }
 
 fn main() {
+    let mode = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| panic!("expected teardown mode: main or worker"));
+    match mode.as_str() {
+        "main" => exercise(),
+        "worker" => std::thread::spawn(exercise)
+            .join()
+            .expect("retained compile worker must not panic during TLS teardown"),
+        _ => panic!("unknown teardown mode {mode:?}"),
+    }
+    println!("retained compile {mode} teardown clean");
+}
+
+fn exercise() {
     let x = array!([2.0f32, 3.0]);
     prepare_retained_compilation_thread();
     RETAINED.with(|slot| {
@@ -23,5 +37,4 @@ fn main() {
         assert_eq!(compiled.call_mut(&x).unwrap(), array!([4.0f32, 9.0]));
         assert_eq!(compiled.call_mut(&x).unwrap(), array!([4.0f32, 9.0]));
     });
-    println!("retained compile teardown clean");
 }

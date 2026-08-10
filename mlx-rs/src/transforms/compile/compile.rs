@@ -7,7 +7,7 @@ use std::marker::PhantomData;
 use crate::{error::Exception, Array};
 
 use super::{
-    prepare_retained_compilation_thread, type_id_to_usize, Closure, Compiled, CompiledState,
+    new_compile_lease, prepare_retained_compilation_thread, Closure, Compiled, CompiledState,
     Guarded, VectorArray,
 };
 
@@ -25,8 +25,8 @@ where
 {
     let shapeless = shapeless.into().unwrap_or(false);
     move |args| {
-        // NOTE: we have to place this here to avoid the lifetime issue
-        // `f.compile` will look up the cached compiled function so it shouldn't result in re-compilation
+        // NOTE: we have to place this here to avoid the lifetime issue. This convenience API owns a
+        // one-call handle; use `compile_retained` when the backend graph must survive across calls.
         let mut compiled = f.compile(shapeless);
         compiled.call_mut(args)
     }
@@ -230,12 +230,10 @@ where
     type Args<'a> = &'a [Array];
 
     fn compile<'args>(self, shapeless: bool) -> impl CallMut<Self::Args<'args>, Vec<Array>, ()> {
-        let id = type_id_to_usize(&self);
         let state = CompiledState {
             f: self,
-
             shapeless,
-            id,
+            lease: new_compile_lease(),
         };
         Compiled {
             f_marker: PhantomData::<F>,
@@ -251,12 +249,15 @@ where
     type Args<'a> = &'a Array;
 
     fn compile<'args>(mut self, shapeless: bool) -> impl CallMut<Self::Args<'args>, Array, ()> {
-        let id = type_id_to_usize(&self);
         let f = move |args: &[Array]| -> Vec<Array> {
             let result = (self)(&args[0]);
             vec![result]
         };
-        let state = CompiledState { f, shapeless, id };
+        let state = CompiledState {
+            f,
+            shapeless,
+            lease: new_compile_lease(),
+        };
         Compiled {
             f_marker: PhantomData::<F>,
             state,
@@ -271,12 +272,15 @@ where
     type Args<'a> = (&'a Array, &'a Array);
 
     fn compile<'args>(mut self, shapeless: bool) -> impl CallMut<Self::Args<'args>, Array, ()> {
-        let id = type_id_to_usize(&self);
         let f = move |args: &[Array]| -> Vec<Array> {
             let result = (self)((&args[0], &args[1]));
             vec![result]
         };
-        let state = CompiledState { f, shapeless, id };
+        let state = CompiledState {
+            f,
+            shapeless,
+            lease: new_compile_lease(),
+        };
         Compiled {
             f_marker: PhantomData::<F>,
             state,
@@ -291,12 +295,15 @@ where
     type Args<'a> = (&'a Array, &'a Array, &'a Array);
 
     fn compile<'args>(mut self, shapeless: bool) -> impl CallMut<Self::Args<'args>, Array, ()> {
-        let id = type_id_to_usize(&self);
         let f = move |args: &[Array]| -> Vec<Array> {
             let result = (self)((&args[0], &args[1], &args[2]));
             vec![result]
         };
-        let state = CompiledState { f, shapeless, id };
+        let state = CompiledState {
+            f,
+            shapeless,
+            lease: new_compile_lease(),
+        };
         Compiled {
             f_marker: PhantomData::<F>,
             state,
@@ -314,11 +321,10 @@ where
         self,
         shapeless: bool,
     ) -> impl CallMut<Self::Args<'args>, Vec<Array>, Exception> {
-        let id = type_id_to_usize(&self);
         let state = CompiledState {
             f: self,
             shapeless,
-            id,
+            lease: new_compile_lease(),
         };
         Compiled {
             f_marker: PhantomData::<F>,
@@ -337,12 +343,15 @@ where
         mut self,
         shapeless: bool,
     ) -> impl CallMut<Self::Args<'args>, Array, Exception> {
-        let id = type_id_to_usize(&self);
         let f = move |args: &[Array]| -> Result<Vec<Array>, Exception> {
             let result = (self)(&args[0])?;
             Ok(vec![result])
         };
-        let state = CompiledState { f, shapeless, id };
+        let state = CompiledState {
+            f,
+            shapeless,
+            lease: new_compile_lease(),
+        };
         Compiled {
             f_marker: PhantomData::<F>,
             state,
@@ -360,12 +369,15 @@ where
         mut self,
         shapeless: bool,
     ) -> impl CallMut<Self::Args<'args>, Array, Exception> {
-        let id = type_id_to_usize(&self);
         let f = move |args: &[Array]| -> Result<Vec<Array>, Exception> {
             let result = (self)((&args[0], &args[1]))?;
             Ok(vec![result])
         };
-        let state = CompiledState { f, shapeless, id };
+        let state = CompiledState {
+            f,
+            shapeless,
+            lease: new_compile_lease(),
+        };
         Compiled {
             f_marker: PhantomData::<F>,
             state,
@@ -383,12 +395,15 @@ where
         mut self,
         shapeless: bool,
     ) -> impl CallMut<Self::Args<'args>, Array, Exception> {
-        let id = type_id_to_usize(&self);
         let f = move |args: &[Array]| -> Result<Vec<Array>, Exception> {
             let result = (self)((&args[0], &args[1], &args[2]))?;
             Ok(vec![result])
         };
-        let state = CompiledState { f, shapeless, id };
+        let state = CompiledState {
+            f,
+            shapeless,
+            lease: new_compile_lease(),
+        };
         Compiled {
             f_marker: PhantomData::<F>,
             state,
@@ -403,13 +418,12 @@ where
     type Callable = Box<dyn RetainedSlice>;
 
     fn compile_retained(self, shapeless: bool) -> Self::Callable {
-        let id = type_id_to_usize(&self);
         let compiled = Compiled {
             f_marker: PhantomData::<F>,
             state: CompiledState {
                 f: self,
                 shapeless,
-                id,
+                lease: new_compile_lease(),
             },
         };
         Box::new(RetainedSliceImpl {
@@ -426,14 +440,13 @@ where
     type Callable = Box<dyn RetainedUnary>;
 
     fn compile_retained(mut self, shapeless: bool) -> Self::Callable {
-        let id = type_id_to_usize(&self);
         let function = move |args: &[Array]| -> Vec<Array> { vec![(self)(&args[0])] };
         let compiled = Compiled {
             f_marker: PhantomData::<F>,
             state: CompiledState {
                 f: function,
                 shapeless,
-                id,
+                lease: new_compile_lease(),
             },
         };
         Box::new(RetainedUnaryImpl {
@@ -450,14 +463,13 @@ where
     type Callable = Box<dyn RetainedBinary>;
 
     fn compile_retained(mut self, shapeless: bool) -> Self::Callable {
-        let id = type_id_to_usize(&self);
         let function = move |args: &[Array]| -> Vec<Array> { vec![(self)((&args[0], &args[1]))] };
         let compiled = Compiled {
             f_marker: PhantomData::<F>,
             state: CompiledState {
                 f: function,
                 shapeless,
-                id,
+                lease: new_compile_lease(),
             },
         };
         Box::new(RetainedBinaryImpl {
@@ -474,7 +486,6 @@ where
     type Callable = Box<dyn RetainedTernary>;
 
     fn compile_retained(mut self, shapeless: bool) -> Self::Callable {
-        let id = type_id_to_usize(&self);
         let function =
             move |args: &[Array]| -> Vec<Array> { vec![(self)((&args[0], &args[1], &args[2]))] };
         let compiled = Compiled {
@@ -482,7 +493,7 @@ where
             state: CompiledState {
                 f: function,
                 shapeless,
-                id,
+                lease: new_compile_lease(),
             },
         };
         Box::new(RetainedTernaryImpl {
@@ -499,13 +510,12 @@ where
     type Callable = Box<dyn RetainedSlice>;
 
     fn compile_retained(self, shapeless: bool) -> Self::Callable {
-        let id = type_id_to_usize(&self);
         let compiled = Compiled {
             f_marker: PhantomData::<F>,
             state: CompiledState {
                 f: self,
                 shapeless,
-                id,
+                lease: new_compile_lease(),
             },
         };
         Box::new(RetainedSliceImpl {
@@ -522,7 +532,6 @@ where
     type Callable = Box<dyn RetainedUnary>;
 
     fn compile_retained(mut self, shapeless: bool) -> Self::Callable {
-        let id = type_id_to_usize(&self);
         let function =
             move |args: &[Array]| -> Result<Vec<Array>, Exception> { Ok(vec![(self)(&args[0])?]) };
         let compiled = Compiled {
@@ -530,7 +539,7 @@ where
             state: CompiledState {
                 f: function,
                 shapeless,
-                id,
+                lease: new_compile_lease(),
             },
         };
         Box::new(RetainedUnaryImpl {
@@ -547,7 +556,6 @@ where
     type Callable = Box<dyn RetainedBinary>;
 
     fn compile_retained(mut self, shapeless: bool) -> Self::Callable {
-        let id = type_id_to_usize(&self);
         let function = move |args: &[Array]| -> Result<Vec<Array>, Exception> {
             Ok(vec![(self)((&args[0], &args[1]))?])
         };
@@ -556,7 +564,7 @@ where
             state: CompiledState {
                 f: function,
                 shapeless,
-                id,
+                lease: new_compile_lease(),
             },
         };
         Box::new(RetainedBinaryImpl {
@@ -573,7 +581,6 @@ where
     type Callable = Box<dyn RetainedTernary>;
 
     fn compile_retained(mut self, shapeless: bool) -> Self::Callable {
-        let id = type_id_to_usize(&self);
         let function = move |args: &[Array]| -> Result<Vec<Array>, Exception> {
             Ok(vec![(self)((&args[0], &args[1], &args[2]))?])
         };
@@ -582,7 +589,7 @@ where
             state: CompiledState {
                 f: function,
                 shapeless,
-                id,
+                lease: new_compile_lease(),
             },
         };
         Box::new(RetainedTernaryImpl {
@@ -735,7 +742,7 @@ impl<F> CompiledState<F> {
     {
         let inner_closure = Closure::new(&mut self.f);
 
-        call_mut_inner(inner_closure, self.id, self.shapeless, args)
+        call_mut_inner(inner_closure, self.lease.id, self.shapeless, args)
     }
 
     fn fallible_call_mut(&mut self, args: &[impl AsRef<Array>]) -> Result<Vec<Array>, Exception>
@@ -744,13 +751,13 @@ impl<F> CompiledState<F> {
     {
         let inner_closure = Closure::new_fallible(&mut self.f);
 
-        call_mut_inner(inner_closure, self.id, self.shapeless, args)
+        call_mut_inner(inner_closure, self.lease.id, self.shapeless, args)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use core::panic;
+    use std::marker::PhantomData;
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
@@ -763,47 +770,18 @@ mod tests {
         Array,
     };
 
-    use super::{compile, compile_retained};
-
-    fn example_fn_0(x: f32) -> f32 {
-        x + 1.0
-    }
-
-    fn example_fn_3(x: f32) -> f32 {
-        x + 1.0
-    }
+    use super::{compile, compile_retained, CallMut};
 
     #[test]
-    fn test_type_id_to_usize() {
-        // We would like to check that different functions that share the same signature can produce
-        // different ids
+    fn compile_leases_have_unique_process_local_ids_and_erase_on_final_drop() {
+        let first = super::new_compile_lease();
+        let first_id = first.id;
+        let sibling = first.clone();
+        let second = super::new_compile_lease();
 
-        let example_fn_1 = |x: f32| x + 1.0;
-        let example_fn_2 = |x: f32| x + 1.0;
-
-        let mut ids = Vec::new();
-
-        ids.push(super::type_id_to_usize(&example_fn_0));
-
-        let id1 = super::type_id_to_usize(&example_fn_1);
-        if ids.contains(&id1) {
-            panic!("id1 already exists");
-        }
-        ids.push(id1);
-
-        let id2 = super::type_id_to_usize(&example_fn_2);
-        if ids.contains(&id2) {
-            panic!("id2 already exists");
-        }
-        ids.push(id2);
-
-        let id3 = super::type_id_to_usize(&example_fn_3);
-        if ids.contains(&id3) {
-            panic!("id3 already exists");
-        }
-        ids.push(id3);
-
-        assert_eq!(ids.len(), 4);
+        assert_ne!(first.id, second.id);
+        drop(first);
+        assert_eq!(sibling.id, first_id, "a clone keeps the shared lease alive");
     }
 
     #[test]
@@ -857,7 +835,7 @@ mod tests {
         let b = array!([4.0, 5.0]);
         let args = [a, b];
 
-        // The cache is keyed by function pointer and argument shapes
+        // The cache is keyed by compiled-handle identity and argument shapes.
         let c = array!([4.0, 5.0, 6.0]);
         let d = array!([7.0, 8.0]);
         let another_args = [c, d];
@@ -984,11 +962,297 @@ mod tests {
         );
     }
 
+    fn captured_slice(scale: f32) -> impl FnMut(&[Array]) -> Result<Vec<Array>, Exception> {
+        move |args| {
+            let product = multiply(&args[0], &args[1])?;
+            Ok(vec![multiply(product, Array::from_f32(scale))?])
+        }
+    }
+
+    fn captured_infallible_slice(scale: f32) -> impl FnMut(&[Array]) -> Vec<Array> {
+        move |args| {
+            let product = multiply(&args[0], &args[1]).unwrap();
+            vec![multiply(product, Array::from_f32(scale)).unwrap()]
+        }
+    }
+
+    fn captured_unary(scale: f32) -> impl FnMut(&Array) -> Result<Array, Exception> {
+        move |x| multiply(x, Array::from_f32(scale))
+    }
+
+    fn captured_infallible_unary(scale: f32) -> impl FnMut(&Array) -> Array {
+        move |x| multiply(x, Array::from_f32(scale)).unwrap()
+    }
+
+    fn captured_binary(scale: f32) -> impl FnMut((&Array, &Array)) -> Result<Array, Exception> {
+        move |(x, y)| multiply(multiply(x, y)?, Array::from_f32(scale))
+    }
+
+    fn captured_infallible_binary(scale: f32) -> impl FnMut((&Array, &Array)) -> Array {
+        move |(x, y)| multiply(multiply(x, y).unwrap(), Array::from_f32(scale)).unwrap()
+    }
+
+    fn captured_ternary(
+        scale: f32,
+    ) -> impl FnMut((&Array, &Array, &Array)) -> Result<Array, Exception> {
+        move |(x, y, z)| multiply(multiply(multiply(x, y)?, z)?, Array::from_f32(scale))
+    }
+
+    fn captured_infallible_ternary(scale: f32) -> impl FnMut((&Array, &Array, &Array)) -> Array {
+        move |(x, y, z)| {
+            multiply(
+                multiply(multiply(x, y).unwrap(), z).unwrap(),
+                Array::from_f32(scale),
+            )
+            .unwrap()
+        }
+    }
+
+    #[test]
+    fn same_closure_type_handles_are_independent_for_every_retained_interface() {
+        let x = array!([1.0f32, 2.0]);
+        let y = array!([3.0f32, 4.0]);
+        let z = array!([5.0f32, 6.0]);
+        let binary_args = [x.clone(), y.clone()];
+
+        {
+            let mut first = compile_retained(captured_infallible_slice(2.0), true);
+            let mut second = compile_retained(captured_infallible_slice(3.0), true);
+            assert_eq!(
+                first.call_mut(&binary_args).unwrap()[0],
+                array!([6.0f32, 16.0])
+            );
+            assert_eq!(
+                second.call_mut(&binary_args).unwrap()[0],
+                array!([9.0f32, 24.0])
+            );
+            assert_eq!(
+                first.call_mut(&binary_args).unwrap()[0],
+                array!([6.0f32, 16.0])
+            );
+            drop(first);
+            assert_eq!(
+                second.call_mut(&binary_args).unwrap()[0],
+                array!([9.0f32, 24.0])
+            );
+            crate::transforms::compile::clear_cache();
+            assert_eq!(
+                second.call_mut(&binary_args).unwrap()[0],
+                array!([9.0f32, 24.0])
+            );
+        }
+        {
+            let mut first = compile_retained(captured_slice(2.0), true);
+            let mut second = compile_retained(captured_slice(3.0), true);
+            assert_eq!(
+                first.call_mut(&binary_args).unwrap()[0],
+                array!([6.0f32, 16.0])
+            );
+            assert_eq!(
+                second.call_mut(&binary_args).unwrap()[0],
+                array!([9.0f32, 24.0])
+            );
+            assert_eq!(
+                first.call_mut(&binary_args).unwrap()[0],
+                array!([6.0f32, 16.0])
+            );
+            drop(first);
+            assert_eq!(
+                second.call_mut(&binary_args).unwrap()[0],
+                array!([9.0f32, 24.0])
+            );
+            crate::transforms::compile::clear_cache();
+            assert_eq!(
+                second.call_mut(&binary_args).unwrap()[0],
+                array!([9.0f32, 24.0])
+            );
+        }
+        {
+            let mut first = compile_retained(captured_infallible_unary(2.0), true);
+            let mut second = compile_retained(captured_infallible_unary(3.0), true);
+            assert_eq!(first.call_mut(&x).unwrap(), array!([2.0f32, 4.0]));
+            assert_eq!(second.call_mut(&x).unwrap(), array!([3.0f32, 6.0]));
+            assert_eq!(first.call_mut(&x).unwrap(), array!([2.0f32, 4.0]));
+            drop(first);
+            assert_eq!(second.call_mut(&x).unwrap(), array!([3.0f32, 6.0]));
+            crate::transforms::compile::clear_cache();
+            assert_eq!(second.call_mut(&x).unwrap(), array!([3.0f32, 6.0]));
+        }
+        {
+            let mut first = compile_retained(captured_unary(2.0), true);
+            let mut second = compile_retained(captured_unary(3.0), true);
+            assert_eq!(first.call_mut(&x).unwrap(), array!([2.0f32, 4.0]));
+            assert_eq!(second.call_mut(&x).unwrap(), array!([3.0f32, 6.0]));
+            assert_eq!(first.call_mut(&x).unwrap(), array!([2.0f32, 4.0]));
+            drop(first);
+            assert_eq!(second.call_mut(&x).unwrap(), array!([3.0f32, 6.0]));
+            crate::transforms::compile::clear_cache();
+            assert_eq!(second.call_mut(&x).unwrap(), array!([3.0f32, 6.0]));
+        }
+        {
+            let mut first = compile_retained(captured_infallible_binary(2.0), true);
+            let mut second = compile_retained(captured_infallible_binary(3.0), true);
+            assert_eq!(first.call_mut((&x, &y)).unwrap(), array!([6.0f32, 16.0]));
+            assert_eq!(second.call_mut((&x, &y)).unwrap(), array!([9.0f32, 24.0]));
+            assert_eq!(first.call_mut((&x, &y)).unwrap(), array!([6.0f32, 16.0]));
+            drop(first);
+            assert_eq!(second.call_mut((&x, &y)).unwrap(), array!([9.0f32, 24.0]));
+            crate::transforms::compile::clear_cache();
+            assert_eq!(second.call_mut((&x, &y)).unwrap(), array!([9.0f32, 24.0]));
+        }
+        {
+            let mut first = compile_retained(captured_binary(2.0), true);
+            let mut second = compile_retained(captured_binary(3.0), true);
+            assert_eq!(first.call_mut((&x, &y)).unwrap(), array!([6.0f32, 16.0]));
+            assert_eq!(second.call_mut((&x, &y)).unwrap(), array!([9.0f32, 24.0]));
+            assert_eq!(first.call_mut((&x, &y)).unwrap(), array!([6.0f32, 16.0]));
+            drop(first);
+            assert_eq!(second.call_mut((&x, &y)).unwrap(), array!([9.0f32, 24.0]));
+            crate::transforms::compile::clear_cache();
+            assert_eq!(second.call_mut((&x, &y)).unwrap(), array!([9.0f32, 24.0]));
+        }
+        {
+            let mut first = compile_retained(captured_infallible_ternary(2.0), true);
+            let mut second = compile_retained(captured_infallible_ternary(3.0), true);
+            assert_eq!(
+                first.call_mut((&x, &y, &z)).unwrap(),
+                array!([30.0f32, 96.0])
+            );
+            assert_eq!(
+                second.call_mut((&x, &y, &z)).unwrap(),
+                array!([45.0f32, 144.0])
+            );
+            assert_eq!(
+                first.call_mut((&x, &y, &z)).unwrap(),
+                array!([30.0f32, 96.0])
+            );
+            drop(first);
+            assert_eq!(
+                second.call_mut((&x, &y, &z)).unwrap(),
+                array!([45.0f32, 144.0])
+            );
+            crate::transforms::compile::clear_cache();
+            assert_eq!(
+                second.call_mut((&x, &y, &z)).unwrap(),
+                array!([45.0f32, 144.0])
+            );
+        }
+        {
+            let mut first = compile_retained(captured_ternary(2.0), true);
+            let mut second = compile_retained(captured_ternary(3.0), true);
+            assert_eq!(
+                first.call_mut((&x, &y, &z)).unwrap(),
+                array!([30.0f32, 96.0])
+            );
+            assert_eq!(
+                second.call_mut((&x, &y, &z)).unwrap(),
+                array!([45.0f32, 144.0])
+            );
+            assert_eq!(
+                first.call_mut((&x, &y, &z)).unwrap(),
+                array!([30.0f32, 96.0])
+            );
+            drop(first);
+            assert_eq!(
+                second.call_mut((&x, &y, &z)).unwrap(),
+                array!([45.0f32, 144.0])
+            );
+            crate::transforms::compile::clear_cache();
+            assert_eq!(
+                second.call_mut((&x, &y, &z)).unwrap(),
+                array!([45.0f32, 144.0])
+            );
+        }
+    }
+
     fn traced_square(traces: Arc<AtomicUsize>) -> impl FnMut(&Array) -> Result<Array, Exception> {
         move |x| {
             traces.fetch_add(1, Ordering::Relaxed);
             multiply(x, x)
         }
+    }
+
+    fn captured_scale(
+        scale: f32,
+        traces: Arc<AtomicUsize>,
+    ) -> impl FnMut(&Array) -> Result<Array, Exception> {
+        move |x| {
+            traces.fetch_add(1, Ordering::Relaxed);
+            multiply(x, Array::from_f32(scale))
+        }
+    }
+
+    #[test]
+    fn same_closure_type_retained_handles_have_independent_backend_state() {
+        let first_traces = Arc::new(AtomicUsize::new(0));
+        let second_traces = Arc::new(AtomicUsize::new(0));
+        let mut first = compile_retained(captured_scale(2.0, Arc::clone(&first_traces)), true);
+        let mut second = compile_retained(captured_scale(3.0, Arc::clone(&second_traces)), true);
+        let x = array!([2.0f32, 4.0]);
+
+        // Alternate the two handles. A TypeId-only backend key aliases these same-type closures and
+        // returns one capture's graph for both callables.
+        assert_eq!(first.call_mut(&x).unwrap(), array!([4.0f32, 8.0]));
+        assert_eq!(second.call_mut(&x).unwrap(), array!([6.0f32, 12.0]));
+        assert_eq!(first.call_mut(&x).unwrap(), array!([4.0f32, 8.0]));
+        assert_eq!(second.call_mut(&x).unwrap(), array!([6.0f32, 12.0]));
+        assert_eq!(first_traces.load(Ordering::Relaxed), 1);
+        assert_eq!(second_traces.load(Ordering::Relaxed), 1);
+
+        // Dropping one independent lease must not erase the other's compiled graph.
+        drop(first);
+        assert_eq!(second.call_mut(&x).unwrap(), array!([6.0f32, 12.0]));
+        assert_eq!(second_traces.load(Ordering::Relaxed), 1);
+
+        // Explicit cache invalidation keeps the stable handle identity but forces exactly one
+        // retrace, after which the handle hits again.
+        crate::transforms::compile::clear_cache();
+        assert_eq!(second.call_mut(&x).unwrap(), array!([6.0f32, 12.0]));
+        assert_eq!(second.call_mut(&x).unwrap(), array!([6.0f32, 12.0]));
+        assert_eq!(second_traces.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn cloned_compiled_state_erases_only_after_the_final_owner_drops() {
+        let traces = Arc::new(AtomicUsize::new(0));
+        let trace = Arc::clone(&traces);
+        let function = move |args: &[Array]| -> Result<Vec<Array>, Exception> {
+            trace.fetch_add(1, Ordering::Relaxed);
+            Ok(vec![multiply(&args[0], &args[0])?])
+        };
+        let mut first = super::Compiled {
+            f_marker: PhantomData::<fn(&[Array]) -> Result<Vec<Array>, Exception>>,
+            state: super::CompiledState {
+                f: function,
+                shapeless: true,
+                lease: super::new_compile_lease(),
+            },
+        };
+        let mut sibling = first.clone();
+        let x = array!([2.0f32, 3.0]);
+
+        assert_eq!(
+            CallMut::<&[Array], Vec<Array>, Exception>::call_mut(
+                &mut first,
+                std::slice::from_ref(&x),
+            )
+            .unwrap()[0],
+            array!([4.0f32, 9.0])
+        );
+        drop(first);
+        assert_eq!(
+            CallMut::<&[Array], Vec<Array>, Exception>::call_mut(
+                &mut sibling,
+                std::slice::from_ref(&x),
+            )
+            .unwrap()[0],
+            array!([4.0f32, 9.0])
+        );
+        assert_eq!(
+            traces.load(Ordering::Relaxed),
+            1,
+            "dropping one clone must not erase the shared backend graph"
+        );
     }
 
     #[test]
