@@ -29,6 +29,177 @@ where
     }
 }
 
+/// Returns a compiled function whose inner MLX compiled-state handle remains alive until the
+/// returned callable is dropped.
+///
+/// This is the retained counterpart to [`compile`]. The convenience [`compile`] closure constructs
+/// an inner [`Compiled`] handle for each invocation so it can erase the argument lifetime from its
+/// public `FnMut` type. That is ergonomic for one-shot use, but dropping the inner handle also erases
+/// MLX's compiled structure. `compile_retained` instead returns one of the object-safe retained call
+/// interfaces ([`RetainedSlice`], [`RetainedUnary`], [`RetainedBinary`], or [`RetainedTernary`]),
+/// whose `call_mut` method is lifetime-generic and keeps the inner handle alive across calls.
+///
+/// Both infallible and [`Exception`]-returning functions are supported for every input arity
+/// advertised by [`compile`].
+///
+/// # Example
+///
+/// ```rust
+/// use mlx_rs::{array, ops::add, transforms::compile::compile_retained, Array};
+///
+/// let function = |(x, y): (&Array, &Array)| add(x, y);
+/// let mut compiled = compile_retained(function, true);
+/// let x = array!(1.0f32);
+/// let y = array!(2.0f32);
+///
+/// let first = compiled.call_mut((&x, &y)).unwrap();
+/// let second = compiled.call_mut((&x, &y)).unwrap();
+/// assert_eq!(first.item::<f32>(), second.item::<f32>());
+/// ```
+pub fn compile_retained<F, A, O, E>(f: F, shapeless: impl Into<Option<bool>>) -> F::Callable
+where
+    F: CompileRetained<A, O, E>,
+{
+    f.compile_retained(shapeless.into().unwrap_or(false))
+}
+
+/// Type-directed construction of a retained compiled callable.
+///
+/// Use the [`compile_retained`] free function rather than naming this trait directly. `A`, `O`, and
+/// `E` mirror [`Compile`]'s input, output, and error markers and allow Rust to select the supported
+/// arity and fallibility without overloads.
+pub trait CompileRetained<A, O, E>: Sized {
+    /// The object-safe callable returned for this input arity.
+    type Callable;
+
+    /// Construct the retained callable.
+    fn compile_retained(self, shapeless: bool) -> Self::Callable;
+}
+
+/// A retained compiled function accepting a borrowed slice of arrays and returning multiple arrays.
+pub trait RetainedSlice {
+    /// Apply the retained compiled function.
+    fn call_mut(&mut self, args: &[Array]) -> Result<Vec<Array>, Exception>;
+}
+
+/// A retained compiled function accepting one array.
+pub trait RetainedUnary {
+    /// Apply the retained compiled function.
+    fn call_mut(&mut self, arg: &Array) -> Result<Array, Exception>;
+}
+
+/// A retained compiled function accepting two arrays.
+pub trait RetainedBinary {
+    /// Apply the retained compiled function.
+    fn call_mut(&mut self, args: (&Array, &Array)) -> Result<Array, Exception>;
+}
+
+/// A retained compiled function accepting three arrays.
+pub trait RetainedTernary {
+    /// Apply the retained compiled function.
+    fn call_mut(&mut self, args: (&Array, &Array, &Array)) -> Result<Array, Exception>;
+}
+
+struct RetainedSliceImpl<F, G, E> {
+    compiled: Compiled<F, G>,
+    error: PhantomData<E>,
+}
+
+struct RetainedUnaryImpl<F, G, E> {
+    compiled: Compiled<F, G>,
+    error: PhantomData<E>,
+}
+
+struct RetainedBinaryImpl<F, G, E> {
+    compiled: Compiled<F, G>,
+    error: PhantomData<E>,
+}
+
+struct RetainedTernaryImpl<F, G, E> {
+    compiled: Compiled<F, G>,
+    error: PhantomData<E>,
+}
+
+impl<F, G> RetainedSlice for RetainedSliceImpl<F, G, ()>
+where
+    F: FnMut(&[Array]) -> Vec<Array>,
+    G: FnMut(&[Array]) -> Vec<Array>,
+{
+    fn call_mut(&mut self, args: &[Array]) -> Result<Vec<Array>, Exception> {
+        CallMut::<&[Array], Vec<Array>, ()>::call_mut(&mut self.compiled, args)
+    }
+}
+
+impl<F, G> RetainedSlice for RetainedSliceImpl<F, G, Exception>
+where
+    F: FnMut(&[Array]) -> Result<Vec<Array>, Exception>,
+    G: FnMut(&[Array]) -> Result<Vec<Array>, Exception>,
+{
+    fn call_mut(&mut self, args: &[Array]) -> Result<Vec<Array>, Exception> {
+        CallMut::<&[Array], Vec<Array>, Exception>::call_mut(&mut self.compiled, args)
+    }
+}
+
+impl<F, G> RetainedUnary for RetainedUnaryImpl<F, G, ()>
+where
+    F: FnMut(&Array) -> Array,
+    G: FnMut(&[Array]) -> Vec<Array>,
+{
+    fn call_mut(&mut self, arg: &Array) -> Result<Array, Exception> {
+        CallMut::<&Array, Array, ()>::call_mut(&mut self.compiled, arg)
+    }
+}
+
+impl<F, G> RetainedUnary for RetainedUnaryImpl<F, G, Exception>
+where
+    F: FnMut(&Array) -> Result<Array, Exception>,
+    G: FnMut(&[Array]) -> Result<Vec<Array>, Exception>,
+{
+    fn call_mut(&mut self, arg: &Array) -> Result<Array, Exception> {
+        CallMut::<&Array, Array, Exception>::call_mut(&mut self.compiled, arg)
+    }
+}
+
+impl<F, G> RetainedBinary for RetainedBinaryImpl<F, G, ()>
+where
+    F: FnMut((&Array, &Array)) -> Array,
+    G: FnMut(&[Array]) -> Vec<Array>,
+{
+    fn call_mut(&mut self, args: (&Array, &Array)) -> Result<Array, Exception> {
+        CallMut::<(&Array, &Array), Array, ()>::call_mut(&mut self.compiled, args)
+    }
+}
+
+impl<F, G> RetainedBinary for RetainedBinaryImpl<F, G, Exception>
+where
+    F: FnMut((&Array, &Array)) -> Result<Array, Exception>,
+    G: FnMut(&[Array]) -> Result<Vec<Array>, Exception>,
+{
+    fn call_mut(&mut self, args: (&Array, &Array)) -> Result<Array, Exception> {
+        CallMut::<(&Array, &Array), Array, Exception>::call_mut(&mut self.compiled, args)
+    }
+}
+
+impl<F, G> RetainedTernary for RetainedTernaryImpl<F, G, ()>
+where
+    F: FnMut((&Array, &Array, &Array)) -> Array,
+    G: FnMut(&[Array]) -> Vec<Array>,
+{
+    fn call_mut(&mut self, args: (&Array, &Array, &Array)) -> Result<Array, Exception> {
+        CallMut::<(&Array, &Array, &Array), Array, ()>::call_mut(&mut self.compiled, args)
+    }
+}
+
+impl<F, G> RetainedTernary for RetainedTernaryImpl<F, G, Exception>
+where
+    F: FnMut((&Array, &Array, &Array)) -> Result<Array, Exception>,
+    G: FnMut(&[Array]) -> Result<Vec<Array>, Exception>,
+{
+    fn call_mut(&mut self, args: (&Array, &Array, &Array)) -> Result<Array, Exception> {
+        CallMut::<(&Array, &Array, &Array), Array, Exception>::call_mut(&mut self.compiled, args)
+    }
+}
+
 /// A trait for functions that can be compiled.
 ///
 /// # Generic parameters
@@ -221,6 +392,202 @@ where
     }
 }
 
+impl<F> CompileRetained<&[Array], Vec<Array>, ()> for F
+where
+    F: FnMut(&[Array]) -> Vec<Array> + 'static,
+{
+    type Callable = Box<dyn RetainedSlice>;
+
+    fn compile_retained(self, shapeless: bool) -> Self::Callable {
+        let id = type_id_to_usize(&self);
+        let compiled = Compiled {
+            f_marker: PhantomData::<F>,
+            state: CompiledState {
+                f: self,
+                shapeless,
+                id,
+            },
+        };
+        Box::new(RetainedSliceImpl {
+            compiled,
+            error: PhantomData::<()>,
+        })
+    }
+}
+
+impl<F> CompileRetained<&Array, Array, ()> for F
+where
+    F: FnMut(&Array) -> Array + 'static,
+{
+    type Callable = Box<dyn RetainedUnary>;
+
+    fn compile_retained(mut self, shapeless: bool) -> Self::Callable {
+        let id = type_id_to_usize(&self);
+        let function = move |args: &[Array]| -> Vec<Array> { vec![(self)(&args[0])] };
+        let compiled = Compiled {
+            f_marker: PhantomData::<F>,
+            state: CompiledState {
+                f: function,
+                shapeless,
+                id,
+            },
+        };
+        Box::new(RetainedUnaryImpl {
+            compiled,
+            error: PhantomData::<()>,
+        })
+    }
+}
+
+impl<F> CompileRetained<(&Array, &Array), Array, ()> for F
+where
+    F: FnMut((&Array, &Array)) -> Array + 'static,
+{
+    type Callable = Box<dyn RetainedBinary>;
+
+    fn compile_retained(mut self, shapeless: bool) -> Self::Callable {
+        let id = type_id_to_usize(&self);
+        let function = move |args: &[Array]| -> Vec<Array> { vec![(self)((&args[0], &args[1]))] };
+        let compiled = Compiled {
+            f_marker: PhantomData::<F>,
+            state: CompiledState {
+                f: function,
+                shapeless,
+                id,
+            },
+        };
+        Box::new(RetainedBinaryImpl {
+            compiled,
+            error: PhantomData::<()>,
+        })
+    }
+}
+
+impl<F> CompileRetained<(&Array, &Array, &Array), Array, ()> for F
+where
+    F: FnMut((&Array, &Array, &Array)) -> Array + 'static,
+{
+    type Callable = Box<dyn RetainedTernary>;
+
+    fn compile_retained(mut self, shapeless: bool) -> Self::Callable {
+        let id = type_id_to_usize(&self);
+        let function =
+            move |args: &[Array]| -> Vec<Array> { vec![(self)((&args[0], &args[1], &args[2]))] };
+        let compiled = Compiled {
+            f_marker: PhantomData::<F>,
+            state: CompiledState {
+                f: function,
+                shapeless,
+                id,
+            },
+        };
+        Box::new(RetainedTernaryImpl {
+            compiled,
+            error: PhantomData::<()>,
+        })
+    }
+}
+
+impl<F> CompileRetained<&[Array], Vec<Array>, Exception> for F
+where
+    F: FnMut(&[Array]) -> Result<Vec<Array>, Exception> + 'static,
+{
+    type Callable = Box<dyn RetainedSlice>;
+
+    fn compile_retained(self, shapeless: bool) -> Self::Callable {
+        let id = type_id_to_usize(&self);
+        let compiled = Compiled {
+            f_marker: PhantomData::<F>,
+            state: CompiledState {
+                f: self,
+                shapeless,
+                id,
+            },
+        };
+        Box::new(RetainedSliceImpl {
+            compiled,
+            error: PhantomData::<Exception>,
+        })
+    }
+}
+
+impl<F> CompileRetained<&Array, Array, Exception> for F
+where
+    F: FnMut(&Array) -> Result<Array, Exception> + 'static,
+{
+    type Callable = Box<dyn RetainedUnary>;
+
+    fn compile_retained(mut self, shapeless: bool) -> Self::Callable {
+        let id = type_id_to_usize(&self);
+        let function =
+            move |args: &[Array]| -> Result<Vec<Array>, Exception> { Ok(vec![(self)(&args[0])?]) };
+        let compiled = Compiled {
+            f_marker: PhantomData::<F>,
+            state: CompiledState {
+                f: function,
+                shapeless,
+                id,
+            },
+        };
+        Box::new(RetainedUnaryImpl {
+            compiled,
+            error: PhantomData::<Exception>,
+        })
+    }
+}
+
+impl<F> CompileRetained<(&Array, &Array), Array, Exception> for F
+where
+    F: FnMut((&Array, &Array)) -> Result<Array, Exception> + 'static,
+{
+    type Callable = Box<dyn RetainedBinary>;
+
+    fn compile_retained(mut self, shapeless: bool) -> Self::Callable {
+        let id = type_id_to_usize(&self);
+        let function = move |args: &[Array]| -> Result<Vec<Array>, Exception> {
+            Ok(vec![(self)((&args[0], &args[1]))?])
+        };
+        let compiled = Compiled {
+            f_marker: PhantomData::<F>,
+            state: CompiledState {
+                f: function,
+                shapeless,
+                id,
+            },
+        };
+        Box::new(RetainedBinaryImpl {
+            compiled,
+            error: PhantomData::<Exception>,
+        })
+    }
+}
+
+impl<F> CompileRetained<(&Array, &Array, &Array), Array, Exception> for F
+where
+    F: FnMut((&Array, &Array, &Array)) -> Result<Array, Exception> + 'static,
+{
+    type Callable = Box<dyn RetainedTernary>;
+
+    fn compile_retained(mut self, shapeless: bool) -> Self::Callable {
+        let id = type_id_to_usize(&self);
+        let function = move |args: &[Array]| -> Result<Vec<Array>, Exception> {
+            Ok(vec![(self)((&args[0], &args[1], &args[2]))?])
+        };
+        let compiled = Compiled {
+            f_marker: PhantomData::<F>,
+            state: CompiledState {
+                f: function,
+                shapeless,
+                id,
+            },
+        };
+        Box::new(RetainedTernaryImpl {
+            compiled,
+            error: PhantomData::<Exception>,
+        })
+    }
+}
+
 /// A trait for a compiled function that can be called.
 pub trait CallMut<A, O, E> {
     /// Calls the compiled function with the given arguments.
@@ -380,6 +747,10 @@ impl<F> CompiledState<F> {
 #[cfg(test)]
 mod tests {
     use core::panic;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
 
     use crate::{
         array,
@@ -388,7 +759,7 @@ mod tests {
         Array,
     };
 
-    use super::compile;
+    use super::{compile, compile_retained};
 
     fn example_fn_0(x: f32) -> f32 {
         x + 1.0
@@ -561,5 +932,91 @@ mod tests {
 
         let r3 = compiled((&i1, &i2, &i3)).unwrap();
         assert_eq!(&r1, &r3);
+    }
+
+    #[test]
+    fn test_compile_retained_supports_every_advertised_arity_and_fallibility() {
+        let x = array!([1.0f32, 2.0]);
+        let y = array!([3.0f32, 4.0]);
+        let z = array!([5.0f32, 6.0]);
+
+        let mut infallible_slice =
+            compile_retained(|args: &[Array]| vec![&args[0] * &args[1]], true);
+        let mut fallible_slice = compile_retained(
+            |args: &[Array]| multiply(&args[0], &args[1]).map(|out| vec![out]),
+            true,
+        );
+        let slice_args = [x.clone(), y.clone()];
+        assert_eq!(
+            infallible_slice.call_mut(&slice_args).unwrap()[0],
+            fallible_slice.call_mut(&slice_args).unwrap()[0]
+        );
+
+        let mut infallible_unary = compile_retained(|arg: &Array| arg * arg, true);
+        let mut fallible_unary = compile_retained(|arg: &Array| multiply(arg, arg), true);
+        assert_eq!(
+            infallible_unary.call_mut(&x).unwrap(),
+            fallible_unary.call_mut(&x).unwrap()
+        );
+
+        let mut infallible_binary =
+            compile_retained(|(lhs, rhs): (&Array, &Array)| lhs * rhs, true);
+        let mut fallible_binary =
+            compile_retained(|(lhs, rhs): (&Array, &Array)| multiply(lhs, rhs), true);
+        assert_eq!(
+            infallible_binary.call_mut((&x, &y)).unwrap(),
+            fallible_binary.call_mut((&x, &y)).unwrap()
+        );
+
+        let mut infallible_ternary =
+            compile_retained(|(a, b, c): (&Array, &Array, &Array)| a * b * c, true);
+        let mut fallible_ternary = compile_retained(
+            |(a, b, c): (&Array, &Array, &Array)| multiply(&multiply(a, b)?, c),
+            true,
+        );
+        assert_eq!(
+            infallible_ternary.call_mut((&x, &y, &z)).unwrap(),
+            fallible_ternary.call_mut((&x, &y, &z)).unwrap()
+        );
+    }
+
+    fn traced_square(traces: Arc<AtomicUsize>) -> impl FnMut(&Array) -> Result<Array, Exception> {
+        move |x| {
+            traces.fetch_add(1, Ordering::Relaxed);
+            multiply(x, x)
+        }
+    }
+
+    #[test]
+    fn test_compile_retained_traces_once_across_distinct_argument_lifetimes() {
+        let traces = Arc::new(AtomicUsize::new(0));
+        let mut compiled = compile_retained(traced_square(Arc::clone(&traces)), true);
+
+        {
+            let x = array!([2.0f32, 3.0]);
+            assert_eq!(compiled.call_mut(&x).unwrap(), array!([4.0f32, 9.0]));
+        }
+        {
+            // A different lexical lifetime and shape exercise the object-safe, lifetime-generic
+            // call surface and the shape-polymorphic retained handle.
+            let x = array!([2.0f32, 3.0, 4.0]);
+            assert_eq!(compiled.call_mut(&x).unwrap(), array!([4.0f32, 9.0, 16.0]));
+        }
+
+        assert_eq!(
+            traces.load(Ordering::Relaxed),
+            1,
+            "the retained handle must reuse the traced function"
+        );
+
+        drop(compiled);
+        let mut replacement = compile_retained(traced_square(Arc::clone(&traces)), true);
+        let x = array!([5.0f32]);
+        assert_eq!(replacement.call_mut(&x).unwrap(), array!([25.0f32]));
+        assert_eq!(
+            traces.load(Ordering::Relaxed),
+            2,
+            "dropping the retained handle must erase its backend compiled state"
+        );
     }
 }
