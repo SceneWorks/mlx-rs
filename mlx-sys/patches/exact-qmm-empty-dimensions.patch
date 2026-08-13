@@ -1,0 +1,87 @@
+From d6962eda8184f346c0e5199142e8cef5296cd7aa Mon Sep 17 00:00:00 2001
+From: Michael Trefry <michael@trefry.net>
+Date: Thu, 13 Aug 2026 01:52:36 -0400
+Subject: [PATCH] fix(exact): reject empty qmm dimensions safely
+
+Signed-off-by: Michael Trefry <michael@trefry.net>
+---
+ mlx/ops.cpp         | 14 ++++++++++++--
+ tests/ops_tests.cpp | 24 ++++++++++++++++++++++++
+ 2 files changed, 36 insertions(+), 2 deletions(-)
+
+diff --git a/mlx/ops.cpp b/mlx/ops.cpp
+index f8c7d84..55808eb 100644
+--- a/mlx/ops.cpp
++++ b/mlx/ops.cpp
+@@ -4860,6 +4860,11 @@ array quantized_matmul_bias(
+         << ".";
+     throw std::invalid_argument(msg.str());
+   }
++  if (w_inner_dims <= 0) {
++    throw std::invalid_argument(
++        "[quantized_matmul_bias] Empty inner dimensions must use the eager "
++        "fallback.");
++  }
+ 
+   // Mirror ensure_row_contiguous_matrix + QuantizedMatmul::eval_gpu when
+   // deriving M/B. A view whose last two dimensions are already contiguous
+@@ -4878,14 +4883,19 @@ array quantized_matmul_bias(
+       matrix_contiguous ? x_cast.flags().row_contiguous : true;
+   int M = eval_row_contiguous ? x_cast.size() / w_inner_dims
+                               : x_cast.shape(-2);
+-  int B = x_cast.size() / M / w_inner_dims;
+ 
+   // The eager baseline selects qmm only above the device-dependent vector
+   // threshold (never greater than 32). For B == 1 it first selects split-K,
+   // which delegates to qmm exactly at 512 or more 32x32 output tiles; batched
+   // inputs route directly to qmm and therefore do not need the tile condition.
++  if (M < 32) {
++    throw std::invalid_argument(
++        "[quantized_matmul_bias] Shape does not select the direct qmm path; "
++        "use the eager fallback.");
++  }
++  int B = x_cast.size() / M / w_inner_dims;
+   int tile_count = ((M + 31) / 32) * ((w_outer_dims + 31) / 32);
+-  if (M < 32 || (B == 1 && tile_count < 512)) {
++  if (B == 1 && tile_count < 512) {
+     throw std::invalid_argument(
+         "[quantized_matmul_bias] Shape does not select the direct qmm path; "
+         "use the eager fallback.");
+diff --git a/tests/ops_tests.cpp b/tests/ops_tests.cpp
+index 7ab85a6..bd0ec44 100644
+--- a/tests/ops_tests.cpp
++++ b/tests/ops_tests.cpp
+@@ -3411,6 +3411,30 @@ TEST_CASE("test exact quantized matmul output-bias epilogue") {
+           4),
+       std::invalid_argument);
+ 
++  CHECK_THROWS_AS(
++      quantized_matmul_bias(
++          zeros({0, K}),
++          quantized[0],
++          quantized[1],
++          quantized[2],
++          output_bias_f32,
++          true,
++          64,
++          4),
++      std::invalid_argument);
++
++  CHECK_THROWS_AS(
++      quantized_matmul_bias(
++          zeros({32, 0}),
++          zeros({N, 0}, uint32),
++          zeros({N, 0}),
++          zeros({N, 0}),
++          output_bias_f32,
++          true,
++          64,
++          4),
++      std::invalid_argument);
++
+   // Aggregate rows across a broadcast batch must not admit a per-matrix M=5
+   // input: the eager baseline selects qmv for every supported Metal device.
+   auto qmv_input = broadcast_to(zeros({1, 5, K}), {128, 5, K});
+-- 
+2.50.1 (Apple Git-155)
+

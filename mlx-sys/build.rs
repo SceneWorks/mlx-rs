@@ -720,6 +720,7 @@ fn prepare_mlx_c_source() -> PathBuf {
             true,
             None,
         ),
+        ("patches/exact-qmm-empty-dimensions.patch", true, None),
     ];
     // sc-12780 idempotency guard: CMake FetchContent may re-run PATCH_COMMAND against an
     // mlx-src that is ALREADY patched (e.g. an incremental rebuild that does not re-fetch).
