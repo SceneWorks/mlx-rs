@@ -443,6 +443,81 @@ fn prepare_mlx_c_source() -> PathBuf {
     );
     println!("cargo:rerun-if-changed=patches/compile-cache-initialize.patch");
 
+    // sc-18318: expose the pmetal-only exact Q4/Q8 qmm+dense-bias operation
+    // added by exact-qmm-bias.patch. Bindgen continues to read the pristine
+    // pinned submodule; mlx-sys declares the extension manually.
+    let qmm_bias_c_patch = std::fs::canonicalize("patches/exact-qmm-bias-c.patch")
+        .expect("find exact-qmm-bias-c.patch");
+    let status = Command::new("patch")
+        .arg("-p1")
+        .arg("-d")
+        .arg(&staged)
+        .arg("-i")
+        .arg(&qmm_bias_c_patch)
+        .status()
+        .expect("Failed to run `patch` for exact-qmm-bias-c.patch");
+    assert!(
+        status.success(),
+        "exact-qmm-bias-c.patch failed to apply to staged mlx-c (sc-18318)"
+    );
+    println!("cargo:rerun-if-changed=patches/exact-qmm-bias-c.patch");
+
+    // sc-18318: expose the exact biased Conv2d/Conv3d implicit-GEMM bridge
+    // added by exact-conv-bias.patch.
+    let conv_bias_c_patch = std::fs::canonicalize("patches/exact-conv-bias-c.patch")
+        .expect("find exact-conv-bias-c.patch");
+    let status = Command::new("patch")
+        .arg("-p1")
+        .arg("-d")
+        .arg(&staged)
+        .arg("-i")
+        .arg(&conv_bias_c_patch)
+        .status()
+        .expect("Failed to run `patch` for exact-conv-bias-c.patch");
+    assert!(
+        status.success(),
+        "exact-conv-bias-c.patch failed to apply to staged mlx-c (sc-18318)"
+    );
+    println!("cargo:rerun-if-changed=patches/exact-conv-bias-c.patch");
+
+    // sc-18318: expose the group-aware exact normalization+affine bridge
+    // added by exact-group-norm-affine.patch.
+    let group_norm_affine_c_patch =
+        std::fs::canonicalize("patches/exact-group-norm-affine-c.patch")
+            .expect("find exact-group-norm-affine-c.patch");
+    let status = Command::new("patch")
+        .arg("-p1")
+        .arg("-d")
+        .arg(&staged)
+        .arg("-i")
+        .arg(&group_norm_affine_c_patch)
+        .status()
+        .expect("Failed to run `patch` for exact-group-norm-affine-c.patch");
+    assert!(
+        status.success(),
+        "exact-group-norm-affine-c.patch failed to apply to staged mlx-c (sc-18318)"
+    );
+    println!("cargo:rerun-if-changed=patches/exact-group-norm-affine-c.patch");
+
+    // sc-18318: expose the exact eager SiLU and tanh-GELU bridges added by
+    // exact-eager-activations.patch.
+    let exact_activations_c_patch =
+        std::fs::canonicalize("patches/exact-eager-activations-c.patch")
+            .expect("find exact-eager-activations-c.patch");
+    let status = Command::new("patch")
+        .arg("-p1")
+        .arg("-d")
+        .arg(&staged)
+        .arg("-i")
+        .arg(&exact_activations_c_patch)
+        .status()
+        .expect("Failed to run `patch` for exact-eager-activations-c.patch");
+    assert!(
+        status.success(),
+        "exact-eager-activations-c.patch failed to apply to staged mlx-c (sc-18318)"
+    );
+    println!("cargo:rerun-if-changed=patches/exact-eager-activations-c.patch");
+
     // Copy our patch files into the staged source. FetchContent allows only one
     // PATCH_COMMAND, so build.rs generates apply_patches.sh (below) which applies
     // each MLX source patch individually and idempotently.
@@ -576,8 +651,12 @@ fn prepare_mlx_c_source() -> PathBuf {
     // still assert 16-bit correctness — now they guard the deployment-target fix.
     let patches_dir = staged.join("patches");
     std::fs::create_dir_all(&patches_dir).expect("Failed to create patches dir");
-    // (basename, required). `required = true` means the build MUST fail if the patch
-    // does not apply; `false` means best-effort (a fully-failing patch is a safe no-op).
+    // (basename, required, applied_probe). `required = true` means the build MUST fail if the
+    // patch does not apply; `false` means best-effort (a fully-failing patch is a safe no-op).
+    // `applied_probe` is reserved for sequential extension patches that overlap files: after a
+    // later patch lands, an earlier patch may no longer reverse-apply even though its complete,
+    // unique surface is present. The probe checks multiple unique artifacts and only skips when
+    // that complete surface is already installed.
     //
     // sc-12746: the MLX source patches are applied INDIVIDUALLY, not concatenated into
     // one `combined.patch`. `git apply` is atomic PER INVOCATION, so a single combined patch
@@ -595,21 +674,115 @@ fn prepare_mlx_c_source() -> PathBuf {
     // instead of producing a binary missing pmetal's metallib resolver or the recoverable-error
     // test hook. See the per-patch notes above and the idempotency guard below.
     let patch_files = [
-        ("patches/metallib-search-path.patch", true),
-        ("patches/command-buffer-recoverable.patch", true),
-        ("patches/pad-copy-int64.patch", true),
-        ("patches/thread-shared-streams.patch", true),
-        ("patches/thread-safe-eval.patch", true),
-        ("patches/apple-metal-sdk.patch", true),
-        ("patches/apple-cpu-no-jit.patch", true),
+        ("patches/metallib-search-path.patch", true, None),
+        ("patches/command-buffer-recoverable.patch", true, None),
+        ("patches/pad-copy-int64.patch", true, None),
+        ("patches/thread-shared-streams.patch", true, None),
+        ("patches/thread-safe-eval.patch", true, None),
+        ("patches/apple-metal-sdk.patch", true, None),
+        ("patches/apple-cpu-no-jit.patch", true, None),
+        (
+            "patches/exact-qmm-bias.patch",
+            true,
+            Some(
+                "grep -Fq 'quantized_matmul_bias(' mlx/ops.h && grep -Fq 'affine_qmm_bias_t' mlx/backend/metal/kernels/quantized.metal && grep -Fq 'affine_qmm_bias_t_nax' mlx/backend/metal/kernels/quantized_nax.metal",
+            ),
+        ),
+        (
+            "patches/exact-conv-bias.patch",
+            true,
+            Some(
+                "grep -Fq 'conv_general_bias(' mlx/ops.h && grep -Fq 'HAS_OUTPUT_BIAS' mlx/backend/metal/kernels/steel/conv/kernels/steel_conv.h && grep -Fq 'HAS_OUTPUT_BIAS' mlx/backend/metal/kernels/steel/conv/kernels/steel_conv_3d.h",
+            ),
+        ),
+        ("patches/exact-conv-bias-nojit.patch", true, None),
+        (
+            "patches/exact-group-norm-affine.patch",
+            true,
+            Some(
+                "test -f mlx/backend/metal/kernels/group_norm.metal && grep -Fq 'group_norm_affine(' mlx/fast.h && grep -Fq 'GroupNormAffine::eval_gpu' mlx/backend/metal/normalization.cpp",
+            ),
+        ),
+        (
+            "patches/exact-eager-activations.patch",
+            true,
+            Some(
+                "test -f mlx/backend/metal/kernels/exact_activations.metal && grep -Fq 'silu_exact(' mlx/fast.h && grep -Fq 'ExactActivation::eval_gpu' mlx/backend/metal/normalization.cpp",
+            ),
+        ),
+        ("patches/exact-backend-stubs.patch", true, None),
+        (
+            "patches/exact-epilogue-dispatcher-tests.patch",
+            true,
+            Some(
+                "grep -Fq 'constexpr int ODD_M = 257;' tests/ops_tests.cpp && grep -Fq 'bool noncontiguous = false' tests/ops_tests.cpp",
+            ),
+        ),
+        (
+            "patches/exact-dispatch-and-affine-lifetime.patch",
+            true,
+            Some(
+                "grep -Fq 'ensure_row_contiguous_matrix + QuantizedMatmul::eval_gpu' mlx/ops.cpp && grep -Fq 'if (weight_copied)' mlx/backend/metal/normalization.cpp && grep -Fq 'if (bias_copied)' mlx/backend/metal/normalization.cpp && grep -Fq 'constexpr int BATCH_M = 33;' tests/ops_tests.cpp",
+            ),
+        ),
+        (
+            "patches/exact-qmm-empty-dimensions.patch",
+            true,
+            Some(
+                "grep -Fq 'w_inner_dims <= 0 || w_outer_dims <= 0' mlx/ops.cpp && grep -Fq 'M_size < 32' mlx/ops.cpp && grep -Fq 'const size_t B_size' mlx/ops.cpp && grep -Fq 'zeros({0, K})' tests/ops_tests.cpp && grep -Fq 'zeros({32, 0})' tests/ops_tests.cpp",
+            ),
+        ),
+        (
+            "patches/exact-supported-dispatch.patch",
+            true,
+            Some(
+                "grep -Fq 'Input and weight must promote to float32' mlx/ops.cpp && grep -Fq 'Only float32, float16, and bfloat16 are' mlx/ops.cpp && grep -Fq 'zeros({1, 8, 8, 16}, float64)' tests/ops_tests.cpp",
+            ),
+        ),
+        (
+            "patches/exact-strict-metal-output.patch",
+            true,
+            Some(
+                "test \"$(grep -Fc 's.device != Device::gpu || !metal::is_available()' mlx/fast.cpp)\" -eq 2 && grep -Fq 'Empty weight or output dimensions' mlx/ops.cpp && grep -Fq 'test exact fast primitives reject without Metal' tests/ops_tests.cpp && grep -Fq 'zeros({2, 33, K})' tests/ops_tests.cpp",
+            ),
+        ),
+        (
+            "patches/exact-strict-abi-domains.patch",
+            true,
+            Some(
+                "grep -Fq 'enum class DispatchRejection' mlx/ops.cpp && grep -Fq 'test exact primitives reject oversized Metal ABI domains' tests/ops_tests.cpp && grep -Fq 'test exact qmm selector handles provisional view flags' tests/ops_tests.cpp && grep -Fq 'Row count must fit the Metal' mlx/fast.cpp",
+            ),
+        ),
+        (
+            "patches/exact-strict-indexing-domains.patch",
+            true,
+            Some(
+                "grep -Fq 'Stored input and output logical sizes must' mlx/ops.cpp && grep -Fq 'Packed weight row offsets must fit' mlx/ops.cpp && grep -Fq 'OVERSIZED_OUTPUT_BATCH' tests/ops_tests.cpp && grep -Fq 'PACKED_OFFSET_K' tests/ops_tests.cpp",
+            ),
+        ),
+        (
+            "patches/exact-conv-selector-overflow.patch",
+            true,
+            Some(
+                "grep -Fq 'static_cast<int64_t>(C) + static_cast<int64_t>(O)' mlx/ops.cpp && grep -Fq 'OVERFLOW_CHANNELS' tests/ops_tests.cpp",
+            ),
+        ),
+        (
+            "patches/exact-dispatch-parameter-domains.patch",
+            true,
+            Some(
+                "grep -Fq 'complete_conv_parameters' mlx/ops.cpp && grep -Fq 'host_parameters_fit' mlx/ops.cpp && grep -Fq '512 / tile_count' mlx/ops.cpp && grep -Fq 'test exact qmm mirrors split-k direct delegation' tests/ops_tests.cpp && grep -Fq '65535, 65535' tests/ops_tests.cpp",
+            ),
+        ),
     ];
     // sc-12780 idempotency guard: CMake FetchContent may re-run PATCH_COMMAND against an
     // mlx-src that is ALREADY patched (e.g. an incremental rebuild that does not re-fetch).
     // `git apply` is not idempotent — re-applying an applied patch fails "patch does not apply".
-    // So each patch is guarded: if it reverse-applies cleanly it is already present and we SKIP
-    // (no-op); otherwise we apply it forward. A `required` patch that genuinely cannot apply
-    // (neither already-present nor forward-applicable) aborts the build. This keeps re-runs a
-    // no-op while still hard-failing on a real apply failure — the whole point of required=true.
+    // So each patch is guarded: independent patches use a reverse-apply check; sequential exact
+    // epilogue patches that overlap files use complete-surface probes because a later patch can
+    // invalidate an earlier reverse check. An already-present patch is skipped; otherwise it is
+    // applied forward. A `required` patch that genuinely cannot apply aborts the build. This keeps
+    // re-runs a no-op while still hard-failing on a real apply failure — the point of required=true.
     let mut script = String::from(
         "#!/bin/sh\n\
          # Generated by mlx-sys/build.rs. Apply each MLX source patch individually,\n\
@@ -617,7 +790,7 @@ fn prepare_mlx_c_source() -> PathBuf {
          # live next to this script.\n\
          d=\"$(dirname \"$0\")\"\n",
     );
-    for (pf, required) in patch_files {
+    for (pf, required, applied_probe) in patch_files {
         let name = std::path::Path::new(pf)
             .file_name()
             .unwrap()
@@ -627,8 +800,13 @@ fn prepare_mlx_c_source() -> PathBuf {
         std::fs::copy(pf, patches_dir.join(&name))
             .unwrap_or_else(|e| panic!("Failed to copy {pf}: {e}"));
         if required {
+            let probe = applied_probe
+                .map(|probe| format!("{probe}; then\n  "))
+                .unwrap_or_else(|| {
+                    format!("git apply --reverse --check \"$d/{name}\" 2>/dev/null; then\n  ")
+                });
             script.push_str(&format!(
-                "if git apply --reverse --check \"$d/{name}\" 2>/dev/null; then\n  \
+                "if {probe}\
                  echo \"pmetal: {name} already applied; skipping\" >&2\n\
                  elif git apply \"$d/{name}\"; then\n  :\n\
                  else\n  \
@@ -664,7 +842,7 @@ fn prepare_mlx_c_source() -> PathBuf {
     std::fs::write(&cmake_path, patched).expect("Failed to write patched CMakeLists.txt");
 
     // Tell cargo to rerun if any patch changes
-    for (pf, _required) in patch_files {
+    for (pf, _required, _applied_probe) in patch_files {
         println!("cargo:rerun-if-changed={pf}");
     }
 
@@ -968,6 +1146,12 @@ fn main() {
         .header("src/mlx-c/mlx/c/error.h")
         .header("src/mlx-c/mlx/c/transforms_impl.h")
         .clang_arg("-Isrc/mlx-c")
+        // System headers pulled in by mlx-c declare malloc/realloc with the SDK's
+        // c_ulong spelling of size_t. They are not part of the mlx-c API, and on
+        // tier-3 Apple targets a nightly build-std rustc rejects those generated
+        // declarations under suspicious_runtime_symbol_definitions even though
+        // the ABI width matches. Do not bind unrelated libc allocation symbols.
+        .blocklist_function("^(malloc|realloc)$")
         .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
         .generate()
         .expect("Unable to generate bindings");

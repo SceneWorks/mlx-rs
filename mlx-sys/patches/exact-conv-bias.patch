@@ -1,0 +1,1061 @@
+From a06937f6b4c90acdd7bc9a86d6093494865b0d2d Mon Sep 17 00:00:00 2001
+From: Michael Trefry <michael@trefry.net>
+Date: Wed, 12 Aug 2026 23:08:50 -0400
+Subject: [PATCH] feat(convolution): add exact bias epilogues
+
+Signed-off-by: Michael Trefry <michael@trefry.net>
+
+diff --git a/mlx/backend/cpu/conv.cpp b/mlx/backend/cpu/conv.cpp
+index 5d4638a..186e73a 100644
+--- a/mlx/backend/cpu/conv.cpp
++++ b/mlx/backend/cpu/conv.cpp
+@@ -1291,6 +1291,10 @@ void conv_3D_cpu(
+ } // namespace
+ 
+ void Convolution::eval_cpu(const std::vector<array>& inputs, array& out) {
++  if (output_bias_) {
++    throw std::runtime_error(
++        "[conv_general_bias] The exact fused epilogue is Metal-only.");
++  }
+   out.set_data(allocator::malloc(out.nbytes()));
+ 
+   auto& in = inputs[0];
+diff --git a/mlx/backend/metal/conv.cpp b/mlx/backend/metal/conv.cpp
+index 49f87d9..3b68564 100644
+--- a/mlx/backend/metal/conv.cpp
++++ b/mlx/backend/metal/conv.cpp
+@@ -194,7 +194,8 @@ void implicit_gemm_conv_2D_gpu(
+     const array& in,
+     const array& wt,
+     array& out,
+-    const MLXConvParams<2>& conv_params) {
++    const MLXConvParams<2>& conv_params,
++    const std::optional<array>& output_bias) {
+   const int groups = conv_params.groups;
+   const int C_per_group = conv_params.C / conv_params.groups;
+   const int O_per_group = conv_params.O / conv_params.groups;
+@@ -286,7 +287,9 @@ void implicit_gemm_conv_2D_gpu(
+       "_channel_",
+       n_channel_specialization ? std::to_string(n_channel_specialization) : "l",
+       "_filter_",
+-      small_filter ? 's' : 'l');
++      small_filter ? 's' : 'l',
++      "_bias_",
++      output_bias.has_value());
+ 
+   // Encode and dispatch kernel
+   auto& compute_encoder = metal::get_command_encoder(s);
+@@ -300,7 +303,8 @@ void implicit_gemm_conv_2D_gpu(
+       wm,
+       wn,
+       n_channel_specialization,
+-      small_filter);
++      small_filter,
++      output_bias.has_value());
+   compute_encoder.set_compute_pipeline_state(kernel);
+ 
+   // Deduce grid launch dimensions
+@@ -319,6 +323,7 @@ void implicit_gemm_conv_2D_gpu(
+   // Encode params
+   compute_encoder.set_bytes(conv_params, 3);
+   compute_encoder.set_bytes(gemm_params, 4);
++  compute_encoder.set_input_array(output_bias ? *output_bias : out, 5);
+ 
+   // Launch kernel
+   compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
+@@ -330,7 +335,8 @@ void implicit_gemm_conv_2D_general_gpu(
+     const array& in,
+     const array& wt,
+     array& out,
+-    const MLXConvParams<2>& conv_params) {
++    const MLXConvParams<2>& conv_params,
++    const std::optional<array>& output_bias) {
+   // Deduce implicit gemm size
+   int implicit_M = safe_cast(
+       static_cast<int64_t>(conv_params.N) * conv_params.oS[0] *
+@@ -466,7 +472,9 @@ void implicit_gemm_conv_2D_general_gpu(
+       "_wm",
+       wm,
+       "_wn",
+-      wn);
++      wn,
++      "_bias_",
++      output_bias.has_value());
+   std::string hash_name;
+   hash_name.reserve(64);
+   concatenate(hash_name, kname, "_alC_", align_C);
+@@ -477,7 +485,17 @@ void implicit_gemm_conv_2D_general_gpu(
+   // Encode and dispatch kernel
+   auto& compute_encoder = metal::get_command_encoder(s);
+   auto kernel = get_steel_conv_general_kernel(
+-      d, kname, hash_name, func_consts, out, bm, bn, bk, wm, wn);
++      d,
++      kname,
++      hash_name,
++      func_consts,
++      out,
++      bm,
++      bn,
++      bk,
++      wm,
++      wn,
++      output_bias.has_value());
+   compute_encoder.set_compute_pipeline_state(kernel);
+ 
+   // Deduce grid launch dimensions
+@@ -501,6 +519,7 @@ void implicit_gemm_conv_2D_general_gpu(
+ 
+   compute_encoder.set_vector_bytes(base_h, 6);
+   compute_encoder.set_vector_bytes(base_w, 7);
++  compute_encoder.set_input_array(output_bias ? *output_bias : out, 8);
+ 
+   // Launch kernel
+   compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
+@@ -512,7 +531,8 @@ void implicit_gemm_conv_3D_gpu(
+     const array& in,
+     const array& wt,
+     array& out,
+-    const MLXConvParams<3>& conv_params) {
++    const MLXConvParams<3>& conv_params,
++    const std::optional<array>& output_bias) {
+   const int groups = conv_params.groups;
+   const int C_per_group = conv_params.C / conv_params.groups;
+   const int O_per_group = conv_params.O / conv_params.groups;
+@@ -600,12 +620,23 @@ void implicit_gemm_conv_3D_gpu(
+       "_wn",
+       wn,
+       "_filter_",
+-      small_filter ? 's' : 'l');
++      small_filter ? 's' : 'l',
++      "_bias_",
++      output_bias.has_value());
+ 
+   // Encode and dispatch kernel
+   auto& compute_encoder = metal::get_command_encoder(s);
+-  auto kernel =
+-      get_steel_conv_3d_kernel(d, kname, out, bm, bn, bk, wm, wn, small_filter);
++  auto kernel = get_steel_conv_3d_kernel(
++      d,
++      kname,
++      out,
++      bm,
++      bn,
++      bk,
++      wm,
++      wn,
++      small_filter,
++      output_bias.has_value());
+   compute_encoder.set_compute_pipeline_state(kernel);
+ 
+   // Deduce grid launch dimensions
+@@ -624,6 +655,7 @@ void implicit_gemm_conv_3D_gpu(
+   // Encode params
+   compute_encoder.set_bytes(conv_params, 3);
+   compute_encoder.set_bytes(gemm_params, 4);
++  compute_encoder.set_input_array(output_bias ? *output_bias : out, 5);
+ 
+   // Launch kernel
+   compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
+@@ -669,7 +701,8 @@ void pad_and_slice_conv_3D_gpu(
+   array wt = pad_array(wt_pre, extra_o, extra_c);
+   auto new_params =
+       MLXConvParams<3>::with_padded_channels(conv_params, extra_o, extra_c);
+-  implicit_gemm_conv_3D_gpu(s, d, in, wt, intermediate, new_params);
++  implicit_gemm_conv_3D_gpu(
++      s, d, in, wt, intermediate, new_params, std::nullopt);
+ 
+   // Slice out
+   out.copy_shared_buffer(
+@@ -683,7 +716,8 @@ void dispatch_conv_3D_gpu(
+     const array& wt_pre,
+     array& out,
+     const MLXConvParams<3>& conv_params,
+-    std::vector<array>& copies) {
++    std::vector<array>& copies,
++    const std::optional<array>& output_bias) {
+   bool is_idil_one = conv_params.idil[0] == 1 && conv_params.idil[1] == 1 &&
+       conv_params.idil[2] == 1;
+   const int C_per_group = conv_params.C / conv_params.groups;
+@@ -698,6 +732,10 @@ void dispatch_conv_3D_gpu(
+   // We check it first because it doesn't need contiguous inputs and it needs
+   // different output allocation.
+   if (is_idil_one && !mod16_channels && conv_params.groups == 1) {
++    if (output_bias) {
++      throw std::runtime_error(
++          "[conv_general_bias] Padded 3D dispatch must use eager fallback.");
++    }
+     return pad_and_slice_conv_3D_gpu(s, d, in_pre, wt_pre, out, conv_params);
+   }
+ 
+@@ -708,7 +746,13 @@ void dispatch_conv_3D_gpu(
+ 
+   // Perform the implicit gemm
+   if (is_idil_one && mod16_channels) {
+-    return implicit_gemm_conv_3D_gpu(s, d, in, wt, out, conv_params);
++    return implicit_gemm_conv_3D_gpu(
++        s, d, in, wt, out, conv_params, output_bias);
++  }
++
++  if (output_bias) {
++    throw std::runtime_error(
++        "[conv_general_bias] Explicit 3D dispatch must use eager fallback.");
+   }
+ 
+   // Explicit gemms where we unfold and do a matmul
+@@ -984,12 +1028,17 @@ void dispatch_conv_2D_gpu(
+     const array& wt,
+     array& out,
+     const MLXConvParams<2>& conv_params,
+-    std::vector<array>& copies) {
++    std::vector<array>& copies,
++    const std::optional<array>& output_bias) {
+   bool is_stride_one = conv_params.str[0] == 1 && conv_params.str[1] == 1;
+   bool is_kdil_one = conv_params.kdil[0] == 1 && conv_params.kdil[1] == 1;
+   bool is_idil_one = conv_params.idil[0] == 1 && conv_params.idil[1] == 1;
+ 
+   if (conv_params.groups > 1) {
++    if (output_bias) {
++      throw std::runtime_error(
++          "[conv_general_bias] Grouped 2D dispatch must use eager fallback.");
++    }
+     const int C_per_group = conv_params.C / conv_params.groups;
+     const int O_per_group = conv_params.O / conv_params.groups;
+ 
+@@ -1007,7 +1056,8 @@ void dispatch_conv_2D_gpu(
+ 
+     if ((C_per_group <= 4 || C_per_group % 16 == 0) &&
+         (O_per_group <= 16 || O_per_group % 16 == 0)) {
+-      return implicit_gemm_conv_2D_gpu(s, d, in, wt, out, conv_params);
++      return implicit_gemm_conv_2D_gpu(
++          s, d, in, wt, out, conv_params, std::nullopt);
+     } else {
+       return explicit_gemm_conv_group_ND_gpu(s, d, in, wt, out, conv_params);
+     }
+@@ -1023,21 +1073,31 @@ void dispatch_conv_2D_gpu(
+       conv_params.wS[0] == 3 && conv_params.wS[1] == 3 &&
+       conv_params.C % 32 == 0 && conv_params.O % 32 == 0 && inp_large &&
+       channels_large) {
++    if (output_bias) {
++      throw std::runtime_error(
++          "[conv_general_bias] Winograd dispatch must use eager fallback.");
++    }
+     return winograd_conv_2D_gpu(s, d, in, wt, out, conv_params, copies);
+   }
+ 
+   // Direct to implicit gemm conv
+   if (is_idil_one && (conv_params.C <= 4 || conv_params.C % 16 == 0) &&
+       (conv_params.O <= 16 || conv_params.O % 16 == 0)) {
+-    return implicit_gemm_conv_2D_gpu(s, d, in, wt, out, conv_params);
++    return implicit_gemm_conv_2D_gpu(
++        s, d, in, wt, out, conv_params, output_bias);
+   }
+ 
+   else if ((conv_params.C % 16 == 0 && conv_params.O % 16 == 0) || out_large) {
+-    return implicit_gemm_conv_2D_general_gpu(s, d, in, wt, out, conv_params);
++    return implicit_gemm_conv_2D_general_gpu(
++        s, d, in, wt, out, conv_params, output_bias);
+   }
+ 
+   // Direct to explicit gemm conv
+   else {
++    if (output_bias) {
++      throw std::runtime_error(
++          "[conv_general_bias] Explicit 2D dispatch must use eager fallback.");
++    }
+     return explicit_gemm_conv_ND_gpu(s, d, in, wt, out, conv_params);
+   }
+ }
+@@ -1142,7 +1202,8 @@ void conv_1D_gpu(
+         /* const int groups = */ groups,
+         /* const bool flip = */ flip};
+ 
+-    dispatch_conv_2D_gpu(s, d, in, wt, out, conv_params, copies);
++    dispatch_conv_2D_gpu(
++        s, d, in, wt, out, conv_params, copies, std::nullopt);
+     return;
+   }
+ 
+@@ -1187,7 +1248,8 @@ void conv_2D_gpu(
+     const std::vector<int>& in_dilation,
+     const int groups,
+     bool flip,
+-    std::vector<array>& copies) {
++    std::vector<array>& copies,
++    const std::optional<array>& output_bias) {
+   // Allocate space and ensure weights are contiguous
+   out.set_data(allocator::malloc(out.nbytes()));
+   auto in = ensure_row_contiguous(in_pre, d, s);
+@@ -1217,7 +1279,8 @@ void conv_2D_gpu(
+       /* const int groups = */ groups,
+       /* const bool flip = */ flip,
+   };
+-  dispatch_conv_2D_gpu(s, d, in, wt, out, conv_params, copies);
++  dispatch_conv_2D_gpu(
++      s, d, in, wt, out, conv_params, copies, output_bias);
+ }
+ 
+ void conv_3D_gpu(
+@@ -1232,7 +1295,8 @@ void conv_3D_gpu(
+     const std::vector<int>& in_dilation,
+     int groups,
+     bool flip,
+-    std::vector<array>& copies) {
++    std::vector<array>& copies,
++    const std::optional<array>& output_bias) {
+   // We will use the contiguous strides for the conv params because that is
+   // what the rest of the code expects.
+   constexpr int NDIM = 3;
+@@ -1288,7 +1352,8 @@ void conv_3D_gpu(
+       /* const int groups = */ groups,
+       /* const bool flip = */ flip,
+   };
+-  return dispatch_conv_3D_gpu(s, d, in, wt, out, conv_params, copies);
++  return dispatch_conv_3D_gpu(
++      s, d, in, wt, out, conv_params, copies, output_bias);
+ }
+ 
+ } // namespace
+@@ -1304,6 +1369,10 @@ void Convolution::eval_gpu(const std::vector<array>& inputs, array& out) {
+   // Some shortcuts for brevity
+   const array& in = inputs[0];
+   const array& wt = inputs[1];
++  std::optional<array> output_bias = std::nullopt;
++  if (output_bias_) {
++    output_bias = ensure_row_contiguous(inputs[2], d, s);
++  }
+ 
+   // 3D conv
+   if (out.ndim() == 5) {
+@@ -1319,7 +1388,8 @@ void Convolution::eval_gpu(const std::vector<array>& inputs, array& out) {
+         input_dilation_,
+         groups_,
+         flip_,
+-        copies);
++        copies,
++        output_bias);
+   }
+   // 2D conv
+   else if (out.ndim() == 4) {
+@@ -1335,7 +1405,8 @@ void Convolution::eval_gpu(const std::vector<array>& inputs, array& out) {
+         input_dilation_,
+         groups_,
+         flip_,
+-        copies);
++        copies,
++        output_bias);
+   }
+   // 1D conv
+   else if (out.ndim() == 3) {
+diff --git a/mlx/backend/metal/jit_kernels.cpp b/mlx/backend/metal/jit_kernels.cpp
+index 9ed9ce4..efcd9be 100644
+--- a/mlx/backend/metal/jit_kernels.cpp
++++ b/mlx/backend/metal/jit_kernels.cpp
+@@ -813,7 +813,8 @@ MTL::ComputePipelineState* get_steel_conv_kernel(
+     int wm,
+     int wn,
+     int n_channel_specialization,
+-    bool small_filter) {
++    bool small_filter,
++    bool output_bias) {
+   const auto& lib_name = kernel_name;
+   auto lib = d.get_library(lib_name, [&]() {
+     std::ostringstream kernel_source;
+@@ -828,7 +829,8 @@ MTL::ComputePipelineState* get_steel_conv_kernel(
+                          wm,
+                          wn,
+                          n_channel_specialization,
+-                         small_filter);
++                         small_filter,
++                         output_bias);
+     return kernel_source.str();
+   });
+   return d.get_kernel(kernel_name, lib);
+@@ -843,7 +845,8 @@ MTL::ComputePipelineState* get_steel_conv_3d_kernel(
+     int bk,
+     int wm,
+     int wn,
+-    bool small_filter) {
++    bool small_filter,
++    bool output_bias) {
+   const auto& lib_name = kernel_name;
+   auto lib = d.get_library(lib_name, [&]() {
+     std::ostringstream kernel_source;
+@@ -857,7 +860,8 @@ MTL::ComputePipelineState* get_steel_conv_3d_kernel(
+                          bk,
+                          wm,
+                          wn,
+-                         small_filter);
++                         small_filter,
++                         output_bias);
+     return kernel_source.str();
+   });
+   return d.get_kernel(kernel_name, lib);
+@@ -873,7 +877,8 @@ MTL::ComputePipelineState* get_steel_conv_general_kernel(
+     int bn,
+     int bk,
+     int wm,
+-    int wn) {
++    int wn,
++    bool output_bias) {
+   const auto& lib_name = kernel_name;
+   auto lib = d.get_library(lib_name, [&]() {
+     std::ostringstream kernel_source;
+@@ -887,7 +892,8 @@ MTL::ComputePipelineState* get_steel_conv_general_kernel(
+                          bn,
+                          bk,
+                          wm,
+-                         wn);
++                         wn,
++                         output_bias);
+     return kernel_source.str();
+   });
+   return d.get_kernel(kernel_name, lib, hash_name, func_consts);
+diff --git a/mlx/backend/metal/kernels.h b/mlx/backend/metal/kernels.h
+index cb289fc..8daada4 100644
+--- a/mlx/backend/metal/kernels.h
++++ b/mlx/backend/metal/kernels.h
+@@ -199,7 +199,8 @@ MTL::ComputePipelineState* get_steel_conv_kernel(
+     int wm,
+     int wn,
+     int n_channel_specialization,
+-    bool small_filter);
++    bool small_filter,
++    bool output_bias);
+ 
+ MTL::ComputePipelineState* get_steel_conv_3d_kernel(
+     metal::Device& d,
+@@ -210,7 +211,8 @@ MTL::ComputePipelineState* get_steel_conv_3d_kernel(
+     int bk,
+     int wm,
+     int wn,
+-    bool small_filter);
++    bool small_filter,
++    bool output_bias);
+ 
+ MTL::ComputePipelineState* get_gemv_kernel(
+     metal::Device& d,
+@@ -263,7 +265,8 @@ MTL::ComputePipelineState* get_steel_conv_general_kernel(
+     int bn,
+     int bk,
+     int wm,
+-    int wn);
++    int wn,
++    bool output_bias);
+ 
+ MTL::ComputePipelineState* get_fft_kernel(
+     metal::Device& d,
+diff --git a/mlx/backend/metal/kernels/steel/conv/kernels/steel_conv.h b/mlx/backend/metal/kernels/steel/conv/kernels/steel_conv.h
+index f559596..b07533d 100644
+--- a/mlx/backend/metal/kernels/steel/conv/kernels/steel_conv.h
++++ b/mlx/backend/metal/kernels/steel/conv/kernels/steel_conv.h
+@@ -12,7 +12,8 @@ template <
+     int WM,
+     int WN,
+     int N_CHANNELS = 0,
+-    bool SMALL_FILTER = false>
++    bool SMALL_FILTER = false,
++    bool HAS_OUTPUT_BIAS = false>
+ [[kernel, max_total_threads_per_threadgroup(WM * WN * 32)]] void
+ implicit_gemm_conv_2d(
+     const device T* A [[buffer(0)]],
+@@ -20,6 +21,7 @@ implicit_gemm_conv_2d(
+     device T* C [[buffer(2)]],
+     const constant MLXConvParams<2>* params [[buffer(3)]],
+     const constant ImplicitGemmConv2DParams* gemm_params [[buffer(4)]],
++    const device T* output_bias [[buffer(5)]],
+     uint3 tid [[threadgroup_position_in_grid]],
+     uint3 lid [[thread_position_in_threadgroup]],
+     uint simd_gid [[simdgroup_index_in_threadgroup]],
+@@ -172,5 +174,14 @@ implicit_gemm_conv_2d(
+   short tgp_bm = min(BM, gemm_params->M - c_row);
+   short tgp_bn = min(BN, gemm_params->N - c_col);
+   const int ldc = N * params->groups;
++  if constexpr (HAS_OUTPUT_BIAS) {
++    const TransformAdd<T, float> epilogue(1.0f, 1.0f);
++    mma_op.apply_epilogue_safe(
++        output_bias + tid.z * N + c_col,
++        0,
++        1,
++        short2(tgp_bn, tgp_bm),
++        epilogue);
++  }
+   mma_op.store_result_safe(C, ldc, short2(tgp_bn, tgp_bm));
+ }
+diff --git a/mlx/backend/metal/kernels/steel/conv/kernels/steel_conv.metal b/mlx/backend/metal/kernels/steel/conv/kernels/steel_conv.metal
+index 7851e5e..19b9405 100644
+--- a/mlx/backend/metal/kernels/steel/conv/kernels/steel_conv.metal
++++ b/mlx/backend/metal/kernels/steel/conv/kernels/steel_conv.metal
+@@ -20,28 +20,35 @@
+     channel_name,                                                              \
+     n_channels,                                                                \
+     filter_name,                                                               \
+-    small_filter)                                                              \
++    small_filter,                                                              \
++    has_bias)                                                                  \
+   template [[host_name("implicit_gemm_conv_2d_" #name "_bm" #bm "_bn" #bn      \
+                        "_bk" #bk "_wm" #wm "_wn" #wn "_channel_" #channel_name \
+-                       "_filter_" #filter_name)]] [[kernel]] void              \
+-  implicit_gemm_conv_2d<itype, bm, bn, bk, wm, wn, n_channels, small_filter>(  \
++                       "_filter_" #filter_name "_bias_" #has_bias)]] [[kernel]] void \
++  implicit_gemm_conv_2d<                                                       \
++      itype, bm, bn, bk, wm, wn, n_channels, small_filter, has_bias>(          \
+       const device itype* A [[buffer(0)]],                                     \
+       const device itype* B [[buffer(1)]],                                     \
+       device itype* C [[buffer(2)]],                                           \
+       const constant MLXConvParams<2>* params [[buffer(3)]],                   \
+       const constant ImplicitGemmConv2DParams* gemm_params [[buffer(4)]],      \
++      const device itype* output_bias [[buffer(5)]],                           \
+       uint3 tid [[threadgroup_position_in_grid]],                              \
+       uint3 lid [[thread_position_in_threadgroup]],                            \
+       uint simd_gid [[simdgroup_index_in_threadgroup]],                        \
+       uint simd_lid [[thread_index_in_simdgroup]]);
+ 
++#define instantiate_implicit_conv_2d_bias(name, itype, bm, bn, bk, wm, wn, channel_name, n_channels, filter_name, small_filter) \
++    instantiate_implicit_conv_2d(name, itype, bm, bn, bk, wm, wn, channel_name, n_channels, filter_name, small_filter, 0) \
++    instantiate_implicit_conv_2d(name, itype, bm, bn, bk, wm, wn, channel_name, n_channels, filter_name, small_filter, 1)
++
+ #define instantiate_implicit_2d_filter(name, itype, bm, bn, bk, wm, wn)           \
+-    instantiate_implicit_conv_2d(name, itype, bm, bn, bk, wm, wn, l, 0, s, true)  \
+-    instantiate_implicit_conv_2d(name, itype, bm, bn, bk, wm, wn, l, 0, l, false) \
+-    instantiate_implicit_conv_2d(name, itype, bm, bn, bk, wm, wn, 1, 1, l, false) \
+-    instantiate_implicit_conv_2d(name, itype, bm, bn, bk, wm, wn, 2, 2, l, false) \
+-    instantiate_implicit_conv_2d(name, itype, bm, bn, bk, wm, wn, 3, 3, l, false) \
+-    instantiate_implicit_conv_2d(name, itype, bm, bn, bk, wm, wn, 4, 4, l, false)
++    instantiate_implicit_conv_2d_bias(name, itype, bm, bn, bk, wm, wn, l, 0, s, true)  \
++    instantiate_implicit_conv_2d_bias(name, itype, bm, bn, bk, wm, wn, l, 0, l, false) \
++    instantiate_implicit_conv_2d_bias(name, itype, bm, bn, bk, wm, wn, 1, 1, l, false) \
++    instantiate_implicit_conv_2d_bias(name, itype, bm, bn, bk, wm, wn, 2, 2, l, false) \
++    instantiate_implicit_conv_2d_bias(name, itype, bm, bn, bk, wm, wn, 3, 3, l, false) \
++    instantiate_implicit_conv_2d_bias(name, itype, bm, bn, bk, wm, wn, 4, 4, l, false)
+ 
+ #define instantiate_implicit_2d_blocks(name, itype)               \
+     instantiate_implicit_2d_filter(name, itype, 32,  8, 16, 4, 1) \
+diff --git a/mlx/backend/metal/kernels/steel/conv/kernels/steel_conv_3d.h b/mlx/backend/metal/kernels/steel/conv/kernels/steel_conv_3d.h
+index f2ccc1c..def67fb 100644
+--- a/mlx/backend/metal/kernels/steel/conv/kernels/steel_conv_3d.h
++++ b/mlx/backend/metal/kernels/steel/conv/kernels/steel_conv_3d.h
+@@ -11,7 +11,8 @@ template <
+     int BK,
+     int WM,
+     int WN,
+-    bool SMALL_FILTER = false>
++    bool SMALL_FILTER = false,
++    bool HAS_OUTPUT_BIAS = false>
+ [[kernel, max_total_threads_per_threadgroup(WM * WN * 32)]] void
+ implicit_gemm_conv_3d(
+     const device T* A [[buffer(0)]],
+@@ -19,6 +20,7 @@ implicit_gemm_conv_3d(
+     device T* C [[buffer(2)]],
+     const constant MLXConvParams<3>* params [[buffer(3)]],
+     const constant ImplicitGemmConv3DParams* gemm_params [[buffer(4)]],
++    const device T* output_bias [[buffer(5)]],
+     uint3 tid [[threadgroup_position_in_grid]],
+     uint3 lid [[thread_position_in_threadgroup]],
+     uint simd_gid [[simdgroup_index_in_threadgroup]],
+@@ -131,5 +133,14 @@ implicit_gemm_conv_3d(
+   short tgp_bm = min(BM, gemm_params->M - c_row);
+   short tgp_bn = min(BN, gemm_params->N - c_col);
+   const int ldc = N * params->groups;
++  if constexpr (HAS_OUTPUT_BIAS) {
++    const TransformAdd<T, float> epilogue(1.0f, 1.0f);
++    mma_op.apply_epilogue_safe(
++        output_bias + tid.z * N + c_col,
++        0,
++        1,
++        short2(tgp_bn, tgp_bm),
++        epilogue);
++  }
+   mma_op.store_result_safe(C, ldc, short2(tgp_bn, tgp_bm));
+ }
+diff --git a/mlx/backend/metal/kernels/steel/conv/kernels/steel_conv_3d.metal b/mlx/backend/metal/kernels/steel/conv/kernels/steel_conv_3d.metal
+index c62c707..99daf76 100644
+--- a/mlx/backend/metal/kernels/steel/conv/kernels/steel_conv_3d.metal
++++ b/mlx/backend/metal/kernels/steel/conv/kernels/steel_conv_3d.metal
+@@ -18,10 +18,11 @@
+     wm,                                                   \
+     wn,                                                   \
+     fn,                                                   \
+-    f)                                                    \
++    f,                                                    \
++    has_bias)                                             \
+   instantiate_kernel(                                     \
+       "implicit_gemm_conv_3d_" #name "_bm" #bm "_bn" #bn  \
+-          "_bk" #bk "_wm" #wm "_wn" #wn "_filter_" #fn,   \
++          "_bk" #bk "_wm" #wm "_wn" #wn "_filter_" #fn "_bias_" #has_bias, \
+       implicit_gemm_conv_3d,                              \
+       itype,                                              \
+       bm,                                                 \
+@@ -29,11 +30,14 @@
+       bk,                                                 \
+       wm,                                                 \
+       wn,                                                 \
+-      f)
++      f,                                                  \
++      has_bias)
+ 
+ #define instantiate_implicit_conv_3d_filter(name, itype, bm, bn, bk, wm, wn)  \
+-    instantiate_implicit_conv_3d(name, itype, bm, bn, bk, wm, wn, s, true)    \
+-    instantiate_implicit_conv_3d(name, itype, bm, bn, bk, wm, wn, l, false)
++    instantiate_implicit_conv_3d(name, itype, bm, bn, bk, wm, wn, s, true, 0)    \
++    instantiate_implicit_conv_3d(name, itype, bm, bn, bk, wm, wn, s, true, 1)    \
++    instantiate_implicit_conv_3d(name, itype, bm, bn, bk, wm, wn, l, false, 0)   \
++    instantiate_implicit_conv_3d(name, itype, bm, bn, bk, wm, wn, l, false, 1)
+ 
+ #define instantiate_implicit_3d_blocks(name, itype)                       \
+     instantiate_implicit_conv_3d_filter(name, itype, 32,  8, 16, 4, 1)    \
+diff --git a/mlx/backend/metal/kernels/steel/conv/kernels/steel_conv_general.h b/mlx/backend/metal/kernels/steel/conv/kernels/steel_conv_general.h
+index 38250f9..e06b475 100644
+--- a/mlx/backend/metal/kernels/steel/conv/kernels/steel_conv_general.h
++++ b/mlx/backend/metal/kernels/steel/conv/kernels/steel_conv_general.h
+@@ -11,6 +11,7 @@ template <
+     int BK,
+     int WM,
+     int WN,
++    bool HAS_OUTPUT_BIAS = false,
+     typename AccumType = float,
+     typename Epilogue = TransformNone<T, AccumType>>
+ [[kernel, max_total_threads_per_threadgroup(WM * WN * 32)]] void
+@@ -23,6 +24,7 @@ implicit_gemm_conv_2d_general(
+     const constant Conv2DGeneralJumpParams* jump_params [[buffer(5)]],
+     const constant Conv2DGeneralBaseInfo* base_h [[buffer(6)]],
+     const constant Conv2DGeneralBaseInfo* base_w [[buffer(7)]],
++    const device T* output_bias [[buffer(8)]],
+     uint3 tid [[threadgroup_position_in_grid]],
+     uint3 lid [[thread_position_in_threadgroup]],
+     uint simd_gid [[simdgroup_index_in_threadgroup]],
+@@ -215,7 +217,14 @@ implicit_gemm_conv_2d_general(
+           STEEL_PRAGMA_UNROLL
+           for (short k = 0; k < kelems; k++) {
+             if ((j * mma_t::TN_stride + k) < diff) {
+-              C[offset + k] = Epilogue::apply(accum[k]);
++              const T rounded = Epilogue::apply(accum[k]);
++              if constexpr (HAS_OUTPUT_BIAS) {
++                C[offset + k] = static_cast<T>(
++                    rounded +
++                    output_bias[offset_n + j * mma_t::TN_stride + k]);
++              } else {
++                C[offset + k] = rounded;
++              }
+             }
+           }
+         }
+diff --git a/mlx/backend/metal/kernels/steel/conv/kernels/steel_conv_general.metal b/mlx/backend/metal/kernels/steel/conv/kernels/steel_conv_general.metal
+index 23e8575..5da694b 100644
+--- a/mlx/backend/metal/kernels/steel/conv/kernels/steel_conv_general.metal
++++ b/mlx/backend/metal/kernels/steel/conv/kernels/steel_conv_general.metal
+@@ -13,11 +13,11 @@
+ using namespace metal;
+ using namespace mlx::steel;
+ 
+-#define instantiate_implicit_conv_2d(name, itype, bm, bn, bk, wm, wn)         \
++#define instantiate_implicit_conv_2d(name, itype, bm, bn, bk, wm, wn, has_bias) \
+   template                                                                    \
+       [[host_name("implicit_gemm_conv_2d_general_" #name "_bm" #bm "_bn" #bn  \
+-                  "_bk" #bk "_wm" #wm "_wn" #wn)]] [[kernel]] void            \
+-      implicit_gemm_conv_2d_general<itype, bm, bn, bk, wm, wn>(               \
++                  "_bk" #bk "_wm" #wm "_wn" #wn "_bias_" #has_bias)]] [[kernel]] void \
++      implicit_gemm_conv_2d_general<itype, bm, bn, bk, wm, wn, has_bias>(     \
+           const device itype* A [[buffer(0)]],                                \
+           const device itype* B [[buffer(1)]],                                \
+           device itype* C [[buffer(2)]],                                      \
+@@ -26,13 +26,15 @@ using namespace mlx::steel;
+           const constant Conv2DGeneralJumpParams* jump_params [[buffer(5)]],  \
+           const constant Conv2DGeneralBaseInfo* base_h [[buffer(6)]],         \
+           const constant Conv2DGeneralBaseInfo* base_w [[buffer(7)]],         \
++          const device itype* output_bias [[buffer(8)]],                      \
+           uint3 tid [[threadgroup_position_in_grid]],                         \
+           uint3 lid [[thread_position_in_threadgroup]],                       \
+           uint simd_gid [[simdgroup_index_in_threadgroup]],                   \
+           uint simd_lid [[thread_index_in_simdgroup]]);
+ 
+ #define instantiate_implicit_2d_filter(name, itype, bm, bn, bk, wm, wn) \
+-  instantiate_implicit_conv_2d(name, itype, bm, bn, bk, wm, wn)
++  instantiate_implicit_conv_2d(name, itype, bm, bn, bk, wm, wn, 0) \
++  instantiate_implicit_conv_2d(name, itype, bm, bn, bk, wm, wn, 1)
+ 
+ #define instantiate_implicit_2d_blocks(name, itype)               \
+     instantiate_implicit_2d_filter(name, itype, 32,  8, 16, 4, 1) \
+diff --git a/mlx/backend/metal/nojit_kernels.cpp b/mlx/backend/metal/nojit_kernels.cpp
+index 64cfa39..5dd605b 100644
+--- a/mlx/backend/metal/nojit_kernels.cpp
++++ b/mlx/backend/metal/nojit_kernels.cpp
+@@ -206,6 +206,7 @@ MTL::ComputePipelineState* get_steel_gemm_gather_kernel(
+     int,
+     int,
+     int,
++    bool,
+     bool) {
+   return d.get_kernel(kernel_name, hash_name, func_consts);
+ }
+@@ -269,6 +270,7 @@ MTL::ComputePipelineState* get_gemv_masked_kernel(
+     int,
+     int,
+     int,
++    bool,
+     bool) {
+   return d.get_kernel(kernel_name);
+ }
+@@ -310,7 +312,8 @@ MTL::ComputePipelineState* get_steel_conv_general_kernel(
+     int,
+     int,
+     int,
+-    int) {
++    int,
++    bool) {
+   return d.get_kernel(kernel_name, hash_name, func_consts);
+ }
+ 
+diff --git a/mlx/ops.cpp b/mlx/ops.cpp
+index 52a4cb5..e870498 100644
+--- a/mlx/ops.cpp
++++ b/mlx/ops.cpp
+@@ -4403,10 +4403,10 @@ array conv_transpose3d(
+       s);
+ }
+ 
+-/** General convolution with a filter */
+-array conv_general(
++array conv_general_impl(
+     array in,
+     array wt,
++    std::optional<array> output_bias,
+     std::vector<int> stride /* = {} */,
+     std::vector<int> padding_lo /* = {} */,
+     std::vector<int> padding_hi /* = {} */,
+@@ -4501,6 +4501,73 @@ array conv_general(
+       kernel_dilation,
+       input_dilation);
+ 
++  if (output_bias) {
++    constexpr std::string_view tag = "conv_general_bias";
++    auto stream = to_stream(s);
++    if (stream.device != Device::gpu || !metal::is_available()) {
++      throw std::invalid_argument(
++          "[conv_general_bias] The exact fused epilogue is Metal-only.");
++    }
++    if ((spatial_dims != 2 && spatial_dims != 3) || groups != 1) {
++      throw std::invalid_argument(
++          "[conv_general_bias] Only ungrouped 2D and 3D convolutions are "
++          "supported.");
++    }
++    if (output_bias->ndim() != 1 || output_bias->shape(0) != out_shape.back()) {
++      std::ostringstream msg;
++      msg << "[" << tag << "] Output bias must have shape (" << out_shape.back()
++          << ") but got " << output_bias->shape() << ".";
++      throw std::invalid_argument(msg.str());
++    }
++    if (output_bias->dtype() != out_type) {
++      std::ostringstream msg;
++      msg << "[" << tag << "] Output bias dtype must equal the convolution "
++          << "output dtype " << out_type << " but got " << output_bias->dtype()
++          << ".";
++      throw std::invalid_argument(msg.str());
++    }
++
++    const int C = in.shape(-1);
++    const int O = wt.shape(0);
++    bool direct_implicit = false;
++    if (spatial_dims == 2) {
++      const bool stride_one = stride[0] == 1 && stride[1] == 1;
++      const bool kdil_one =
++          kernel_dilation[0] == 1 && kernel_dilation[1] == 1;
++      const bool idil_one =
++          input_dilation[0] == 1 && input_dilation[1] == 1;
++      const bool inp_large =
++          static_cast<int64_t>(in.shape(0)) * in.shape(1) * in.shape(2) >=
++          4096;
++      const bool channels_large = (C + O) >= 256;
++      const bool winograd = !flip && stride_one && kdil_one && idil_one &&
++          wt.shape(1) == 3 && wt.shape(2) == 3 && C % 32 == 0 &&
++          O % 32 == 0 && inp_large && channels_large;
++      const bool implicit_regular = idil_one && (C <= 4 || C % 16 == 0) &&
++          (O <= 16 || O % 16 == 0);
++      const bool out_large = static_cast<int64_t>(out_shape[0]) * out_shape[1] *
++          out_shape[2] >= 256;
++      const bool implicit_general =
++          (C % 16 == 0 && O % 16 == 0) || out_large;
++      direct_implicit = !winograd && (implicit_regular || implicit_general);
++    } else {
++      const bool idil_one = input_dilation[0] == 1 &&
++          input_dilation[1] == 1 && input_dilation[2] == 1;
++      direct_implicit =
++          idil_one && C % 16 == 0 && (O <= 16 || O % 16 == 0);
++    }
++    if (!direct_implicit) {
++      throw std::invalid_argument(
++          "[conv_general_bias] Shape does not select a direct implicit-GEMM "
++          "convolution; use the eager fallback.");
++    }
++  }
++
++  std::vector<array> inputs{in, wt};
++  if (output_bias) {
++    inputs.push_back(*output_bias);
++  }
++
+   return array(
+       std::move(out_shape),
+       in.dtype(),
+@@ -4512,8 +4579,61 @@ array conv_general(
+           kernel_dilation,
+           input_dilation,
+           groups,
+-          flip),
+-      {in, wt});
++          flip,
++          output_bias.has_value()),
++      std::move(inputs));
++}
++
++/** General convolution with a filter */
++array conv_general(
++    array in,
++    array wt,
++    std::vector<int> stride /* = {} */,
++    std::vector<int> padding_lo /* = {} */,
++    std::vector<int> padding_hi /* = {} */,
++    std::vector<int> kernel_dilation /* = {} */,
++    std::vector<int> input_dilation /* = {} */,
++    int groups /* = 1 */,
++    bool flip /* = false */,
++    StreamOrDevice s /* = {} */) {
++  return conv_general_impl(
++      std::move(in),
++      std::move(wt),
++      std::nullopt,
++      std::move(stride),
++      std::move(padding_lo),
++      std::move(padding_hi),
++      std::move(kernel_dilation),
++      std::move(input_dilation),
++      groups,
++      flip,
++      s);
++}
++
++array conv_general_bias(
++    array in,
++    array wt,
++    array output_bias,
++    std::vector<int> stride /* = {} */,
++    std::vector<int> padding_lo /* = {} */,
++    std::vector<int> padding_hi /* = {} */,
++    std::vector<int> kernel_dilation /* = {} */,
++    std::vector<int> input_dilation /* = {} */,
++    int groups /* = 1 */,
++    bool flip /* = false */,
++    StreamOrDevice s /* = {} */) {
++  return conv_general_impl(
++      std::move(in),
++      std::move(wt),
++      std::move(output_bias),
++      std::move(stride),
++      std::move(padding_lo),
++      std::move(padding_hi),
++      std::move(kernel_dilation),
++      std::move(input_dilation),
++      groups,
++      flip,
++      s);
+ }
+ 
+ std::pair<int, int> quantization_params_from_mode(
+diff --git a/mlx/ops.h b/mlx/ops.h
+index 418e1b0..f5ea89c 100644
+--- a/mlx/ops.h
++++ b/mlx/ops.h
+@@ -1457,6 +1457,25 @@ MLX_API array conv_general(
+     bool flip = false,
+     StreamOrDevice s = {});
+ 
++/** 2D/3D convolution with an exact dense output-bias epilogue.
++ *
++ * This operation intentionally admits only Metal implicit-GEMM dispatches
++ * whose algorithm matches `add(conv_general(...), output_bias)`. Callers must
++ * use that eager expression when validation rejects a shape.
++ */
++MLX_API array conv_general_bias(
++    array input,
++    array weight,
++    array output_bias,
++    std::vector<int> stride = {},
++    std::vector<int> padding_lo = {},
++    std::vector<int> padding_hi = {},
++    std::vector<int> kernel_dilation = {},
++    std::vector<int> input_dilation = {},
++    int groups = 1,
++    bool flip = false,
++    StreamOrDevice s = {});
++
+ /** General convolution with a filter */
+ inline array conv_general(
+     const array& input,
+diff --git a/mlx/primitives.cpp b/mlx/primitives.cpp
+index 491ee1c..9340c25 100644
+--- a/mlx/primitives.cpp
++++ b/mlx/primitives.cpp
+@@ -1425,7 +1425,7 @@ std::vector<array> Convolution::vjp(
+     const std::vector<array>& cotangents,
+     const std::vector<int>& argnums,
+     const std::vector<array>&) {
+-  assert(primals.size() == 2);
++  assert(primals.size() == (output_bias_ ? 3 : 2));
+   std::vector<array> grads;
+ 
+   // Collect info
+@@ -1451,6 +1451,12 @@ std::vector<array> Convolution::vjp(
+       };
+ 
+   for (int a : argnums) {
++    if (output_bias_ && a == 2) {
++      std::vector<int> axes(cotan.ndim() - 1);
++      std::iota(axes.begin(), axes.end(), 0);
++      grads.push_back(sum(cotan, axes, false, stream()));
++      continue;
++    }
+     // Grads for input
+     if (a == 0) {
+       std::vector<int> padding_lo = padding_lo_;
+@@ -1568,6 +1574,9 @@ std::vector<array> Convolution::vjp(
+ std::pair<std::vector<array>, std::vector<int>> Convolution::vmap(
+     const std::vector<array>& inputs,
+     const std::vector<int>& axes) {
++  if (output_bias_) {
++    throw std::runtime_error("[Convolution::vmap] Biased convolution NYI");
++  }
+   auto do_conv = [&](const array& in, const array& w, int groups) {
+     return conv_general(
+         in,
+@@ -1628,7 +1637,8 @@ bool Convolution::is_equivalent(const Primitive& other) const {
+       kernel_strides_ == c_other.kernel_strides_ &&
+       kernel_dilation_ == c_other.kernel_dilation_ &&
+       input_dilation_ == c_other.input_dilation_ &&
+-      groups_ == c_other.groups_ && flip_ == c_other.flip_;
++      groups_ == c_other.groups_ && flip_ == c_other.flip_ &&
++      output_bias_ == c_other.output_bias_;
+ }
+ 
+ std::vector<Shape> Convolution::output_shapes(
+diff --git a/mlx/primitives.h b/mlx/primitives.h
+index 0c65e58..c4da48c 100644
+--- a/mlx/primitives.h
++++ b/mlx/primitives.h
+@@ -734,7 +734,8 @@ class Convolution : public UnaryPrimitive {
+       const std::vector<int>& kernel_dilation,
+       const std::vector<int>& input_dilation,
+       const int groups = 1,
+-      const bool flip = false)
++      const bool flip = false,
++      const bool output_bias = false)
+       : UnaryPrimitive(stream),
+         padding_lo_(padding_lo),
+         padding_hi_(padding_hi),
+@@ -742,7 +743,8 @@ class Convolution : public UnaryPrimitive {
+         kernel_dilation_(kernel_dilation),
+         input_dilation_(input_dilation),
+         groups_(groups),
+-        flip_(flip) {}
++        flip_(flip),
++        output_bias_(output_bias) {}
+ 
+   void eval_cpu(const std::vector<array>& inputs, array& out) override;
+   void eval_gpu(const std::vector<array>& inputs, array& out) override;
+@@ -765,7 +767,8 @@ class Convolution : public UnaryPrimitive {
+         kernel_dilation_,
+         input_dilation_,
+         groups_,
+-        flip_);
++        flip_,
++        output_bias_);
+   }
+ 
+   static Shape conv_out_shape(
+@@ -785,6 +788,7 @@ class Convolution : public UnaryPrimitive {
+   std::vector<int> input_dilation_;
+   int groups_;
+   bool flip_;
++  bool output_bias_;
+ };
+ 
+ class Copy : public UnaryPrimitive {
+diff --git a/tests/ops_tests.cpp b/tests/ops_tests.cpp
+index 0b99e25..a67b086 100644
+--- a/tests/ops_tests.cpp
++++ b/tests/ops_tests.cpp
+@@ -3370,6 +3370,76 @@ TEST_CASE("test exact quantized matmul output-bias epilogue") {
+       std::invalid_argument);
+ }
+ 
++TEST_CASE("test exact convolution output-bias epilogues") {
++  if (!is_available(Device::gpu)) {
++    return;
++  }
++
++  for (auto dtype : {float32, float16, bfloat16}) {
++    auto check = [dtype](
++                     const Shape& input_shape,
++                     const Shape& weight_shape,
++                     const std::vector<int>& padding) {
++      auto numel = [](const Shape& shape) {
++        return std::accumulate(shape.begin(), shape.end(), 1, std::multiplies<>());
++      };
++      auto input = astype(
++          reshape(
++              sin(arange(0, numel(input_shape), float32) * 0.01f),
++              input_shape),
++          dtype);
++      auto weight = astype(
++          reshape(
++              cos(arange(0, numel(weight_shape), float32) * 0.02f),
++              weight_shape),
++          dtype);
++      auto bias = astype(
++          sin(arange(0, weight_shape[0], float32) * 0.1f), dtype);
++      std::vector<int> ones(input_shape.size() - 2, 1);
++      auto eager = add(
++          conv_general(
++              input,
++              weight,
++              ones,
++              padding,
++              padding,
++              ones,
++              ones),
++          bias);
++      auto fused = conv_general_bias(
++          input,
++          weight,
++          bias,
++          ones,
++          padding,
++          padding,
++          ones,
++          ones);
++      CHECK(array_equal(eager, fused).item<bool>());
++    };
++
++    // Regular and general 2D implicit-GEMM dispatches, then 3D implicit GEMM.
++    check({1, 8, 8, 16}, {16, 3, 3, 16}, {1, 1});
++    check({1, 16, 16, 5}, {7, 3, 3, 5}, {1, 1});
++    check({1, 4, 4, 4, 16}, {16, 3, 3, 3, 16}, {1, 1, 1});
++  }
++
++  auto winograd_input = zeros({1, 64, 64, 128});
++  auto winograd_weight = zeros({128, 3, 3, 128});
++  auto winograd_bias = zeros({128});
++  CHECK_THROWS_AS(
++      conv_general_bias(
++          winograd_input,
++          winograd_weight,
++          winograd_bias,
++          {1, 1},
++          {1, 1},
++          {1, 1},
++          {1, 1},
++          {1, 1}),
++      std::invalid_argument);
++}
++
+ TEST_CASE("test repeat") {
+   auto data = array({13, 3, 16, 6, 14, 4, 15, 5, 11, 1, 12, 2}, {3, 2, 2});
+   auto repeat_axis_0 = repeat(data, 2, 0);

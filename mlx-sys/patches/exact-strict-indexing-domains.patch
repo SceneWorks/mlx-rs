@@ -1,0 +1,253 @@
+From 93d1dc1c621887a9b8655d6800e3c778993de9b1 Mon Sep 17 00:00:00 2001
+From: Michael Trefry <michael@trefry.net>
+Date: Thu, 13 Aug 2026 03:14:55 -0400
+Subject: [PATCH] fix(exact): bound strict kernel indexing domains
+
+Signed-off-by: Michael Trefry <michael@trefry.net>
+---
+ mlx/fast.cpp        |   7 +--
+ mlx/ops.cpp         |  35 +++++++++++++
+ tests/ops_tests.cpp | 124 ++++++++++++++++++++++++++++++++++++++++++--
+ 3 files changed, 158 insertions(+), 8 deletions(-)
+
+diff --git a/mlx/fast.cpp b/mlx/fast.cpp
+index a932b83..8020b8e 100644
+--- a/mlx/fast.cpp
++++ b/mlx/fast.cpp
+@@ -410,10 +410,11 @@ array group_norm_affine(
+   const size_t n_rows =
+       static_cast<size_t>(x.shape(0)) * static_cast<size_t>(num_groups);
+   const size_t axis_size = x.size() / n_rows;
+-  if (n_rows > UINT32_MAX || axis_size > UINT32_MAX) {
++  if (n_rows > UINT32_MAX || axis_size > INT_MAX) {
+     throw std::invalid_argument(
+-        "[group_norm_affine] Row count and normalized axis size must fit "
+-        "the Metal uint32 ABI; use the eager fallback.");
++        "[group_norm_affine] Row count must fit the Metal uint32 ABI and "
++        "normalized axis size must fit the Metal int ABI; use the eager "
++        "fallback.");
+   }
+ 
+   auto s = to_stream(s_);
+diff --git a/mlx/ops.cpp b/mlx/ops.cpp
+index 1fd9657..d09480f 100644
+--- a/mlx/ops.cpp
++++ b/mlx/ops.cpp
+@@ -4598,6 +4598,21 @@ array conv_general_impl(
+           "[conv_general_bias] Implicit GEMM M, N, and K must fit the Metal "
+           "int launch ABI; use the eager fallback.");
+     }
++    size_t out_size = 1;
++    bool out_size_fits = true;
++    for (const auto dim : out_shape) {
++      if (dim <= 0 || out_size > INT_MAX / static_cast<size_t>(dim)) {
++        out_size_fits = false;
++        break;
++      }
++      out_size *= static_cast<size_t>(dim);
++    }
++    if (in.size() > INT_MAX || wt.size() > INT_MAX ||
++        output_bias->size() > INT_MAX || !out_size_fits) {
++      throw std::invalid_argument(
++          "[conv_general_bias] Input, weight, bias, and output logical sizes "
++          "must fit the Metal int indexing ABI; use the eager fallback.");
++    }
+     auto stream = to_stream(s);
+     if (stream.device != Device::gpu || !metal::is_available()) {
+       throw std::invalid_argument(
+@@ -4910,6 +4925,14 @@ array quantized_matmul_bias(
+         "[quantized_matmul_bias] N and K must fit the Metal int launch ABI; "
+         "use the eager fallback.");
+   }
++  const size_t packed_row_bytes =
++      static_cast<size_t>(w_inner_dims) * static_cast<size_t>(bits) / 8;
++  if (packed_row_bytes == 0 ||
++      static_cast<size_t>(w_outer_dims) > INT_MAX / packed_row_bytes) {
++    throw std::invalid_argument(
++        "[quantized_matmul_bias] Packed weight row offsets must fit the "
++        "Metal int ABI; use the eager fallback.");
++  }
+ 
+   // Mirror ensure_row_contiguous_matrix + QuantizedMatmul::eval_gpu when
+   // deriving M/B. A view whose last two dimensions are already contiguous
+@@ -4994,6 +5017,18 @@ array quantized_matmul_bias(
+       break;
+   }
+ 
++  constexpr size_t max_qmm_size = INT_MAX;
++  const size_t output_rows = x_cast.size() / static_cast<size_t>(w_inner_dims);
++  const bool output_size_fits =
++      output_rows <= max_qmm_size / static_cast<size_t>(w_outer_dims);
++  if (x_cast.size() > max_qmm_size || w.size() > max_qmm_size ||
++      scales.size() > max_qmm_size || biases.size() > max_qmm_size ||
++      output_bias.size() > max_qmm_size || !output_size_fits) {
++    throw std::invalid_argument(
++        "[quantized_matmul_bias] Stored input and output logical sizes must "
++        "fit the Metal int indexing ABI; use the eager fallback.");
++  }
++
+   auto stream = to_stream(s);
+   if (stream.device != Device::gpu || !metal::is_available()) {
+     throw std::invalid_argument(
+diff --git a/tests/ops_tests.cpp b/tests/ops_tests.cpp
+index 2c16685..30ed4c3 100644
+--- a/tests/ops_tests.cpp
++++ b/tests/ops_tests.cpp
+@@ -3331,12 +3331,13 @@ TEST_CASE("test exact fast primitives reject without Metal") {
+ 
+ TEST_CASE("test exact primitives reject oversized Metal ABI domains") {
+   auto huge_axis =
+-      broadcast_to(zeros({1, 1, 1, 1}), {1, 65536, 65536, 1});
++      broadcast_to(zeros({1, 1, 1, 1}), {1, 46341, 46341, 1});
+   CHECK_THROWS_WITH_AS(
+       fast::group_norm_affine(
+           huge_axis, ones({1}), zeros({1}), 1, 1e-5f, Device::gpu),
+-      "[group_norm_affine] Row count and normalized axis size must fit the "
+-      "Metal uint32 ABI; use the eager fallback.",
++      "[group_norm_affine] Row count must fit the Metal uint32 ABI and "
++      "normalized axis size must fit the Metal int ABI; use the eager "
++      "fallback.",
+       std::invalid_argument);
+ 
+   auto huge_rows =
+@@ -3350,8 +3351,9 @@ TEST_CASE("test exact primitives reject oversized Metal ABI domains") {
+           65536,
+           1e-5f,
+           Device::gpu),
+-      "[group_norm_affine] Row count and normalized axis size must fit the "
+-      "Metal uint32 ABI; use the eager fallback.",
++      "[group_norm_affine] Row count must fit the Metal uint32 ABI and "
++      "normalized axis size must fit the Metal int ABI; use the eager "
++      "fallback.",
+       std::invalid_argument);
+ 
+   auto huge_conv_m =
+@@ -3406,6 +3408,60 @@ TEST_CASE("test exact primitives reject oversized Metal ABI domains") {
+       "launch ABI; use the eager fallback.",
+       std::invalid_argument);
+ 
++  constexpr int LOGICAL_C = 65536;
++  auto oversized_conv_input = broadcast_to(
++      zeros({1, 1, 1, 1}), {32768, 1, 1, LOGICAL_C});
++  auto logical_conv_weight = broadcast_to(
++      zeros({1, 1, 1, 1}), {16, 1, 1, LOGICAL_C});
++  CHECK_THROWS_WITH_AS(
++      conv_general_bias(
++          oversized_conv_input,
++          logical_conv_weight,
++          zeros({16}),
++          {1, 1},
++          {0, 0},
++          {0, 0},
++          {1, 1},
++          {1, 1}),
++      "[conv_general_bias] Input, weight, bias, and output logical sizes must "
++      "fit the Metal int indexing ABI; use the eager fallback.",
++      std::invalid_argument);
++
++  auto oversized_conv_weight = broadcast_to(
++      zeros({1, 1, 1, 1}), {32768, 1, 1, LOGICAL_C});
++  auto logical_conv_bias = broadcast_to(zeros({1}), {32768});
++  CHECK_THROWS_WITH_AS(
++      conv_general_bias(
++          broadcast_to(zeros({1, 1, 1, 1}), {1, 1, 1, LOGICAL_C}),
++          oversized_conv_weight,
++          logical_conv_bias,
++          {1, 1},
++          {0, 0},
++          {0, 0},
++          {1, 1},
++          {1, 1}),
++      "[conv_general_bias] Input, weight, bias, and output logical sizes must "
++      "fit the Metal int indexing ABI; use the eager fallback.",
++      std::invalid_argument);
++
++  auto oversized_conv_output =
++      broadcast_to(zeros({1, 1, 1, 1}), {65536, 1, 1, 16});
++  auto output_conv_weight =
++      broadcast_to(zeros({1, 1, 1, 1}), {32768, 1, 1, 16});
++  CHECK_THROWS_WITH_AS(
++      conv_general_bias(
++          oversized_conv_output,
++          output_conv_weight,
++          logical_conv_bias,
++          {1, 1},
++          {0, 0},
++          {0, 0},
++          {1, 1},
++          {1, 1}),
++      "[conv_general_bias] Input, weight, bias, and output logical sizes must "
++      "fit the Metal int indexing ABI; use the eager fallback.",
++      std::invalid_argument);
++
+   constexpr int K = 128;
+   constexpr int N = 1024;
+   auto packed = zeros({N, K * 4 / 32}, uint32);
+@@ -3500,6 +3556,64 @@ TEST_CASE("test exact primitives reject oversized Metal ABI domains") {
+       "[quantized_matmul_bias] N and K must fit the Metal int launch ABI; "
+       "use the eager fallback.",
+       std::invalid_argument);
++
++  constexpr int PACKED_OFFSET_K = 65536;
++  constexpr int PACKED_OFFSET_N = 65536;
++  auto oversized_packed_offsets = broadcast_to(
++      zeros({1, 1}, uint32),
++      {PACKED_OFFSET_N, PACKED_OFFSET_K * 4 / 32});
++  auto packed_offset_scales = broadcast_to(
++      zeros({1, 1}), {PACKED_OFFSET_N, PACKED_OFFSET_K / 64});
++  auto packed_offset_bias =
++      broadcast_to(zeros({1}), {PACKED_OFFSET_N});
++  CHECK_THROWS_WITH_AS(
++      quantized_matmul_bias(
++          broadcast_to(zeros({1, 1}), {32, PACKED_OFFSET_K}),
++          oversized_packed_offsets,
++          packed_offset_scales,
++          packed_offset_scales,
++          packed_offset_bias,
++          true,
++          64,
++          4,
++          Device::gpu),
++      "[quantized_matmul_bias] Packed weight row offsets must fit the Metal "
++      "int ABI; use the eager fallback.",
++      std::invalid_argument);
++
++  constexpr int OVERSIZED_INPUT_M = 16'777'216;
++  CHECK_THROWS_WITH_AS(
++      quantized_matmul_bias(
++          broadcast_to(zeros({1, 1}), {OVERSIZED_INPUT_M, K}),
++          packed,
++          scales,
++          biases,
++          zeros({N}),
++          true,
++          64,
++          4,
++          Device::gpu),
++      "[quantized_matmul_bias] Stored input and output logical sizes must fit "
++      "the Metal int indexing ABI; use the eager fallback.",
++      std::invalid_argument);
++
++  constexpr int OVERSIZED_OUTPUT_BATCH = 65536;
++  auto oversized_qmm_output = broadcast_to(
++      zeros({1, 1, 1}), {OVERSIZED_OUTPUT_BATCH, 32, K});
++  CHECK_THROWS_WITH_AS(
++      quantized_matmul_bias(
++          oversized_qmm_output,
++          packed,
++          scales,
++          biases,
++          zeros({N}),
++          true,
++          64,
++          4,
++          Device::gpu),
++      "[quantized_matmul_bias] Stored input and output logical sizes must fit "
++      "the Metal int indexing ABI; use the eager fallback.",
++      std::invalid_argument);
+ }
+ 
+ TEST_CASE("test exact qmm selector handles provisional view flags") {
+-- 
+2.50.1 (Apple Git-155)
+

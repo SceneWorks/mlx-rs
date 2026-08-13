@@ -64,6 +64,59 @@ pub fn conv_general_device<'a>(
     })
 }
 
+/// Perform 2D or 3D convolution and add a dense channel bias inside the
+/// native Metal implicit-GEMM epilogue.
+///
+/// The result preserves the eager `conv_general` then add rounding boundary.
+/// This strict operation returns an error for grouped convolution, Winograd,
+/// explicit-GEMM/unfold, padded-channel 3D, non-Metal execution, or any other
+/// dispatch that cannot preserve that exact algorithm. Callers must use the
+/// eager expression for rejected inputs and must not report fusion as applied.
+#[generate_macro]
+#[default_device]
+#[allow(clippy::too_many_arguments)]
+pub fn conv_general_bias_device<'a>(
+    array: impl AsRef<Array>,
+    weight: impl AsRef<Array>,
+    output_bias: impl AsRef<Array>,
+    #[optional] strides: impl IntoOption<&'a [i32]>,
+    #[optional] padding: impl IntoOption<&'a [i32]>,
+    #[optional] kernel_dilation: impl IntoOption<&'a [i32]>,
+    #[optional] input_dilation: impl IntoOption<&'a [i32]>,
+    #[optional] groups: impl Into<Option<i32>>,
+    #[optional] flip: impl Into<Option<bool>>,
+    #[optional] stream: impl AsRef<Stream>,
+) -> Result<Array> {
+    let strides = strides.into_option().unwrap_or(&[1]);
+    let padding = padding.into_option().unwrap_or(&[0]);
+    let kernel_dilation = kernel_dilation.into_option().unwrap_or(&[1]);
+    let input_dilation = input_dilation.into_option().unwrap_or(&[1]);
+    let groups = groups.into().unwrap_or(1);
+    let flip = flip.into().unwrap_or(false);
+
+    Array::try_from_op(|res| unsafe {
+        mlx_sys::mlx_pmetal_conv_general_bias(
+            res,
+            array.as_ref().as_ptr(),
+            weight.as_ref().as_ptr(),
+            output_bias.as_ref().as_ptr(),
+            strides.as_ptr(),
+            strides.len(),
+            padding.as_ptr(),
+            padding.len(),
+            padding.as_ptr(),
+            padding.len(),
+            kernel_dilation.as_ptr(),
+            kernel_dilation.len(),
+            input_dilation.as_ptr(),
+            input_dilation.len(),
+            groups,
+            flip,
+            stream.as_ref().as_ptr(),
+        )
+    })
+}
+
 /// 1D convolution over an input with several channels returning an error if the inputs are invalid.
 ///
 /// Only the default `groups=1` is currently supported.

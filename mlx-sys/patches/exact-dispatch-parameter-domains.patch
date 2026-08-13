@@ -1,0 +1,507 @@
+From d4ab82c1a551e2e0700ab8df98525b14bdc1db07 Mon Sep 17 00:00:00 2001
+From: Michael Trefry <michael@trefry.net>
+Date: Thu, 13 Aug 2026 03:36:12 -0400
+Subject: [PATCH] fix(exact): mirror dispatch parameter domains
+
+Signed-off-by: Michael Trefry <michael@trefry.net>
+---
+ mlx/ops.cpp         | 247 +++++++++++++++++++++++++++++++++++++++-----
+ tests/ops_tests.cpp | 118 ++++++++++++++++++---
+ 2 files changed, 326 insertions(+), 39 deletions(-)
+
+diff --git a/mlx/ops.cpp b/mlx/ops.cpp
+index 6b2e2a1..3c9d6e4 100644
+--- a/mlx/ops.cpp
++++ b/mlx/ops.cpp
+@@ -4444,6 +4444,18 @@ array conv_general_impl(
+   auto out_type = promote_types(in.dtype(), wt.dtype());
+   in = astype(in, out_type, s);
+   wt = astype(wt, out_type, s);
++  if (output_bias) {
++    if ((spatial_dims != 2 && spatial_dims != 3) || groups != 1) {
++      throw std::invalid_argument(
++          "[conv_general_bias] Only ungrouped 2D and 3D convolutions are "
++          "supported.");
++    }
++    if (out_type != float32 && out_type != float16 && out_type != bfloat16) {
++      throw std::invalid_argument(
++          "[conv_general_bias] Input and weight must promote to float32, "
++          "float16, or bfloat16.");
++    }
++  }
+ 
+   if (stride.size() <= 1) {
+     int stride_int = stride.size() ? stride[0] : 1;
+@@ -4470,6 +4482,25 @@ array conv_general_impl(
+     input_dilation = std::vector<int>(spatial_dims, input_dilation_int);
+   }
+ 
++  const bool complete_conv_parameters =
++      stride.size() == spatial_dims && padding_lo.size() == spatial_dims &&
++      padding_hi.size() == spatial_dims &&
++      kernel_dilation.size() == spatial_dims &&
++      input_dilation.size() == spatial_dims;
++  if (output_bias && complete_conv_parameters) {
++    for (int i = 0; i < spatial_dims; ++i) {
++      const int64_t crop_lo =
++          padding_lo[i] < 0 ? -static_cast<int64_t>(padding_lo[i]) : 0;
++      const int64_t crop_hi =
++          padding_hi[i] < 0 ? -static_cast<int64_t>(padding_hi[i]) : 0;
++      if (crop_lo + crop_hi >= in.shape(i + 1)) {
++        throw std::invalid_argument(
++            "[conv_general_bias] Cropping and convolution parameters must "
++            "fit the Metal int indexing ABI; use the eager fallback.");
++      }
++    }
++  }
++
+   // Check for negative padding
+   bool has_neg_padding = false;
+   for (auto& pd : padding_lo) {
+@@ -4499,6 +4530,39 @@ array conv_general_impl(
+     in = slice(in, std::move(starts), std::move(stops), s);
+   }
+ 
++  if (output_bias && complete_conv_parameters) {
++    bool parameter_extents_fit = true;
++    for (int i = 0; i < spatial_dims; ++i) {
++      if (stride[i] <= 0 || kernel_dilation[i] <= 0 ||
++          input_dilation[i] <= 0 || padding_lo[i] < 0 ||
++          padding_hi[i] < 0) {
++        continue;
++      }
++      const size_t kernel_extent = static_cast<size_t>(wt.shape(i + 1) - 1);
++      const size_t input_extent = static_cast<size_t>(in.shape(i + 1) - 1);
++      const size_t kernel_dilation_value = kernel_dilation[i];
++      const size_t input_dilation_value = input_dilation[i];
++      if (kernel_extent > (INT_MAX - 1) / kernel_dilation_value ||
++          input_extent > (INT_MAX - 1) / input_dilation_value) {
++        parameter_extents_fit = false;
++        break;
++      }
++      const size_t dilated_input = 1 + input_extent * input_dilation_value;
++      const size_t pad_lo = padding_lo[i];
++      const size_t pad_hi = padding_hi[i];
++      if (pad_lo > INT_MAX - pad_hi ||
++          dilated_input > INT_MAX - (pad_lo + pad_hi)) {
++        parameter_extents_fit = false;
++        break;
++      }
++    }
++    if (!parameter_extents_fit) {
++      throw std::invalid_argument(
++          "[conv_general_bias] Cropping and convolution parameters must fit "
++          "the Metal int indexing ABI; use the eager fallback.");
++    }
++  }
++
+   // Get output shapes
+   auto out_shape = Convolution::conv_out_shape(
+       in.shape(),
+@@ -4511,16 +4575,6 @@ array conv_general_impl(
+ 
+   if (output_bias) {
+     constexpr std::string_view tag = "conv_general_bias";
+-    if ((spatial_dims != 2 && spatial_dims != 3) || groups != 1) {
+-      throw std::invalid_argument(
+-          "[conv_general_bias] Only ungrouped 2D and 3D convolutions are "
+-          "supported.");
+-    }
+-    if (out_type != float32 && out_type != float16 && out_type != bfloat16) {
+-      throw std::invalid_argument(
+-          "[conv_general_bias] Input and weight must promote to float32, "
+-          "float16, or bfloat16.");
+-    }
+     if (in.size() == 0 || wt.size() == 0 ||
+         std::any_of(out_shape.begin(), out_shape.end(), [](int dim) {
+           return dim == 0;
+@@ -4543,9 +4597,26 @@ array conv_general_impl(
+       throw std::invalid_argument(msg.str());
+     }
+ 
++    size_t out_size = 1;
++    bool out_size_fits = true;
++    for (const auto dim : out_shape) {
++      if (dim <= 0 || out_size > INT_MAX / static_cast<size_t>(dim)) {
++        out_size_fits = false;
++        break;
++      }
++      out_size *= static_cast<size_t>(dim);
++    }
++    if (in.size() > INT_MAX || wt.size() > INT_MAX ||
++        output_bias->size() > INT_MAX || !out_size_fits) {
++      throw std::invalid_argument(
++          "[conv_general_bias] Input, weight, bias, and output logical sizes "
++          "must fit the Metal int indexing ABI; use the eager fallback.");
++    }
++
+     const int C = in.shape(-1);
+     const int O = wt.shape(0);
+     bool direct_implicit = false;
++    bool direct_implicit_general = false;
+     if (spatial_dims == 2) {
+       const bool stride_one = stride[0] == 1 && stride[1] == 1;
+       const bool kdil_one =
+@@ -4567,6 +4638,8 @@ array conv_general_impl(
+       const bool implicit_general =
+           (C % 16 == 0 && O % 16 == 0) || out_large;
+       direct_implicit = !winograd && (implicit_regular || implicit_general);
++      direct_implicit_general =
++          !winograd && !implicit_regular && implicit_general;
+     } else {
+       const bool idil_one = input_dilation[0] == 1 &&
+           input_dilation[1] == 1 && input_dilation[2] == 1;
+@@ -4599,20 +4672,131 @@ array conv_general_impl(
+           "[conv_general_bias] Implicit GEMM M, N, and K must fit the Metal "
+           "int launch ABI; use the eager fallback.");
+     }
+-    size_t out_size = 1;
+-    bool out_size_fits = true;
+-    for (const auto dim : out_shape) {
+-      if (dim <= 0 || out_size > INT_MAX / static_cast<size_t>(dim)) {
+-        out_size_fits = false;
++
++    constexpr size_t max_conv_index = INT_MAX;
++    auto add_product_fits = [](
++                                size_t& total,
++                                size_t lhs,
++                                size_t rhs,
++                                size_t limit) {
++      if (total > limit ||
++          (lhs != 0 && rhs > (limit - total) / lhs)) {
++        return false;
++      }
++      total += lhs * rhs;
++      return true;
++    };
++
++    std::vector<size_t> input_spatial_strides(spatial_dims);
++    size_t contiguous_stride = static_cast<size_t>(C);
++    for (int i = spatial_dims - 1; i >= 0; --i) {
++      input_spatial_strides[i] = contiguous_stride;
++      contiguous_stride *= static_cast<size_t>(in.shape(i + 1));
++    }
++
++    bool host_parameters_fit = true;
++    size_t input_jump_extent = 0;
++    size_t weight_spatial_size = 1;
++    for (int i = 0; i < spatial_dims; ++i) {
++      const size_t weight_dim = wt.shape(i + 1);
++      const size_t output_dim = out_shape[i + 1];
++      const size_t kernel_dilation_value = kernel_dilation[i];
++      if (input_spatial_strides[i] >
++          max_conv_index / kernel_dilation_value) {
++        host_parameters_fit = false;
+         break;
+       }
+-      out_size *= static_cast<size_t>(dim);
++      const size_t dilated_input_stride =
++          input_spatial_strides[i] * kernel_dilation_value;
++      if (!add_product_fits(
++              input_jump_extent,
++              weight_dim - 1,
++              dilated_input_stride,
++              max_conv_index - 16)) {
++        host_parameters_fit = false;
++        break;
++      }
++
++      size_t coordinate_extent = padding_lo[i];
++      if (!add_product_fits(
++              coordinate_extent,
++              output_dim - 1,
++              static_cast<size_t>(stride[i]),
++              max_conv_index) ||
++          !add_product_fits(
++              coordinate_extent,
++              weight_dim - 1,
++              kernel_dilation_value,
++              max_conv_index)) {
++        host_parameters_fit = false;
++        break;
++      }
++
++      weight_spatial_size *= weight_dim;
+     }
+-    if (in.size() > INT_MAX || wt.size() > INT_MAX ||
+-        output_bias->size() > INT_MAX || !out_size_fits) {
++
++    if (host_parameters_fit && spatial_dims == 2 && !direct_implicit_general) {
++      size_t gemm_iteration_extent = 15;
++      if (C > 2 && C <= 4) {
++        host_parameters_fit = add_product_fits(
++            gemm_iteration_extent,
++            weight_spatial_size,
++            4,
++            max_conv_index);
++      } else if (C > 4) {
++        gemm_iteration_extent = 0;
++        host_parameters_fit = add_product_fits(
++            gemm_iteration_extent,
++            weight_spatial_size,
++            (static_cast<size_t>(C) + 15) / 16,
++            max_conv_index);
++      }
++    } else if (host_parameters_fit && spatial_dims == 3) {
++      size_t gemm_iteration_extent = 0;
++      host_parameters_fit = add_product_fits(
++          gemm_iteration_extent,
++          weight_spatial_size,
++          (static_cast<size_t>(C) + 15) / 16,
++          max_conv_index);
++    }
++
++    if (host_parameters_fit && direct_implicit_general) {
++      auto lcm_fits = [](size_t lhs, size_t rhs, size_t& result) {
++        const size_t divisor = std::gcd(lhs, rhs);
++        lhs /= divisor;
++        if (lhs > static_cast<size_t>(INT_MAX) / rhs) {
++          return false;
++        }
++        result = lhs * rhs;
++        return true;
++      };
++      for (int i = 0; i < spatial_dims; ++i) {
++        size_t weight_lcm = 0;
++        size_t output_lcm = 0;
++        if (!lcm_fits(
++                input_dilation[i], kernel_dilation[i], weight_lcm) ||
++            !lcm_fits(input_dilation[i], stride[i], output_lcm)) {
++          host_parameters_fit = false;
++          break;
++        }
++        const size_t weight_jump = weight_lcm / kernel_dilation[i];
++        const size_t output_jump = output_lcm / stride[i];
++        const size_t weight_dim = wt.shape(i + 1);
++        const size_t output_dim = out_shape[i + 1];
++        if (weight_jump > weight_dim || output_jump > output_dim ||
++            weight_dim - 1 > max_conv_index - weight_jump ||
++            output_dim - 1 > max_conv_index - output_jump) {
++          host_parameters_fit = false;
++          break;
++        }
++      }
++    }
++
++    if (!host_parameters_fit) {
+       throw std::invalid_argument(
+-          "[conv_general_bias] Input, weight, bias, and output logical sizes "
+-          "must fit the Metal int indexing ABI; use the eager fallback.");
++          "[conv_general_bias] Stride, padding, dilation, and jump "
++          "parameters must fit the direct Metal int ABI; use the eager "
++          "fallback.");
+     }
+     auto stream = to_stream(s);
+     if (stream.device != Device::gpu || !metal::is_available()) {
+@@ -4954,9 +5138,10 @@ array quantized_matmul_bias(
+         : static_cast<size_t>(x_cast.shape(-2));
+ 
+     // The eager baseline selects qmm only above the device-dependent vector
+-    // threshold (never greater than 32). For B == 1 it first selects split-K,
+-    // which delegates to qmm exactly at 512 or more 32x32 output tiles;
+-    // batched inputs route directly to qmm and do not need that tile bound.
++    // threshold (never greater than 32). For B == 1 it first calls qmm_splitk,
++    // whose integer split selection can still delegate directly to qmm below
++    // 512 tiles after the quantization-group cap and divisibility adjustment.
++    // Batched inputs route directly to qmm and do not need that split check.
+     if (M_size < 32 || M_size > max_qmm_dim) {
+       return DispatchRejection::M;
+     }
+@@ -4967,9 +5152,23 @@ array quantized_matmul_bias(
+     }
+     const size_t tile_count = ((M_size + 31) / 32) *
+         ((static_cast<size_t>(w_outer_dims) + 31) / 32);
+-    if (B_size == 1 && (tile_count < 512 || tile_count > INT_MAX)) {
++    if (tile_count == 0 || tile_count > INT_MAX) {
+       return DispatchRejection::Tiles;
+     }
++    if (B_size == 1) {
++      size_t split_k = std::max<size_t>(1, 512 / tile_count);
++      split_k = std::min(
++          split_k,
++          static_cast<size_t>(w_inner_dims) /
++              static_cast<size_t>(group_size));
++      while (split_k > 1 &&
++             w_inner_dims % (split_k * static_cast<size_t>(group_size)) != 0) {
++        --split_k;
++      }
++      if (split_k > 1) {
++        return DispatchRejection::Tiles;
++      }
++    }
+     return DispatchRejection::None;
+   };
+ 
+diff --git a/tests/ops_tests.cpp b/tests/ops_tests.cpp
+index e4b45bd..4d2b3b9 100644
+--- a/tests/ops_tests.cpp
++++ b/tests/ops_tests.cpp
+@@ -3327,6 +3327,46 @@ TEST_CASE("test exact fast primitives reject without Metal") {
+       fast::silu_exact(x, Device::gpu), std::invalid_argument);
+   CHECK_THROWS_AS(
+       fast::gelu_tanh_exact(x, Device::gpu), std::invalid_argument);
++
++  constexpr int K = 128;
++  constexpr int N = 1001;
++  auto packed = zeros({N, K * 4 / 32}, uint32);
++  auto scales = zeros({N, K / 64});
++  CHECK_THROWS_AS(
++      quantized_matmul_bias(
++          zeros({257, K}),
++          packed,
++          scales,
++          scales,
++          zeros({N}),
++          true,
++          64,
++          4,
++          Device::gpu),
++      std::invalid_argument);
++}
++
++TEST_CASE("test exact qmm mirrors split-k direct delegation") {
++  if (!metal::is_available()) {
++    return;
++  }
++
++  constexpr int K = 128;
++  constexpr int N = 1001;
++  auto x = zeros({257, K});
++  auto packed = zeros({N, K * 4 / 32}, uint32);
++  auto scales = zeros({N, K / 64});
++  auto output_bias = zeros({N});
++  CHECK_NOTHROW(quantized_matmul_bias(
++      x,
++      packed,
++      scales,
++      scales,
++      output_bias,
++      true,
++      64,
++      4,
++      Device::gpu));
+ }
+ 
+ TEST_CASE("test exact primitives reject oversized Metal ABI domains") {
+@@ -3356,13 +3396,14 @@ TEST_CASE("test exact primitives reject oversized Metal ABI domains") {
+       "fallback.",
+       std::invalid_argument);
+ 
++  constexpr int HUGE_M = INT_MAX - 31;
+   auto huge_conv_m =
+-      broadcast_to(zeros({1, 1, 1, 16}), {65536, 256, 256, 16});
++      broadcast_to(zeros({1, 1, 1, 1}), {HUGE_M, 1, 1, 1});
+   CHECK_THROWS_WITH_AS(
+       conv_general_bias(
+           huge_conv_m,
+-          zeros({16, 1, 1, 16}),
+-          zeros({16}),
++          zeros({1, 1, 1, 1}),
++          zeros({1}),
+           {1, 1},
+           {0, 0},
+           {0, 0},
+@@ -3374,11 +3415,11 @@ TEST_CASE("test exact primitives reject oversized Metal ABI domains") {
+ 
+   constexpr int HUGE_N = INT_MAX - 15;
+   auto huge_conv_n = broadcast_to(
+-      zeros({1, 1, 1, 1}), {HUGE_N, 1, 1, 16});
++      zeros({1, 1, 1, 1}), {HUGE_N, 1, 1, 1});
+   auto huge_conv_bias = broadcast_to(zeros({1}), {HUGE_N});
+   CHECK_THROWS_WITH_AS(
+       conv_general_bias(
+-          zeros({1, 1, 1, 16}),
++          zeros({1, 1, 1, 1}),
+           huge_conv_n,
+           huge_conv_bias,
+           {1, 1},
+@@ -3390,20 +3431,21 @@ TEST_CASE("test exact primitives reject oversized Metal ABI domains") {
+       "launch ABI; use the eager fallback.",
+       std::invalid_argument);
+ 
++  constexpr int HUGE_CONV_K = INT_MAX - 31;
+   auto huge_conv_k = broadcast_to(
+-      zeros({1, 1, 1, 1, 1}), {1, 2048, 2048, 33, 16});
++      zeros({1, 1, 1, 1}), {1, HUGE_CONV_K, 1, 1});
+   auto huge_conv_weight = broadcast_to(
+-      zeros({1, 1, 1, 1, 1}), {16, 2048, 2048, 33, 16});
++      zeros({1, 1, 1, 1}), {1, HUGE_CONV_K, 1, 1});
+   CHECK_THROWS_WITH_AS(
+       conv_general_bias(
+           huge_conv_k,
+           huge_conv_weight,
+-          zeros({16}),
+-          {1, 1, 1},
+-          {0, 0, 0},
+-          {0, 0, 0},
+-          {1, 1, 1},
+-          {1, 1, 1}),
++          zeros({1}),
++          {1, 1},
++          {0, 0},
++          {0, 0},
++          {1, 1},
++          {1, 1}),
+       "[conv_general_bias] Implicit GEMM M, N, and K must fit the Metal int "
+       "launch ABI; use the eager fallback.",
+       std::invalid_argument);
+@@ -3459,8 +3501,54 @@ TEST_CASE("test exact primitives reject oversized Metal ABI domains") {
+           {0, 0},
+           {1, 1},
+           {1, 1}),
+-      "[conv_general_bias] Implicit GEMM M, N, and K must fit the Metal int "
+-      "launch ABI; use the eager fallback.",
++      "[conv_general_bias] Input, weight, bias, and output logical sizes must "
++      "fit the Metal int indexing ABI; use the eager fallback.",
++      std::invalid_argument);
++
++  CHECK_THROWS_WITH_AS(
++      conv_general_bias(
++          zeros({1, 1, 1, 16}),
++          zeros({16, 1, 1, 16}),
++          zeros({16}),
++          {1, 1},
++          {0, 0},
++          {0, 0},
++          {65535, 65535},
++          {65536, 65536}),
++      "[conv_general_bias] Stride, padding, dilation, and jump parameters "
++      "must fit the direct Metal int ABI; use the eager fallback.",
++      std::invalid_argument);
++
++  auto wide_2d_input =
++      broadcast_to(zeros({1, 1, 1, 1}), {1, 1, 4096, 16});
++  CHECK_THROWS_WITH_AS(
++      conv_general_bias(
++          wide_2d_input,
++          zeros({16, 1, 1, 16}),
++          zeros({16}),
++          {1, 1},
++          {0, 0},
++          {0, 0},
++          {65536, 1},
++          {1, 1}),
++      "[conv_general_bias] Stride, padding, dilation, and jump parameters "
++      "must fit the direct Metal int ABI; use the eager fallback.",
++      std::invalid_argument);
++
++  auto wide_3d_input =
++      broadcast_to(zeros({1, 1, 1, 1, 1}), {1, 1, 1, 4096, 16});
++  CHECK_THROWS_WITH_AS(
++      conv_general_bias(
++          wide_3d_input,
++          zeros({16, 1, 1, 1, 16}),
++          zeros({16}),
++          {1, 1, 1},
++          {0, 0, 0},
++          {0, 0, 0},
++          {65536, 1, 1},
++          {1, 1, 1}),
++      "[conv_general_bias] Stride, padding, dilation, and jump parameters "
++      "must fit the direct Metal int ABI; use the eager fallback.",
+       std::invalid_argument);
+ 
+   auto oversized_conv_output =
+-- 
+2.50.1 (Apple Git-155)
+

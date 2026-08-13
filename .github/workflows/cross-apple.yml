@@ -39,34 +39,38 @@ jobs:
             # Device and simulator differ only in the `-simulator` suffix — which is exactly the
             # bug this matrix exists to catch, since nothing else about an arm64 simulator build
             # distinguishes it from the device.
-            metallib_triple: air64_v27-apple-ios18.0.0
+            metallib_triple: air64-apple-ios18.0.0
             sdk: iphoneos
             clang_target: arm64-apple-ios18.0
             toolchain: stable
             build_std: ""
+            deployment_env: IPHONEOS_DEPLOYMENT_TARGET
           - target: aarch64-apple-ios-sim
-            metallib_triple: air64_v27-apple-ios18.0.0-simulator
+            metallib_triple: air64-apple-ios18.0.0-simulator
             sdk: iphonesimulator
             clang_target: arm64-apple-ios18.0-simulator
             toolchain: stable
             build_std: ""
+            deployment_env: IPHONEOS_DEPLOYMENT_TARGET
           # tvOS is a tier-3 Rust target with no prebuilt std, so it needs -Z build-std on
           # nightly. That is also the only way anyone can consume this crate on tvOS, so the
           # nightly pin mirrors reality rather than working around CI. It does mean these legs
           # can break for reasons unrelated to this repo — which is part of why the whole
           # workflow is nightly/label-gated rather than a PR requirement.
           - target: aarch64-apple-tvos
-            metallib_triple: air64_v27-apple-tvos18.0.0
+            metallib_triple: air64-apple-tvos18.0.0
             sdk: appletvos
             clang_target: arm64-apple-tvos18.0
             toolchain: nightly
             build_std: "-Z build-std=std,panic_abort"
+            deployment_env: TVOS_DEPLOYMENT_TARGET
           - target: aarch64-apple-tvos-sim
-            metallib_triple: air64_v27-apple-tvos18.0.0-simulator
+            metallib_triple: air64-apple-tvos18.0.0-simulator
             sdk: appletvsimulator
             clang_target: arm64-apple-tvos18.0-simulator
             toolchain: nightly
             build_std: "-Z build-std=std,panic_abort"
+            deployment_env: TVOS_DEPLOYMENT_TARGET
     steps:
       - uses: actions/checkout@v5
         with:
@@ -82,7 +86,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}-${{ hashFiles('**/Cargo.toml') }}
-      - run: cargo build ${{ matrix.build_std }} -p pmetal-mlx-sys --target ${{ matrix.target }}
+      - name: Build pmetal-mlx-sys for ${{ matrix.target }}
+        run: |
+          export "${{ matrix.deployment_env }}=18.0"
+          cargo build ${{ matrix.build_std }} -p pmetal-mlx-sys --target ${{ matrix.target }}
 
       - name: Assert the metallib targets ${{ matrix.target }}
         run: |
@@ -99,7 +106,7 @@ jobs:
           # `|| true` so an empty result is reported by the comparison below rather than as a
           # bare grep exit code.
           found=$(LC_ALL=C strings -a "$metallib" \
-                  | grep -oE 'air64[_a-z0-9]*-apple-[a-z0-9.]+(-simulator)?' \
+                  | grep -oE 'air64(_v[0-9]+)?-apple-(ios|tvos)[0-9]+(\.[0-9]+){2}(-simulator)?' \
                   | sort -u || true)
           echo "triples: $found"
           if [ "$found" != "${{ matrix.metallib_triple }}" ]; then
@@ -114,10 +121,17 @@ jobs:
       - name: Link a real binary for ${{ matrix.target }}
         run: |
           set -euo pipefail
-          # `*pmetal-mlx-sys*/out`, not `*/pmetal-mlx-sys-*/out`: a -Z build-std run nests the
-          # build dir one level deeper (pmetal-mlx-sys/<hash>/out) than a normal one
-          # (pmetal-mlx-sys-<hash>/out), and the stricter glob silently matches neither.
-          out=$(find target/${{ matrix.target }} -type d -path '*pmetal-mlx-sys*/out' -print -quit)
+          # A -Z build-std run can leave multiple pmetal-mlx-sys `out` directories behind. Pick
+          # the one that owns the staged C example instead of whichever directory `find` sees
+          # first; only the completed native build-script output contains this file and the
+          # static archives linked below.
+          example=$(find target/${{ matrix.target }} -type f \
+            -path '*pmetal-mlx-sys*/out/mlx-c-staged/examples/example.c' -print -quit)
+          if [ -z "$example" ]; then
+            echo "::error::no completed pmetal-mlx-sys build output for ${{ matrix.target }}"
+            exit 1
+          fi
+          out=${example%/mlx-c-staged/examples/example.c}
           sdk=$(xcrun --sdk ${{ matrix.sdk }} --show-sdk-path)
           # Empty on the device SDKs, which export everything metal-cpp references.
           shim=$(find "$out" -name 'libmlx_metal_cpp_absent.a' -print -quit)

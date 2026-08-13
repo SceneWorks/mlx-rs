@@ -1,0 +1,72 @@
+From e9524470b775f68ab2d979c43f696da2b16c037d Mon Sep 17 00:00:00 2001
+From: Michael Trefry <michael@trefry.net>
+Date: Wed, 12 Aug 2026 22:54:06 -0400
+Subject: [PATCH] feat(ops): expose exact qmm bias bridge
+
+Signed-off-by: Michael Trefry <michael@trefry.net>
+
+diff --git a/mlx/c/ops.cpp b/mlx/c/ops.cpp
+index f5eac1b..2090c32 100644
+--- a/mlx/c/ops.cpp
++++ b/mlx/c/ops.cpp
+@@ -2615,6 +2615,38 @@ extern "C" int mlx_quantized_matmul(
+   }
+   return 0;
+ }
++extern "C" int mlx_pmetal_quantized_matmul_bias(
++    mlx_array* res,
++    const mlx_array x,
++    const mlx_array w,
++    const mlx_array scales,
++    const mlx_array biases,
++    const mlx_array output_bias,
++    bool transpose,
++    mlx_optional_int group_size,
++    mlx_optional_int bits,
++    const mlx_stream s) {
++  try {
++    mlx_array_set_(
++        *res,
++        mlx::core::quantized_matmul_bias(
++            mlx_array_get_(x),
++            mlx_array_get_(w),
++            mlx_array_get_(scales),
++            mlx_array_get_(biases),
++            mlx_array_get_(output_bias),
++            transpose,
++            (group_size.has_value ? std::make_optional<int>(group_size.value)
++                                  : std::nullopt),
++            (bits.has_value ? std::make_optional<int>(bits.value)
++                            : std::nullopt),
++            mlx_stream_get_(s)));
++  } catch (std::exception& e) {
++    mlx_error(e.what());
++    return 1;
++  }
++  return 0;
++}
+ extern "C" int
+ mlx_radians(mlx_array* res, const mlx_array a, const mlx_stream s) {
+   try {
+diff --git a/mlx/c/ops.h b/mlx/c/ops.h
+index 64d70e2..61e9a4a 100644
+--- a/mlx/c/ops.h
++++ b/mlx/c/ops.h
+@@ -817,6 +817,17 @@ int mlx_quantized_matmul(
+     mlx_optional_int bits,
+     const char* mode,
+     const mlx_stream s);
++int mlx_pmetal_quantized_matmul_bias(
++    mlx_array* res,
++    const mlx_array x,
++    const mlx_array w,
++    const mlx_array scales,
++    const mlx_array biases,
++    const mlx_array output_bias,
++    bool transpose,
++    mlx_optional_int group_size,
++    mlx_optional_int bits,
++    const mlx_stream s);
+ int mlx_radians(mlx_array* res, const mlx_array a, const mlx_stream s);
+ int mlx_real(mlx_array* res, const mlx_array a, const mlx_stream s);
+ int mlx_reciprocal(mlx_array* res, const mlx_array a, const mlx_stream s);

@@ -243,6 +243,71 @@ pub fn layer_norm_device<'a>(
     })
 }
 
+/// PyTorch-compatible GroupNorm over a channels-last tensor with per-channel
+/// affine weight and bias applied in the native Metal normalization epilogue.
+///
+/// This strict operation preserves the eager `layer_norm`, multiply, then add
+/// dtype-rounding boundaries. It returns an error for non-Metal execution,
+/// mismatched dtypes, malformed group/channel shapes, or unsupported dtypes.
+/// Callers must use the eager expression for rejected inputs and must not
+/// report fusion as applied.
+#[generate_macro(customize(root = "$crate::fast"))]
+#[default_device]
+pub fn group_norm_affine_device(
+    x: impl AsRef<Array>,
+    weight: impl AsRef<Array>,
+    bias: impl AsRef<Array>,
+    num_groups: i32,
+    eps: f32,
+    #[optional] stream: impl AsRef<Stream>,
+) -> Result<Array> {
+    Array::try_from_op(|res| unsafe {
+        mlx_sys::mlx_pmetal_group_norm_affine(
+            res,
+            x.as_ref().as_ptr(),
+            weight.as_ref().as_ptr(),
+            bias.as_ref().as_ptr(),
+            num_groups,
+            eps,
+            stream.as_ref().as_ptr(),
+        )
+    })
+}
+
+/// Fused Metal SiLU preserving the eager `sigmoid` then multiply rounding
+/// boundary exactly.
+///
+/// This strict operation supports float32, float16, and bfloat16 on Metal. It
+/// returns an error for unsupported inputs so callers can truthfully execute
+/// the eager expression instead.
+#[generate_macro(customize(root = "$crate::fast"))]
+#[default_device]
+pub fn silu_exact_device(
+    x: impl AsRef<Array>,
+    #[optional] stream: impl AsRef<Stream>,
+) -> Result<Array> {
+    Array::try_from_op(|res| unsafe {
+        mlx_sys::mlx_pmetal_silu_exact(res, x.as_ref().as_ptr(), stream.as_ref().as_ptr())
+    })
+}
+
+/// Fused Metal tanh-GELU preserving every eager power/multiply/add/tanh dtype
+/// rounding boundary exactly.
+///
+/// This strict operation supports float32, float16, and bfloat16 on Metal. It
+/// returns an error for unsupported inputs so callers can truthfully execute
+/// the eager expression instead.
+#[generate_macro(customize(root = "$crate::fast"))]
+#[default_device]
+pub fn gelu_tanh_exact_device(
+    x: impl AsRef<Array>,
+    #[optional] stream: impl AsRef<Stream>,
+) -> Result<Array> {
+    Array::try_from_op(|res| unsafe {
+        mlx_sys::mlx_pmetal_gelu_tanh_exact(res, x.as_ref().as_ptr(), stream.as_ref().as_ptr())
+    })
+}
+
 /// A template parameter for a JIT-compiled [`MetalKernel`].
 ///
 /// Template parameters are substituted into the generated kernel at JIT-compile

@@ -124,6 +124,56 @@ pub fn quantized_matmul_device<'a>(
     })
 }
 
+/// Perform affine Q4/Q8 quantized matrix multiplication and add a dense output
+/// bias in the native Metal qmm epilogue.
+///
+/// The result is bitwise-equivalent to first evaluating [`quantized_matmul`]
+/// and then adding `output_bias`: the qmm accumulator is rounded to the output
+/// dtype before the bias add. The native operation is intentionally strict and
+/// returns an error unless all of these conditions hold:
+///
+/// - Metal execution with `transpose = true`;
+/// - 2D quantized weights, Q4 or Q8, and group size 32, 64, or 128;
+/// - one-dimensional `output_bias` matching the qmm output width and dtype;
+/// - a shape that selects MLX's direct qmm path rather than qmv or split-K.
+///
+/// Callers that cannot prove those conditions should use the eager
+/// `quantized_matmul` plus add fallback and must not report that this fused
+/// operation was applied.
+#[allow(clippy::too_many_arguments)]
+#[generate_macro]
+#[default_device]
+pub fn quantized_matmul_bias_device(
+    x: impl AsRef<Array>,
+    w: impl AsRef<Array>,
+    scales: impl AsRef<Array>,
+    biases: impl AsRef<Array>,
+    output_bias: impl AsRef<Array>,
+    #[optional] transpose: impl Into<Option<bool>>,
+    #[optional] group_size: impl Into<Option<i32>>,
+    #[optional] bits: impl Into<Option<i32>>,
+    #[optional] stream: impl AsRef<Stream>,
+) -> Result<Array> {
+    let transpose = transpose.into().unwrap_or(true);
+    let group_size = optional_int(group_size.into(), DEFAULT_GROUP_SIZE);
+    let bits = optional_int(bits.into(), DEFAULT_BITS);
+
+    <Array as Guarded>::try_from_op(|res| unsafe {
+        mlx_sys::mlx_pmetal_quantized_matmul_bias(
+            res,
+            x.as_ref().as_ptr(),
+            w.as_ref().as_ptr(),
+            scales.as_ref().as_ptr(),
+            biases.as_ref().as_ptr(),
+            output_bias.as_ref().as_ptr(),
+            transpose,
+            group_size,
+            bits,
+            stream.as_ref().as_ptr(),
+        )
+    })
+}
+
 /// Dequantize the matrix `w` using the provided `scales` and `biases` and the `group_size` and
 /// `bits` configuration.
 ///

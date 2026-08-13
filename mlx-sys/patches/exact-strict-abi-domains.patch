@@ -1,0 +1,490 @@
+From 206b51a7942e1bc6bb62429275ef3db46da884b9 Mon Sep 17 00:00:00 2001
+From: Michael Trefry <michael@trefry.net>
+Date: Thu, 13 Aug 2026 03:01:30 -0400
+Subject: [PATCH] fix(exact): bound strict Metal dispatch domains
+
+Signed-off-by: Michael Trefry <michael@trefry.net>
+---
+ mlx/fast.cpp        |   9 ++
+ mlx/ops.cpp         | 155 ++++++++++++++++++++++-------
+ tests/ops_tests.cpp | 231 ++++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 360 insertions(+), 35 deletions(-)
+
+diff --git a/mlx/fast.cpp b/mlx/fast.cpp
+index abcfc9c..a932b83 100644
+--- a/mlx/fast.cpp
++++ b/mlx/fast.cpp
+@@ -407,6 +407,15 @@ array group_norm_affine(
+         "float32, float16, or bfloat16 dtype.");
+   }
+ 
++  const size_t n_rows =
++      static_cast<size_t>(x.shape(0)) * static_cast<size_t>(num_groups);
++  const size_t axis_size = x.size() / n_rows;
++  if (n_rows > UINT32_MAX || axis_size > UINT32_MAX) {
++    throw std::invalid_argument(
++        "[group_norm_affine] Row count and normalized axis size must fit "
++        "the Metal uint32 ABI; use the eager fallback.");
++  }
++
+   auto s = to_stream(s_);
+   if (s.device != Device::gpu || !metal::is_available()) {
+     throw std::invalid_argument(
+diff --git a/mlx/ops.cpp b/mlx/ops.cpp
+index c421854..1fd9657 100644
+--- a/mlx/ops.cpp
++++ b/mlx/ops.cpp
+@@ -112,7 +112,11 @@ void validate_quantized_input(
+     throw std::invalid_argument(msg.str());
+   }
+ 
+-  if (w.shape(-1) * 32 / bits != scales.shape(-1) * group_size) {
++  const int64_t expanded_w_groups =
++      static_cast<int64_t>(w.shape(-1)) * 32 / bits;
++  const int64_t scaled_groups =
++      static_cast<int64_t>(scales.shape(-1)) * group_size;
++  if (expanded_w_groups != scaled_groups) {
+     std::ostringstream msg;
+     msg << "[" << tag << "] The shapes of the weight and scales are "
+         << "incompatible based on bits and group_size. w.shape() == "
+@@ -136,8 +140,12 @@ std::pair<int, int> extract_quantized_matmul_dims(
+   int x_inner_dims = x.shape(-1);
+ 
+   // Calculate the expanded w's dims
+-  int w_inner_dims = (transpose) ? w.shape(-1) * 32 / bits : w.shape(-2);
+-  int w_outer_dims = (transpose) ? w.shape(-2) : w.shape(-1) * 32 / bits;
++  const int64_t expanded_w_dim =
++      static_cast<int64_t>(w.shape(-1)) * 32 / bits;
++  int w_inner_dims =
++      safe_cast((transpose) ? expanded_w_dim : w.shape(-2), tag);
++  int w_outer_dims =
++      safe_cast((transpose) ? w.shape(-2) : expanded_w_dim, tag);
+ 
+   if (w_inner_dims != x_inner_dims) {
+     std::ostringstream msg;
+@@ -4503,11 +4511,6 @@ array conv_general_impl(
+ 
+   if (output_bias) {
+     constexpr std::string_view tag = "conv_general_bias";
+-    auto stream = to_stream(s);
+-    if (stream.device != Device::gpu || !metal::is_available()) {
+-      throw std::invalid_argument(
+-          "[conv_general_bias] The exact fused epilogue is Metal-only.");
+-    }
+     if ((spatial_dims != 2 && spatial_dims != 3) || groups != 1) {
+       throw std::invalid_argument(
+           "[conv_general_bias] Only ungrouped 2D and 3D convolutions are "
+@@ -4574,6 +4577,32 @@ array conv_general_impl(
+           "[conv_general_bias] Shape does not select a direct implicit-GEMM "
+           "convolution; use the eager fallback.");
+     }
++
++    constexpr int64_t max_implicit_dim = INT_MAX - 63;
++    auto product_fits_implicit_dim = [max_implicit_dim](auto first, auto last) {
++      int64_t product = 1;
++      for (; first != last; ++first) {
++        if (*first <= 0 || product > max_implicit_dim / *first) {
++          return false;
++        }
++        product *= *first;
++      }
++      return true;
++    };
++    if (out_shape.back() > max_implicit_dim ||
++        !product_fits_implicit_dim(
++            out_shape.begin(), out_shape.end() - 1) ||
++        !product_fits_implicit_dim(
++            wt.shape().begin() + 1, wt.shape().end())) {
++      throw std::invalid_argument(
++          "[conv_general_bias] Implicit GEMM M, N, and K must fit the Metal "
++          "int launch ABI; use the eager fallback.");
++    }
++    auto stream = to_stream(s);
++    if (stream.device != Device::gpu || !metal::is_available()) {
++      throw std::invalid_argument(
++          "[conv_general_bias] The exact fused epilogue is Metal-only.");
++    }
+   }
+ 
+   std::vector<array> inputs{in, wt};
+@@ -4821,11 +4850,6 @@ array quantized_matmul_bias(
+     std::optional<int> bits_ /* = std::nullopt */,
+     StreamOrDevice s /* = {} */) {
+   constexpr std::string_view tag = "quantized_matmul_bias";
+-  auto stream = to_stream(s);
+-  if (stream.device != Device::gpu || !metal::is_available()) {
+-    throw std::invalid_argument(
+-        "[quantized_matmul_bias] The exact fused epilogue is Metal-only.");
+-  }
+   if (!transpose) {
+     throw std::invalid_argument(
+         "[quantized_matmul_bias] Only transpose=true is supported.");
+@@ -4879,40 +4903,101 @@ array quantized_matmul_bias(
+         "[quantized_matmul_bias] Empty weight or output dimensions must use "
+         "the eager fallback.");
+   }
++  constexpr size_t max_qmm_dim = INT_MAX - 63;
++  if (static_cast<size_t>(w_inner_dims) > max_qmm_dim ||
++      static_cast<size_t>(w_outer_dims) > max_qmm_dim) {
++    throw std::invalid_argument(
++        "[quantized_matmul_bias] N and K must fit the Metal int launch ABI; "
++        "use the eager fallback.");
++  }
+ 
+   // Mirror ensure_row_contiguous_matrix + QuantizedMatmul::eval_gpu when
+   // deriving M/B. A view whose last two dimensions are already contiguous
+   // preserves its leading batch strides, while every other view is copied to
+   // one row-contiguous matrix and collapsed across its leading dimensions.
++  //
++  // Unscheduled MLX arrays carry provisional contiguous flags even when a
++  // view primitive (for example Broadcast) will replace them at evaluation.
++  // AsType's vector-copy path can preserve those eventual strides even when
++  // the dtype changes. Conservatively require both possible aggregate and
++  // batch-strided interpretations for every unscheduled stored input;
++  // materialized inputs use their final flags exactly.
+   auto x_cast = astype(x, dtype);
+-  bool matrix_contiguous = false;
+-  if (x_cast.ndim() < 2) {
+-    matrix_contiguous = x_cast.strides()[0] == 1;
+-  } else {
+-    matrix_contiguous =
++  enum class DispatchRejection { None, M, Batch, Tiles };
++  auto dispatch_rejection = [&](bool row_contiguous) {
++    const size_t M_size = row_contiguous
++        ? x_cast.size() / static_cast<size_t>(w_inner_dims)
++        : static_cast<size_t>(x_cast.shape(-2));
++
++    // The eager baseline selects qmm only above the device-dependent vector
++    // threshold (never greater than 32). For B == 1 it first selects split-K,
++    // which delegates to qmm exactly at 512 or more 32x32 output tiles;
++    // batched inputs route directly to qmm and do not need that tile bound.
++    if (M_size < 32 || M_size > max_qmm_dim) {
++      return DispatchRejection::M;
++    }
++    const size_t B_size =
++        x_cast.size() / M_size / static_cast<size_t>(w_inner_dims);
++    if (B_size == 0 || B_size > INT_MAX) {
++      return DispatchRejection::Batch;
++    }
++    const size_t tile_count = ((M_size + 31) / 32) *
++        ((static_cast<size_t>(w_outer_dims) + 31) / 32);
++    if (B_size == 1 && (tile_count < 512 || tile_count > INT_MAX)) {
++      return DispatchRejection::Tiles;
++    }
++    return DispatchRejection::None;
++  };
++
++  DispatchRejection rejection;
++  if (x_cast.ndim() <= 2) {
++    rejection = dispatch_rejection(true);
++  } else if (x_cast.status() != array::unscheduled) {
++    const bool matrix_contiguous =
+         x_cast.strides()[x_cast.ndim() - 2] == x_cast.shape(-1) &&
+         x_cast.strides()[x_cast.ndim() - 1] == 1;
++    rejection = dispatch_rejection(
++        !matrix_contiguous || x_cast.flags().row_contiguous);
++  } else {
++    const auto aggregate = dispatch_rejection(true);
++    const auto batched = dispatch_rejection(false);
++    if (aggregate == DispatchRejection::None &&
++        batched == DispatchRejection::None) {
++      rejection = DispatchRejection::None;
++    } else if (
++        aggregate == DispatchRejection::M ||
++        batched == DispatchRejection::M) {
++      rejection = DispatchRejection::M;
++    } else if (
++        aggregate == DispatchRejection::Batch ||
++        batched == DispatchRejection::Batch) {
++      rejection = DispatchRejection::Batch;
++    } else {
++      rejection = DispatchRejection::Tiles;
++    }
+   }
+-  const bool eval_row_contiguous =
+-      matrix_contiguous ? x_cast.flags().row_contiguous : true;
+-  int M = eval_row_contiguous ? x_cast.size() / w_inner_dims
+-                              : x_cast.shape(-2);
+ 
+-  // The eager baseline selects qmm only above the device-dependent vector
+-  // threshold (never greater than 32). For B == 1 it first selects split-K,
+-  // which delegates to qmm exactly at 512 or more 32x32 output tiles; batched
+-  // inputs route directly to qmm and therefore do not need the tile condition.
+-  if (M < 32) {
+-    throw std::invalid_argument(
+-        "[quantized_matmul_bias] Shape does not select the direct qmm path; "
+-        "use the eager fallback.");
++  switch (rejection) {
++    case DispatchRejection::M:
++      throw std::invalid_argument(
++          "[quantized_matmul_bias] M does not select or fit the direct qmm "
++          "Metal ABI; use the eager fallback.");
++    case DispatchRejection::Batch:
++      throw std::invalid_argument(
++          "[quantized_matmul_bias] Batch count must fit the Metal int ABI; "
++          "use the eager fallback.");
++    case DispatchRejection::Tiles:
++      throw std::invalid_argument(
++          "[quantized_matmul_bias] Shape does not select or fit the direct "
++          "qmm path; use the eager fallback.");
++    case DispatchRejection::None:
++      break;
+   }
+-  int B = x_cast.size() / M / w_inner_dims;
+-  int tile_count = ((M + 31) / 32) * ((w_outer_dims + 31) / 32);
+-  if (B == 1 && tile_count < 512) {
++
++  auto stream = to_stream(s);
++  if (stream.device != Device::gpu || !metal::is_available()) {
+     throw std::invalid_argument(
+-        "[quantized_matmul_bias] Shape does not select the direct qmm path; "
+-        "use the eager fallback.");
++        "[quantized_matmul_bias] The exact fused epilogue is Metal-only.");
+   }
+ 
+   std::vector<array> inputs{
+diff --git a/tests/ops_tests.cpp b/tests/ops_tests.cpp
+index 6e94e96..2c16685 100644
+--- a/tests/ops_tests.cpp
++++ b/tests/ops_tests.cpp
+@@ -3329,6 +3329,237 @@ TEST_CASE("test exact fast primitives reject without Metal") {
+       fast::gelu_tanh_exact(x, Device::gpu), std::invalid_argument);
+ }
+ 
++TEST_CASE("test exact primitives reject oversized Metal ABI domains") {
++  auto huge_axis =
++      broadcast_to(zeros({1, 1, 1, 1}), {1, 65536, 65536, 1});
++  CHECK_THROWS_WITH_AS(
++      fast::group_norm_affine(
++          huge_axis, ones({1}), zeros({1}), 1, 1e-5f, Device::gpu),
++      "[group_norm_affine] Row count and normalized axis size must fit the "
++      "Metal uint32 ABI; use the eager fallback.",
++      std::invalid_argument);
++
++  auto huge_rows =
++      broadcast_to(zeros({1, 1, 1, 1}), {65536, 1, 1, 65536});
++  auto huge_affine = broadcast_to(zeros({1}), {65536});
++  CHECK_THROWS_WITH_AS(
++      fast::group_norm_affine(
++          huge_rows,
++          huge_affine,
++          huge_affine,
++          65536,
++          1e-5f,
++          Device::gpu),
++      "[group_norm_affine] Row count and normalized axis size must fit the "
++      "Metal uint32 ABI; use the eager fallback.",
++      std::invalid_argument);
++
++  auto huge_conv_m =
++      broadcast_to(zeros({1, 1, 1, 16}), {65536, 256, 256, 16});
++  CHECK_THROWS_WITH_AS(
++      conv_general_bias(
++          huge_conv_m,
++          zeros({16, 1, 1, 16}),
++          zeros({16}),
++          {1, 1},
++          {0, 0},
++          {0, 0},
++          {1, 1},
++          {1, 1}),
++      "[conv_general_bias] Implicit GEMM M, N, and K must fit the Metal int "
++      "launch ABI; use the eager fallback.",
++      std::invalid_argument);
++
++  constexpr int HUGE_N = INT_MAX - 15;
++  auto huge_conv_n = broadcast_to(
++      zeros({1, 1, 1, 1}), {HUGE_N, 1, 1, 16});
++  auto huge_conv_bias = broadcast_to(zeros({1}), {HUGE_N});
++  CHECK_THROWS_WITH_AS(
++      conv_general_bias(
++          zeros({1, 1, 1, 16}),
++          huge_conv_n,
++          huge_conv_bias,
++          {1, 1},
++          {0, 0},
++          {0, 0},
++          {1, 1},
++          {1, 1}),
++      "[conv_general_bias] Implicit GEMM M, N, and K must fit the Metal int "
++      "launch ABI; use the eager fallback.",
++      std::invalid_argument);
++
++  auto huge_conv_k = broadcast_to(
++      zeros({1, 1, 1, 1, 1}), {1, 2048, 2048, 33, 16});
++  auto huge_conv_weight = broadcast_to(
++      zeros({1, 1, 1, 1, 1}), {16, 2048, 2048, 33, 16});
++  CHECK_THROWS_WITH_AS(
++      conv_general_bias(
++          huge_conv_k,
++          huge_conv_weight,
++          zeros({16}),
++          {1, 1, 1},
++          {0, 0, 0},
++          {0, 0, 0},
++          {1, 1, 1},
++          {1, 1, 1}),
++      "[conv_general_bias] Implicit GEMM M, N, and K must fit the Metal int "
++      "launch ABI; use the eager fallback.",
++      std::invalid_argument);
++
++  constexpr int K = 128;
++  constexpr int N = 1024;
++  auto packed = zeros({N, K * 4 / 32}, uint32);
++  auto scales = zeros({N, K / 64});
++  auto biases = zeros({N, K / 64});
++  CHECK_THROWS_WITH_AS(
++      quantized_matmul_bias(
++          zeros({65536, 32768, K}),
++          packed,
++          scales,
++          biases,
++          zeros({N}),
++          true,
++          64,
++          4,
++          Device::gpu),
++      "[quantized_matmul_bias] M does not select or fit the direct qmm Metal "
++      "ABI; use the eager fallback.",
++      std::invalid_argument);
++
++  auto huge_batch = broadcast_to(
++      zeros({1, 1, 33, K}), {65536, 65536, 33, K});
++  eval(huge_batch);
++  CHECK_THROWS_WITH_AS(
++      quantized_matmul_bias(
++          huge_batch,
++          packed,
++          scales,
++          biases,
++          zeros({N}),
++          true,
++          64,
++          4,
++          Device::gpu),
++      "[quantized_matmul_bias] Batch count must fit the Metal int ABI; use "
++      "the eager fallback.",
++      std::invalid_argument);
++
++  constexpr int HUGE_TILES = 2'000'000;
++  CHECK_THROWS_WITH_AS(
++      quantized_matmul_bias(
++          zeros({HUGE_TILES, K}),
++          zeros({HUGE_TILES, K * 4 / 32}, uint32),
++          zeros({HUGE_TILES, K / 64}),
++          zeros({HUGE_TILES, K / 64}),
++          zeros({HUGE_TILES}),
++          true,
++          64,
++          4,
++          Device::gpu),
++      "[quantized_matmul_bias] Shape does not select or fit the direct qmm "
++      "path; use the eager fallback.",
++      std::invalid_argument);
++
++  auto huge_qmm_n = broadcast_to(
++      zeros({1, 1}, uint32), {HUGE_N, K * 4 / 32});
++  auto huge_qmm_scales =
++      broadcast_to(zeros({1, 1}), {HUGE_N, K / 64});
++  auto huge_qmm_bias = broadcast_to(zeros({1}), {HUGE_N});
++  CHECK_THROWS_WITH_AS(
++      quantized_matmul_bias(
++          zeros({32, K}),
++          huge_qmm_n,
++          huge_qmm_scales,
++          huge_qmm_scales,
++          huge_qmm_bias,
++          true,
++          64,
++          4,
++          Device::gpu),
++      "[quantized_matmul_bias] N and K must fit the Metal int launch ABI; "
++      "use the eager fallback.",
++      std::invalid_argument);
++
++  constexpr int HUGE_K = INT_MAX - 31;
++  constexpr int HUGE_PACKED_K = HUGE_K / 8;
++  auto huge_qmm_k = broadcast_to(
++      zeros({1, 1}, uint32), {N, HUGE_PACKED_K});
++  auto huge_qmm_k_scales =
++      broadcast_to(zeros({1, 1}), {N, HUGE_K / 32});
++  CHECK_THROWS_WITH_AS(
++      quantized_matmul_bias(
++          broadcast_to(zeros({1, 1}), {32, HUGE_K}),
++          huge_qmm_k,
++          huge_qmm_k_scales,
++          huge_qmm_k_scales,
++          zeros({N}),
++          true,
++          32,
++          4,
++          Device::gpu),
++      "[quantized_matmul_bias] N and K must fit the Metal int launch ABI; "
++      "use the eager fallback.",
++      std::invalid_argument);
++}
++
++TEST_CASE("test exact qmm selector handles provisional view flags") {
++  constexpr int K = 128;
++  constexpr int N = 1024;
++  auto packed = zeros({N, K * 4 / 32}, uint32);
++  auto scales = zeros({N, K / 64});
++  auto biases = zeros({N, K / 64});
++  auto output_bias = zeros({N});
++
++  auto lazy_qmv = broadcast_to(zeros({1, 5, K}), {128, 5, K});
++  CHECK_THROWS_WITH_AS(
++      quantized_matmul_bias(
++          lazy_qmv,
++          packed,
++          scales,
++          biases,
++          output_bias,
++          true,
++          64,
++          4,
++          Device::gpu),
++      "[quantized_matmul_bias] M does not select or fit the direct qmm Metal "
++      "ABI; use the eager fallback.",
++      std::invalid_argument);
++
++  eval(lazy_qmv);
++  CHECK_THROWS_WITH_AS(
++      quantized_matmul_bias(
++          lazy_qmv,
++          packed,
++          scales,
++          biases,
++          output_bias,
++          true,
++          64,
++          4,
++          Device::gpu),
++      "[quantized_matmul_bias] M does not select or fit the direct qmm Metal "
++      "ABI; use the eager fallback.",
++      std::invalid_argument);
++
++  auto casted_qmv = broadcast_to(
++      zeros({1, 5, K}, float16), {128, 5, K});
++  CHECK_THROWS_WITH_AS(
++      quantized_matmul_bias(
++          casted_qmv,
++          packed,
++          scales,
++          biases,
++          output_bias,
++          true,
++          64,
++          4,
++          Device::gpu),
++      "[quantized_matmul_bias] M does not select or fit the direct qmm Metal "
++      "ABI; use the eager fallback.",
++      std::invalid_argument);
++}
++
+ TEST_CASE("test exact quantized matmul output-bias epilogue") {
+   if (!metal::is_available()) {
+     return;
+-- 
+2.50.1 (Apple Git-155)
+
