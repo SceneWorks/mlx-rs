@@ -710,6 +710,7 @@ fn prepare_mlx_c_source() -> PathBuf {
                 "test -f mlx/backend/metal/kernels/exact_activations.metal && grep -Fq 'silu_exact(' mlx/fast.h && grep -Fq 'ExactActivation::eval_gpu' mlx/backend/metal/normalization.cpp",
             ),
         ),
+        ("patches/exact-backend-stubs.patch", true, None),
         (
             "patches/exact-epilogue-dispatcher-tests.patch",
             true,

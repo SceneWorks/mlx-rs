@@ -1,0 +1,43 @@
+From 721124073527a16095cc98e051463d90ca1c6fb7 Mon Sep 17 00:00:00 2001
+From: Michael Trefry <michael@trefry.net>
+Date: Thu, 13 Aug 2026 02:23:47 -0400
+Subject: [PATCH] fix(exact): define non-Metal backend stubs
+
+Signed-off-by: Michael Trefry <michael@trefry.net>
+---
+ mlx/backend/cuda/primitives.cpp   | 5 +++++
+ mlx/backend/no_gpu/primitives.cpp | 2 ++
+ 2 files changed, 7 insertions(+)
+
+diff --git a/mlx/backend/cuda/primitives.cpp b/mlx/backend/cuda/primitives.cpp
+index 94f2607..e7465fa 100644
+--- a/mlx/backend/cuda/primitives.cpp
++++ b/mlx/backend/cuda/primitives.cpp
+@@ -32,6 +32,11 @@ NO_GPU(Cholesky)
+ NO_GPU_MULTI(Eig)
+ NO_GPU_MULTI(Eigh)
+ 
++namespace fast {
++NO_GPU_MULTI(GroupNormAffine)
++NO_GPU_MULTI(ExactActivation)
++} // namespace fast
++
+ namespace distributed {
+ NO_GPU_MULTI(Send)
+ NO_GPU_MULTI(Recv)
+diff --git a/mlx/backend/no_gpu/primitives.cpp b/mlx/backend/no_gpu/primitives.cpp
+index 4819ed2..46b3df6 100644
+--- a/mlx/backend/no_gpu/primitives.cpp
++++ b/mlx/backend/no_gpu/primitives.cpp
+@@ -172,6 +172,8 @@ NO_GPU_MULTI(ScaledDotProductAttentionVJP)
+ NO_GPU_MULTI(ConvertFP8)
+ NO_GPU_MULTI(Quantize)
+ NO_GPU_MULTI(CustomKernel)
++NO_GPU_MULTI(GroupNormAffine)
++NO_GPU_MULTI(ExactActivation)
+ } // namespace fast
+ 
+ namespace distributed {
+-- 
+2.50.1 (Apple Git-155)
+
