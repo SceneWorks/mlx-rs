@@ -1,0 +1,830 @@
+From 05274f1d40493c6fa032520caf7fb1e6a4b3b346 Mon Sep 17 00:00:00 2001
+From: Michael Trefry <michael@trefry.net>
+Date: Wed, 12 Aug 2026 22:53:12 -0400
+Subject: [PATCH] feat(quantization): add exact qmm bias epilogues
+
+Signed-off-by: Michael Trefry <michael@trefry.net>
+
+diff --git a/mlx/backend/cpu/quantized.cpp b/mlx/backend/cpu/quantized.cpp
+index c0f1a3c..60c5112 100644
+--- a/mlx/backend/cpu/quantized.cpp
++++ b/mlx/backend/cpu/quantized.cpp
+@@ -922,6 +922,10 @@ void fp_bs_qmm_dispatch(
+ } // namespace
+ 
+ void QuantizedMatmul::eval_cpu(const std::vector<array>& inputs, array& out) {
++  if (output_bias_) {
++    throw std::runtime_error(
++        "[quantized_matmul_bias] The exact fused epilogue is Metal-only.");
++  }
+   auto& x_pre = inputs[0];
+   auto& w_pre = inputs[1];
+   auto& scales_pre = inputs[2];
+diff --git a/mlx/backend/cuda/quantized/quantized.cpp b/mlx/backend/cuda/quantized/quantized.cpp
+index 2a1a268..ae1de13 100644
+--- a/mlx/backend/cuda/quantized/quantized.cpp
++++ b/mlx/backend/cuda/quantized/quantized.cpp
+@@ -13,6 +13,10 @@
+ namespace mlx::core {
+ 
+ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
++  if (output_bias_) {
++    throw std::runtime_error(
++        "[quantized_matmul_bias] The exact fused epilogue is Metal-only.");
++  }
+   nvtx3::scoped_range r("QuantizedMatmul::eval_gpu");
+   auto& s = stream();
+   auto& encoder = cu::get_command_encoder(s);
+diff --git a/mlx/backend/metal/kernels/quantized.h b/mlx/backend/metal/kernels/quantized.h
+index 345dfc7..79fa8e1 100644
+--- a/mlx/backend/metal/kernels/quantized.h
++++ b/mlx/backend/metal/kernels/quantized.h
+@@ -1189,13 +1189,15 @@ template <
+     const bool aligned_N,
+     const int BM = 32,
+     const int BK = 32,
+-    const int BN = 32>
++    const int BN = 32,
++    const bool has_output_bias = false>
+ METAL_FUNC void qmm_t_impl(
+     const device uint32_t* w,
+     const device T* scales,
+     const device T* biases,
+     const device T* x,
+     device T* y,
++    const device T* output_bias,
+     threadgroup T* Xs,
+     threadgroup T* Ws,
+     const constant int& K,
+@@ -1301,8 +1303,22 @@ METAL_FUNC void qmm_t_impl(
+     }
+   }
+ 
+-  // Store results to device memory
++  // Preserve the eager `quantized_matmul` then `add` rounding contract: first
++  // round the accumulator to T, then add the dense bias in T before storing.
+   threadgroup_barrier(mem_flags::mem_threadgroup);
++  if constexpr (has_output_bias) {
++    const mlx::steel::TransformAdd<T, float> epilogue(1.0f, 1.0f);
++    if (num_els < BM || num_outs < BN) {
++      mma_op.apply_epilogue_safe(
++          output_bias + y_col,
++          0,
++          1,
++          short2(num_outs, num_els),
++          epilogue);
++    } else {
++      mma_op.apply_epilogue(output_bias + y_col, 0, 1, epilogue);
++    }
++  }
+   if (num_els < BM || num_outs < BN) {
+     mma_op.store_result_safe(y, N, short2(num_outs, num_els));
+   } else {
+@@ -1928,6 +1944,81 @@ template <
+       biases,
+       x,
+       y,
++      y,
++      Xs,
++      Ws,
++      K,
++      N,
++      M,
++      K,
++      tid,
++      lid,
++      simd_gid,
++      simd_lid);
++}
++
++template <
++    typename T,
++    const int group_size,
++    const int bits,
++    const bool aligned_N,
++    const bool batched,
++    const int BM = 32,
++    const int BK = 32,
++    const int BN = 32>
++[[kernel]] void affine_qmm_bias_t(
++    const device uint32_t* w [[buffer(0)]],
++    const device T* scales [[buffer(1)]],
++    const device T* biases [[buffer(2)]],
++    const device T* x [[buffer(3)]],
++    const device T* output_bias [[buffer(4)]],
++    device T* y [[buffer(5)]],
++    const constant int& K [[buffer(6)]],
++    const constant int& N [[buffer(7)]],
++    const constant int& M [[buffer(8)]],
++    const constant int& x_batch_ndims [[buffer(9)]],
++    const constant int* x_shape [[buffer(10)]],
++    const constant int64_t* x_strides [[buffer(11)]],
++    const constant int& w_batch_ndims [[buffer(12)]],
++    const constant int* w_shape [[buffer(13)]],
++    const constant int64_t* w_strides [[buffer(14)]],
++    const constant int64_t* s_strides [[buffer(15)]],
++    const constant int64_t* b_strides [[buffer(16)]],
++    uint3 tid [[threadgroup_position_in_grid]],
++    uint lid [[thread_index_in_threadgroup]],
++    uint simd_gid [[simdgroup_index_in_threadgroup]],
++    uint simd_lid [[thread_index_in_simdgroup]]) {
++  (void)lid;
++
++  constexpr int BK_padded = (BK + 16 / sizeof(T));
++  threadgroup T Xs[BM * BK_padded];
++  threadgroup T Ws[BN * BK_padded];
++
++  if (batched) {
++    adjust_matrix_offsets<T>(
++        x,
++        w,
++        scales,
++        biases,
++        y,
++        M * N,
++        x_batch_ndims,
++        x_shape,
++        x_strides,
++        w_batch_ndims,
++        w_shape,
++        w_strides,
++        s_strides,
++        b_strides,
++        tid);
++  }
++  qmm_t_impl<T, group_size, bits, aligned_N, BM, BK, BN, true>(
++      w,
++      scales,
++      biases,
++      x,
++      y,
++      output_bias,
+       Xs,
+       Ws,
+       K,
+@@ -1987,6 +2078,7 @@ template <
+       biases,
+       x,
+       y,
++      y,
+       Xs,
+       Ws,
+       K,
+@@ -2316,6 +2408,7 @@ template <
+       biases,
+       x,
+       y,
++      y,
+       Xs,
+       Ws,
+       K,
+diff --git a/mlx/backend/metal/kernels/quantized.metal b/mlx/backend/metal/kernels/quantized.metal
+index 069482c..ec08e4e 100644
+--- a/mlx/backend/metal/kernels/quantized.metal
++++ b/mlx/backend/metal/kernels/quantized.metal
+@@ -179,4 +179,22 @@
+   instantiate_quantized_groups(6) \
+   instantiate_quantized_groups(8)
+ 
+-instantiate_quantized_all() // clang-format on
++#define instantiate_qmm_bias_type(type, group_size, bits) \
++  instantiate_quantized_aligned_batched(affine_qmm_bias_t, type, group_size, bits, true, 1) \
++  instantiate_quantized_aligned_batched(affine_qmm_bias_t, type, group_size, bits, true, 0) \
++  instantiate_quantized_aligned_batched(affine_qmm_bias_t, type, group_size, bits, false, 1) \
++  instantiate_quantized_aligned_batched(affine_qmm_bias_t, type, group_size, bits, false, 0)
++
++#define instantiate_qmm_bias_group(group_size, bits) \
++  instantiate_qmm_bias_type(float, group_size, bits) \
++  instantiate_qmm_bias_type(float16_t, group_size, bits) \
++  instantiate_qmm_bias_type(bfloat16_t, group_size, bits)
++
++#define instantiate_qmm_bias_bits(bits) \
++  instantiate_qmm_bias_group(32, bits) \
++  instantiate_qmm_bias_group(64, bits) \
++  instantiate_qmm_bias_group(128, bits)
++
++instantiate_quantized_all()
++instantiate_qmm_bias_bits(4)
++instantiate_qmm_bias_bits(8) // clang-format on
+diff --git a/mlx/backend/metal/kernels/quantized_nax.h b/mlx/backend/metal/kernels/quantized_nax.h
+index d50af86..58b0363 100644
+--- a/mlx/backend/metal/kernels/quantized_nax.h
++++ b/mlx/backend/metal/kernels/quantized_nax.h
+@@ -934,13 +934,15 @@ template <
+     const int BK = 64,
+     const int BN = 64,
+     const int WM = 2,
+-    const int WN = 2>
++    const int WN = 2,
++    const bool has_output_bias = false>
+ METAL_FUNC void qmm_t_nax_tgp_impl(
+     const device uint32_t* w,
+     const device T* scales,
+     const device T* biases,
+     const device T* x,
+     device T* y,
++    const device T* output_bias,
+     threadgroup T* Ws,
+     const constant int& K,
+     const constant int& N,
+@@ -1059,6 +1061,18 @@ METAL_FUNC void qmm_t_nax_tgp_impl(
+       // Store results to device memory
+       threadgroup_barrier(mem_flags::mem_threadgroup);
+ 
++      if constexpr (has_output_bias) {
++        NAXTile<T, TM, TN> bias_tile;
++        bias_tile.load_safe(
++            output_bias + y_col + tn, 0, short2(sgp_sn, sgp_sm));
++        STEEL_PRAGMA_UNROLL
++        for (short i = 0; i < decltype(Dtile)::kElemsPerTile; ++i) {
++          const T rounded = static_cast<T>(Dtile.elems()[i]);
++          Dtile.elems()[i] = static_cast<float>(
++              static_cast<T>(rounded + bias_tile.elems()[i]));
++        }
++      }
++
+       if constexpr (kAlignedM.value && kAlignedN.value) {
+         Dtile.store(y + tm * N + tn, N);
+       } else if (kAlignedM.value && sgp_sn == SN) {
+@@ -1248,7 +1262,90 @@ template <
+         tid);
+   }
+   qmm_t_nax_tgp_impl<T, group_size, bits, aligned_N, BM, BK, BN, WM, WN>(
+-      w, scales, biases, x, y, Ws, K, N, M, tid, lid, simd_gid, simd_lid);
++      w, scales, biases, x, y, y, Ws, K, N, M, tid, lid, simd_gid, simd_lid);
++}
++
++template <
++    typename T,
++    const int group_size,
++    const int bits,
++    const bool aligned_N,
++    const bool batched,
++    const int BM = 64,
++    const int BK = 32,
++    const int BN = 64,
++    const int WM = 2,
++    const int WN = 2>
++[[kernel]] void affine_qmm_bias_t_nax(
++    const device uint32_t* w [[buffer(0)]],
++    const device T* scales [[buffer(1)]],
++    const device T* biases [[buffer(2)]],
++    const device T* x [[buffer(3)]],
++    const device T* output_bias [[buffer(4)]],
++    device T* y [[buffer(5)]],
++    const constant int& K [[buffer(6)]],
++    const constant int& N [[buffer(7)]],
++    const constant int& M [[buffer(8)]],
++    const constant int& x_batch_ndims [[buffer(9)]],
++    const constant int* x_shape [[buffer(10)]],
++    const constant int64_t* x_strides [[buffer(11)]],
++    const constant int& w_batch_ndims [[buffer(12)]],
++    const constant int* w_shape [[buffer(13)]],
++    const constant int64_t* w_strides [[buffer(14)]],
++    const constant int64_t* s_strides [[buffer(15)]],
++    const constant int64_t* b_strides [[buffer(16)]],
++    uint3 tid [[threadgroup_position_in_grid]],
++    uint lid [[thread_index_in_threadgroup]],
++    uint simd_gid [[simdgroup_index_in_threadgroup]],
++    uint simd_lid [[thread_index_in_simdgroup]]) {
++  (void)lid;
++
++  constexpr int BK_padded = (BK + 16 / sizeof(T));
++  threadgroup T Ws[BN * BK_padded];
++
++  if (batched) {
++    adjust_matrix_offsets<T>(
++        x,
++        w,
++        scales,
++        biases,
++        y,
++        M * N,
++        x_batch_ndims,
++        x_shape,
++        x_strides,
++        w_batch_ndims,
++        w_shape,
++        w_strides,
++        s_strides,
++        b_strides,
++        tid);
++  }
++  qmm_t_nax_tgp_impl<
++      T,
++      group_size,
++      bits,
++      aligned_N,
++      BM,
++      BK,
++      BN,
++      WM,
++      WN,
++      true>(
++      w,
++      scales,
++      biases,
++      x,
++      y,
++      output_bias,
++      Ws,
++      K,
++      N,
++      M,
++      tid,
++      lid,
++      simd_gid,
++      simd_lid);
+ }
+ 
+ template <
+@@ -1377,7 +1474,7 @@ template <
+       b_strides,
+       tid);
+   qmm_t_nax_tgp_impl<T, group_size, bits, aligned_N, BM, BK, BN, WM, WN>(
+-      w, scales, biases, x, y, Ws, K, N, M, tid, lid, simd_gid, simd_lid);
++      w, scales, biases, x, y, y, Ws, K, N, M, tid, lid, simd_gid, simd_lid);
+ }
+ 
+ template <
+@@ -1678,4 +1775,4 @@ template <
+       });
+     });
+   }
+-}
+\ No newline at end of file
++}
+diff --git a/mlx/backend/metal/kernels/quantized_nax.metal b/mlx/backend/metal/kernels/quantized_nax.metal
+index 5a9c9fb..31eaa12 100644
+--- a/mlx/backend/metal/kernels/quantized_nax.metal
++++ b/mlx/backend/metal/kernels/quantized_nax.metal
+@@ -103,4 +103,22 @@
+   instantiate_quantized_groups(6) \
+   instantiate_quantized_groups(8)
+ 
+-instantiate_quantized_all() // clang-format on
++#define instantiate_qmm_bias_type(type, group_size, bits) \
++  instantiate_quantized_aligned_batched(affine_qmm_bias_t_nax, type, group_size, bits, 64, 64, 64, 2, 2, true, 1) \
++  instantiate_quantized_aligned_batched(affine_qmm_bias_t_nax, type, group_size, bits, 64, 64, 64, 2, 2, true, 0) \
++  instantiate_quantized_aligned_batched(affine_qmm_bias_t_nax, type, group_size, bits, 64, 64, 64, 2, 2, false, 1) \
++  instantiate_quantized_aligned_batched(affine_qmm_bias_t_nax, type, group_size, bits, 64, 64, 64, 2, 2, false, 0)
++
++#define instantiate_qmm_bias_group(group_size, bits) \
++  instantiate_qmm_bias_type(float, group_size, bits) \
++  instantiate_qmm_bias_type(float16_t, group_size, bits) \
++  instantiate_qmm_bias_type(bfloat16_t, group_size, bits)
++
++#define instantiate_qmm_bias_bits(bits) \
++  instantiate_qmm_bias_group(32, bits) \
++  instantiate_qmm_bias_group(64, bits) \
++  instantiate_qmm_bias_group(128, bits)
++
++instantiate_quantized_all()
++instantiate_qmm_bias_bits(4)
++instantiate_qmm_bias_bits(8) // clang-format on
+diff --git a/mlx/backend/metal/quantized.cpp b/mlx/backend/metal/quantized.cpp
+index 62d4871..bec5143 100644
+--- a/mlx/backend/metal/quantized.cpp
++++ b/mlx/backend/metal/quantized.cpp
+@@ -574,7 +574,8 @@ void qmm_nax(
+     int K,
+     metal::Device& d,
+     const Stream& s,
+-    const std::string& mode) {
++    const std::string& mode,
++    const std::optional<array>& output_bias) {
+   int B = out.size() / M / N;
+ 
+   int wm = 2;
+@@ -592,7 +593,8 @@ void qmm_nax(
+   std::string type_string = get_type_string(x.dtype());
+   concatenate(
+       kname,
+-      mode + (transpose ? "_qmm_t_nax_" : "_qmm_n_nax_"),
++      mode + (output_bias ? "_qmm_bias_t_nax_"
++                          : (transpose ? "_qmm_t_nax_" : "_qmm_n_nax_")),
+       type_string,
+       "_gs_",
+       group_size,
+@@ -616,7 +618,7 @@ void qmm_nax(
+     kernel = get_qmm_nax_kernel_wrapped(
+         d,
+         kname,
+-        "qmm_t_nax",
++        output_bias ? "qmm_bias_t_nax" : "qmm_t_nax",
+         mode,
+         type_string,
+         group_size,
+@@ -654,6 +656,9 @@ void qmm_nax(
+     compute_encoder.set_input_array(*biases, c++);
+   }
+   compute_encoder.set_input_array(x, c++);
++  if (output_bias) {
++    compute_encoder.set_input_array(*output_bias, c++);
++  }
+   compute_encoder.set_output_array(out, c++);
+   compute_encoder.set_bytes(K, c++);
+   compute_encoder.set_bytes(N, c++);
+@@ -783,7 +788,8 @@ void qmm(
+     int K,
+     metal::Device& d,
+     const Stream& s,
+-    const std::string& mode) {
++    const std::string& mode,
++    const std::optional<array>& output_bias = std::nullopt) {
+   if (metal::is_nax_available() && transpose && (K % 64 == 0) &&
+       (env::enable_tf32() || x.dtype() != float32)) {
+     return qmm_nax(
+@@ -800,7 +806,8 @@ void qmm(
+         /* int K = */ K,
+         /* metal::Device& d = */ d,
+         /* const Stream& s = */ s,
+-        /* const std::string& mode = */ mode);
++        /* const std::string& mode = */ mode,
++        /* const std::optional<array>& output_bias = */ output_bias);
+   }
+ 
+   int B = out.size() / M / N;
+@@ -819,7 +826,8 @@ void qmm(
+   std::string type_string = get_type_string(x.dtype());
+   concatenate(
+       kname,
+-      mode + (transpose ? "_qmm_t_" : "_qmm_n_"),
++      mode + (output_bias ? "_qmm_bias_t_"
++                          : (transpose ? "_qmm_t_" : "_qmm_n_")),
+       type_string,
+       "_gs_",
+       group_size,
+@@ -833,7 +841,7 @@ void qmm(
+     kernel = get_quantized_kernel_wrapped(
+         d,
+         kname,
+-        "qmm_t",
++        output_bias ? "qmm_bias_t" : "qmm_t",
+         mode,
+         type_string,
+         group_size,
+@@ -854,6 +862,9 @@ void qmm(
+     compute_encoder.set_input_array(*biases, c++);
+   }
+   compute_encoder.set_input_array(x, c++);
++  if (output_bias) {
++    compute_encoder.set_input_array(*output_bias, c++);
++  }
+   compute_encoder.set_output_array(out, c++);
+   compute_encoder.set_bytes(K, c++);
+   compute_encoder.set_bytes(N, c++);
+@@ -1495,9 +1506,13 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
+   array w = ensure_row_contiguous_matrix(inputs[1], d, s);
+   array scales = ensure_row_contiguous_matrix(inputs[2], d, s);
+   std::optional<array> biases = std::nullopt;
+-  if (inputs.size() == 4) {
++  if (mode_ == QuantizationMode::Affine) {
+     biases = ensure_row_contiguous_matrix(inputs[3], d, s);
+   }
++  std::optional<array> output_bias = std::nullopt;
++  if (output_bias_) {
++    output_bias = ensure_row_contiguous(inputs[4], d, s);
++  }
+ 
+   // Extract the matmul shapes
+   bool non_batched = w.ndim() == 2 && x.flags().row_contiguous;
+@@ -1505,6 +1520,25 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
+   int M = non_batched ? x.size() / K : x.shape(-2);
+   int N = out.shape(-1);
+ 
++  if (output_bias_) {
++    qmm(x,
++        w,
++        scales,
++        biases,
++        out,
++        true,
++        group_size_,
++        bits_,
++        M,
++        N,
++        K,
++        d,
++        s,
++        "affine",
++        output_bias);
++    return;
++  }
++
+   int vector_limit = transpose_ ? get_qmv_batch_limit(K, N, d) : 4;
+   auto mode = quantization_mode_to_string(mode_);
+   // It is a matrix matrix product.
+diff --git a/mlx/ops.cpp b/mlx/ops.cpp
+index 849b808..52a4cb5 100644
+--- a/mlx/ops.cpp
++++ b/mlx/ops.cpp
+@@ -4677,6 +4677,98 @@ array quantized_matmul(
+       std::move(inputs));
+ }
+ 
++array quantized_matmul_bias(
++    array x,
++    array w,
++    array scales,
++    array biases,
++    array output_bias,
++    bool transpose /* = true */,
++    std::optional<int> group_size_ /* = std::nullopt */,
++    std::optional<int> bits_ /* = std::nullopt */,
++    StreamOrDevice s /* = {} */) {
++  constexpr std::string_view tag = "quantized_matmul_bias";
++  auto stream = to_stream(s);
++  if (stream.device != Device::gpu || !metal::is_available()) {
++    throw std::invalid_argument(
++        "[quantized_matmul_bias] The exact fused epilogue is Metal-only.");
++  }
++  if (!transpose) {
++    throw std::invalid_argument(
++        "[quantized_matmul_bias] Only transpose=true is supported.");
++  }
++  if (w.ndim() != 2) {
++    throw std::invalid_argument(
++        "[quantized_matmul_bias] The quantized weight must be 2D.");
++  }
++
++  auto [dtype, qmode] = validate_mode_with_type(
++      tag, scales, std::optional<array>(biases), std::nullopt, "affine");
++  auto [group_size, bits] =
++      quantization_params_from_mode(qmode, group_size_, bits_);
++  if ((bits != 4 && bits != 8) ||
++      (group_size != 32 && group_size != 64 && group_size != 128)) {
++    throw std::invalid_argument(
++        "[quantized_matmul_bias] Only Q4/Q8 with group size 32, 64, or 128 "
++        "is supported.");
++  }
++
++  auto [w_inner_dims, w_outer_dims] = extract_quantized_matmul_dims(
++      tag,
++      x,
++      w,
++      scales,
++      std::optional<array>(biases),
++      true,
++      group_size,
++      bits);
++  dtype = promote_types(x.dtype(), dtype);
++  if (!issubdtype(dtype, floating)) {
++    throw std::invalid_argument(
++        "[quantized_matmul_bias] Only real floating types are supported.");
++  }
++  if (output_bias.ndim() != 1 || output_bias.shape(0) != w_outer_dims) {
++    std::ostringstream msg;
++    msg << "[quantized_matmul_bias] Output bias must have shape ("
++        << w_outer_dims << ") but got " << output_bias.shape() << ".";
++    throw std::invalid_argument(msg.str());
++  }
++  if (output_bias.dtype() != dtype) {
++    std::ostringstream msg;
++    msg << "[quantized_matmul_bias] Output bias dtype must equal the qmm "
++        << "output dtype " << dtype << " but got " << output_bias.dtype()
++        << ".";
++    throw std::invalid_argument(msg.str());
++  }
++
++  // The eager baseline selects qmm only above the device-dependent vector
++  // threshold (never greater than 32), and its split-K path delegates to qmm
++  // exactly when there are at least 512 32x32 output tiles.  Requiring both
++  // conditions keeps the fused and eager qmm algorithms identical.
++  int M = x.size() / w_inner_dims;
++  int tile_count = ((M + 31) / 32) * ((w_outer_dims + 31) / 32);
++  if (M < 32 || tile_count < 512) {
++    throw std::invalid_argument(
++        "[quantized_matmul_bias] Shape does not select the direct qmm path; "
++        "use the eager fallback.");
++  }
++
++  std::vector<array> inputs{
++      astype(x, dtype),
++      std::move(w),
++      astype(scales, dtype),
++      astype(biases, dtype),
++      std::move(output_bias)};
++  auto out_shape = inputs[0].shape();
++  out_shape.back() = w_outer_dims;
++  return array(
++      std::move(out_shape),
++      dtype,
++      std::make_shared<QuantizedMatmul>(
++          stream, group_size, bits, qmode, true, true),
++      std::move(inputs));
++}
++
+ void validate_qqmm_inputs(
+     array x,
+     array w,
+diff --git a/mlx/ops.h b/mlx/ops.h
+index ed617c3..418e1b0 100644
+--- a/mlx/ops.h
++++ b/mlx/ops.h
+@@ -1556,6 +1556,23 @@ MLX_API array quantized_matmul(
+     const std::string& mode = "affine",
+     StreamOrDevice s = {});
+ 
++/** Affine Q4/Q8 quantized matmul with an exact dense output-bias epilogue.
++ *
++ * This operation intentionally admits only shapes that use the direct Metal
++ * qmm path. Callers must fall back to `add(quantized_matmul(...), output_bias)`
++ * when validation rejects a shape or device.
++ */
++MLX_API array quantized_matmul_bias(
++    array x,
++    array w,
++    array scales,
++    array biases,
++    array output_bias,
++    bool transpose = true,
++    std::optional<int> group_size = std::nullopt,
++    std::optional<int> bits = std::nullopt,
++    StreamOrDevice s = {});
++
+ /** Quantize a matrix along its last axis */
+ MLX_API std::vector<array> quantize(
+     const array& w,
+diff --git a/mlx/primitives.cpp b/mlx/primitives.cpp
+index 6ac88ee..491ee1c 100644
+--- a/mlx/primitives.cpp
++++ b/mlx/primitives.cpp
+@@ -3503,6 +3503,12 @@ std::vector<array> QuantizedMatmul::vjp(
+   // We rely on the fact that w is always 2D so transpose is simple
+   std::optional<array> dsb = std::nullopt;
+   for (auto arg : argnums) {
++    if (output_bias_ && arg == 4) {
++      std::vector<int> axes(cotangents[0].ndim() - 1);
++      std::iota(axes.begin(), axes.end(), 0);
++      vjps.push_back(sum(cotangents[0], axes, false, stream()));
++      continue;
++    }
+     // gradient wrt to x
+     if (arg == 0) {
+       vjps.push_back(quantized_matmul(
+@@ -3565,27 +3571,40 @@ std::vector<array> QuantizedMatmul::jvp(
+     const std::vector<array>& primals,
+     const std::vector<array>& tangents,
+     const std::vector<int>& argnums) {
+-  if (argnums.size() > 1 || argnums[0] != 0) {
+-    throw std::runtime_error(
+-        "[QuantizedMatmul::jvp] No JVP wrt the quantized matrix yet.");
+-  }
+-  return {quantized_matmul(
+-      tangents[0],
+-      primals[1],
+-      primals[2],
+-      mode_ == QuantizationMode::Affine ? std::optional<array>(primals[3])
+-                                        : std::nullopt,
+-      transpose_,
+-      group_size_,
+-      bits_,
+-      quantization_mode_to_string(mode_),
+-      stream())};
++  std::optional<array> result;
++  for (size_t i = 0; i < argnums.size(); ++i) {
++    array tangent = tangents[i];
++    if (argnums[i] == 0) {
++      tangent = quantized_matmul(
++          tangent,
++          primals[1],
++          primals[2],
++          mode_ == QuantizationMode::Affine
++              ? std::optional<array>(primals[3])
++              : std::nullopt,
++          transpose_,
++          group_size_,
++          bits_,
++          quantization_mode_to_string(mode_),
++          stream());
++    } else if (output_bias_ && argnums[i] == 4) {
++      auto shape = primals[0].shape();
++      shape.back() = primals[1].shape(-2);
++      tangent = broadcast_to(tangent, shape, stream());
++    } else {
++      throw std::runtime_error(
++          "[QuantizedMatmul::jvp] No JVP wrt the quantized matrix yet.");
++    }
++    result = result ? add(*result, tangent, stream()) : tangent;
++  }
++  return {*result};
+ }
+ 
+ bool QuantizedMatmul::is_equivalent(const Primitive& other) const {
+   const QuantizedMatmul& qm_other = static_cast<const QuantizedMatmul&>(other);
+   return group_size_ == qm_other.group_size_ && bits_ == qm_other.bits_ &&
+-      mode_ == qm_other.mode_ && transpose_ == qm_other.transpose_;
++      mode_ == qm_other.mode_ && transpose_ == qm_other.transpose_ &&
++      output_bias_ == qm_other.output_bias_;
+ }
+ 
+ std::vector<Shape> QuantizedMatmul::output_shapes(
+diff --git a/mlx/primitives.h b/mlx/primitives.h
+index 5b8517c..0c65e58 100644
+--- a/mlx/primitives.h
++++ b/mlx/primitives.h
+@@ -1620,12 +1620,14 @@ class QuantizedMatmul : public UnaryPrimitive {
+       int group_size,
+       int bits,
+       QuantizationMode mode,
+-      bool transpose)
++      bool transpose,
++      bool output_bias = false)
+       : UnaryPrimitive(stream),
+         group_size_(group_size),
+         bits_(bits),
+         mode_(mode),
+-        transpose_(transpose) {}
++        transpose_(transpose),
++        output_bias_(output_bias) {}
+ 
+   void eval_cpu(const std::vector<array>& inputs, array& out) override;
+   void eval_gpu(const std::vector<array>& inputs, array& out) override;
+@@ -1636,7 +1638,8 @@ class QuantizedMatmul : public UnaryPrimitive {
+   bool is_equivalent(const Primitive& other) const override;
+   std::vector<Shape> output_shapes(const std::vector<array>& inputs) override;
+   auto state() const {
+-    return std::make_tuple(group_size_, bits_, mode_, transpose_);
++    return std::make_tuple(
++        group_size_, bits_, mode_, transpose_, output_bias_);
+   }
+ 
+  private:
+@@ -1644,6 +1647,7 @@ class QuantizedMatmul : public UnaryPrimitive {
+   int bits_;
+   QuantizationMode mode_;
+   bool transpose_;
++  bool output_bias_;
+ };
+ 
+ class QQMatmul : public UnaryPrimitive {
+diff --git a/tests/ops_tests.cpp b/tests/ops_tests.cpp
+index 987ee4d..0b99e25 100644
+--- a/tests/ops_tests.cpp
++++ b/tests/ops_tests.cpp
+@@ -3312,6 +3312,64 @@ TEST_CASE("test quantize dequantize") {
+   }
+ }
+ 
++TEST_CASE("test exact quantized matmul output-bias epilogue") {
++  if (!is_available(Device::gpu)) {
++    return;
++  }
++
++  constexpr int M = 512;
++  constexpr int N = 1024;
++  constexpr int K = 128;
++  auto input_f32 = reshape(sin(arange(0, M * K, float32) * 0.003f), {M, K});
++  auto weight_f32 =
++      reshape(cos(arange(0, N * K, float32) * 0.002f), {N, K});
++  auto output_bias_f32 = sin(arange(0, N, float32) * 0.01f);
++
++  for (auto dtype : {float32, float16, bfloat16}) {
++    auto input = astype(input_f32, dtype);
++    auto weight = astype(weight_f32, dtype);
++    auto output_bias = astype(output_bias_f32, dtype);
++    for (int bits : {4, 8}) {
++      for (int group_size : {32, 64, 128}) {
++        auto quantized = quantize(weight, group_size, bits);
++        auto eager = add(
++            quantized_matmul(
++                input,
++                quantized[0],
++                quantized[1],
++                quantized[2],
++                true,
++                group_size,
++                bits),
++            output_bias);
++        auto fused = quantized_matmul_bias(
++            input,
++            quantized[0],
++            quantized[1],
++            quantized[2],
++            output_bias,
++            true,
++            group_size,
++            bits);
++        CHECK(array_equal(eager, fused).item<bool>());
++      }
++    }
++  }
++
++  auto quantized = quantize(weight_f32, 64, 4);
++  CHECK_THROWS_AS(
++      quantized_matmul_bias(
++          zeros({16, K}),
++          quantized[0],
++          quantized[1],
++          quantized[2],
++          output_bias_f32,
++          true,
++          64,
++          4),
++      std::invalid_argument);
++}
++
+ TEST_CASE("test repeat") {
+   auto data = array({13, 3, 16, 6, 14, 4, 15, 5, 11, 1, 12, 2}, {3, 2, 2});
+   auto repeat_axis_0 = repeat(data, 2, 0);

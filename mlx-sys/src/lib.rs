@@ -14,4 +14,16 @@ extern "C" {
         token: *mut ::std::os::raw::c_void,
         fun_id: usize,
     ) -> ::std::os::raw::c_int;
+    pub fn mlx_pmetal_quantized_matmul_bias(
+        res: *mut mlx_array,
+        x: mlx_array,
+        w: mlx_array,
+        scales: mlx_array,
+        biases: mlx_array,
+        output_bias: mlx_array,
+        transpose: bool,
+        group_size: mlx_optional_int,
+        bits: mlx_optional_int,
+        stream: mlx_stream,
+    ) -> ::std::os::raw::c_int;
 }

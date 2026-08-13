@@ -443,6 +443,25 @@ fn prepare_mlx_c_source() -> PathBuf {
     );
     println!("cargo:rerun-if-changed=patches/compile-cache-initialize.patch");
 
+    // sc-18318: expose the pmetal-only exact Q4/Q8 qmm+dense-bias operation
+    // added by exact-qmm-bias.patch. Bindgen continues to read the pristine
+    // pinned submodule; mlx-sys declares the extension manually.
+    let qmm_bias_c_patch = std::fs::canonicalize("patches/exact-qmm-bias-c.patch")
+        .expect("find exact-qmm-bias-c.patch");
+    let status = Command::new("patch")
+        .arg("-p1")
+        .arg("-d")
+        .arg(&staged)
+        .arg("-i")
+        .arg(&qmm_bias_c_patch)
+        .status()
+        .expect("Failed to run `patch` for exact-qmm-bias-c.patch");
+    assert!(
+        status.success(),
+        "exact-qmm-bias-c.patch failed to apply to staged mlx-c (sc-18318)"
+    );
+    println!("cargo:rerun-if-changed=patches/exact-qmm-bias-c.patch");
+
     // Copy our patch files into the staged source. FetchContent allows only one
     // PATCH_COMMAND, so build.rs generates apply_patches.sh (below) which applies
     // each MLX source patch individually and idempotently.
@@ -602,6 +621,7 @@ fn prepare_mlx_c_source() -> PathBuf {
         ("patches/thread-safe-eval.patch", true),
         ("patches/apple-metal-sdk.patch", true),
         ("patches/apple-cpu-no-jit.patch", true),
+        ("patches/exact-qmm-bias.patch", true),
     ];
     // sc-12780 idempotency guard: CMake FetchContent may re-run PATCH_COMMAND against an
     // mlx-src that is ALREADY patched (e.g. an incremental rebuild that does not re-fetch).
