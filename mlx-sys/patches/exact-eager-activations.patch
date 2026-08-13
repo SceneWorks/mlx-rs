@@ -1,0 +1,346 @@
+From fbc93b64b11380b02cd5742f2f830ddc0fe099d3 Mon Sep 17 00:00:00 2001
+From: Michael Trefry <michael@trefry.net>
+Date: Wed, 12 Aug 2026 23:38:18 -0400
+Subject: [PATCH] feat(fast): add exact eager activation fusions
+
+Signed-off-by: Michael Trefry <michael@trefry.net>
+---
+ mlx/backend/metal/kernels/CMakeLists.txt      |  1 +
+ .../metal/kernels/exact_activations.metal     | 55 ++++++++++++++
+ mlx/backend/metal/normalization.cpp           | 37 ++++++++++
+ mlx/fast.cpp                                  | 72 +++++++++++++++++++
+ mlx/fast.h                                    |  6 ++
+ mlx/fast_primitives.h                         | 32 +++++++++
+ tests/gpu_tests.cpp                           | 54 ++++++++++++++
+ 7 files changed, 257 insertions(+)
+ create mode 100644 mlx/backend/metal/kernels/exact_activations.metal
+
+diff --git a/mlx/backend/metal/kernels/CMakeLists.txt b/mlx/backend/metal/kernels/CMakeLists.txt
+index 1194ea1..68f8494 100644
+--- a/mlx/backend/metal/kernels/CMakeLists.txt
++++ b/mlx/backend/metal/kernels/CMakeLists.txt
+@@ -48,6 +48,7 @@ endfunction(build_kernel)
+ 
+ build_kernel(arg_reduce)
+ build_kernel(conv steel/conv/params.h)
++build_kernel(exact_activations)
+ build_kernel(group_norm)
+ build_kernel(layer_norm)
+ build_kernel(random)
+diff --git a/mlx/backend/metal/kernels/exact_activations.metal b/mlx/backend/metal/kernels/exact_activations.metal
+new file mode 100644
+index 0000000..677178c
+--- /dev/null
++++ b/mlx/backend/metal/kernels/exact_activations.metal
+@@ -0,0 +1,55 @@
++// Copyright © 2026 Apple Inc.
++
++#include <metal_math>
++
++#include "mlx/backend/metal/kernels/utils.h"
++
++using namespace metal;
++
++template <typename T>
++[[kernel]] void silu_exact_eager(
++    const device T* x,
++    device T* out,
++    uint elem [[thread_position_in_grid]]) {
++  const T value = x[elem];
++
++  // Byte-for-byte the MLX Sigmoid unary functor, with an explicit T result to
++  // preserve the eager sigmoid output before the following multiply.
++  const T y = 1 / (1 + metal::exp(metal::abs(value)));
++  const T sigmoid_value = (value < 0) ? y : 1 - y;
++  out[elem] = static_cast<T>(value * sigmoid_value);
++}
++
++template <typename T>
++[[kernel]] void gelu_tanh_exact_eager(
++    const device T* x,
++    device T* out,
++    uint elem [[thread_position_in_grid]]) {
++  const T value = x[elem];
++
++  // Mirror mlx-gen's eager GELU graph and round to T after every core op:
++  // power, multiply, add, multiply, tanh, add, multiply, multiply.
++  const T c044715 = static_cast<T>(0.044715f);
++  const T c_sqrt_2_over_pi = static_cast<T>(0.7978845834732056f);
++  const T one = static_cast<T>(1.0f);
++  const T c_half = static_cast<T>(0.5f);
++
++  const T x3 = static_cast<T>(metal::pow(value, static_cast<T>(3)));
++  const T cubic = static_cast<T>(x3 * c044715);
++  const T shifted = static_cast<T>(value + cubic);
++  const T inner = static_cast<T>(shifted * c_sqrt_2_over_pi);
++  const T tanh_value = static_cast<T>(metal::precise::tanh(inner));
++  const T gate = static_cast<T>(tanh_value + one);
++  const T half_x = static_cast<T>(value * c_half);
++  out[elem] = static_cast<T>(half_x * gate);
++}
++
++// clang-format off
++#define instantiate_exact_activations(name, itype)                              \
++  instantiate_kernel("silu_exact_eager" #name, silu_exact_eager, itype)        \
++  instantiate_kernel(                                                          \
++      "gelu_tanh_exact_eager" #name, gelu_tanh_exact_eager, itype)
++
++instantiate_exact_activations(float32, float)
++instantiate_exact_activations(float16, half)
++instantiate_exact_activations(bfloat16, bfloat16_t) // clang-format on
+diff --git a/mlx/backend/metal/normalization.cpp b/mlx/backend/metal/normalization.cpp
+index 3776375..462a6a5 100644
+--- a/mlx/backend/metal/normalization.cpp
++++ b/mlx/backend/metal/normalization.cpp
+@@ -375,6 +375,43 @@ void GroupNormAffine::eval_gpu(
+   compute_encoder.dispatch_threads(grid_dims, group_dims);
+ }
+ 
++void ExactActivation::eval_gpu(
++    const std::vector<array>& inputs,
++    std::vector<array>& outputs) {
++  auto& s = stream();
++  auto& d = metal::device(s.device);
++  auto& out = outputs[0];
++
++  const auto& input = inputs[0];
++  const bool no_copy =
++      input.flags().contiguous && input.size() == input.data_size();
++  const array x = no_copy ? input : contiguous_copy_gpu(input, s);
++  if (x.is_donatable()) {
++    out.copy_shared_buffer(x);
++  } else {
++    out.set_data(
++        allocator::malloc(x.data_size() * x.itemsize()),
++        x.data_size(),
++        x.strides(),
++        x.flags());
++  }
++
++  std::string op_name = kind_ == ExactActivationKind::SiLU
++      ? "silu_exact_eager"
++      : "gelu_tanh_exact_eager";
++  op_name += type_to_name(out);
++  auto kernel = d.get_kernel(op_name);
++
++  auto threadgroup_size =
++      std::min(x.size(), kernel->maxTotalThreadsPerThreadgroup());
++  auto& compute_encoder = metal::get_command_encoder(s);
++  compute_encoder.set_compute_pipeline_state(kernel);
++  compute_encoder.set_input_array(x, 0);
++  compute_encoder.set_output_array(out, 1);
++  compute_encoder.dispatch_threads(
++      MTL::Size(x.size(), 1, 1), MTL::Size(threadgroup_size, 1, 1));
++}
++
+ void LayerNormVJP::eval_gpu(
+     const std::vector<array>& inputs,
+     std::vector<array>& outputs) {
+diff --git a/mlx/fast.cpp b/mlx/fast.cpp
+index 6bf91b1..d8e7427 100644
+--- a/mlx/fast.cpp
++++ b/mlx/fast.cpp
+@@ -444,6 +444,78 @@ bool GroupNormAffine::is_equivalent(const Primitive& other) const {
+   return num_groups_ == a_other.num_groups_ && eps_ == a_other.eps_;
+ }
+ 
++namespace {
++
++void validate_exact_activation(const array& x, Stream s, std::string_view tag) {
++  if (x.size() == 0) {
++    std::ostringstream msg;
++    msg << "[" << tag << "] Empty inputs must use the eager fallback.";
++    throw std::invalid_argument(msg.str());
++  }
++  if (x.size() > UINT32_MAX) {
++    std::ostringstream msg;
++    msg << "[" << tag
++        << "] Inputs larger than UINT32_MAX must use the eager fallback.";
++    throw std::invalid_argument(msg.str());
++  }
++  if (x.dtype() != float32 && x.dtype() != float16 && x.dtype() != bfloat16) {
++    std::ostringstream msg;
++    msg << "[" << tag
++        << "] Input must have float32, float16, or bfloat16 dtype.";
++    throw std::invalid_argument(msg.str());
++  }
++  if (s.device != Device::gpu) {
++    std::ostringstream msg;
++    msg << "[" << tag << "] The exact fused activation is Metal-only.";
++    throw std::invalid_argument(msg.str());
++  }
++}
++
++} // namespace
++
++array silu_exact(const array& x, StreamOrDevice s_ /* = {} */) {
++  auto s = to_stream(s_);
++  validate_exact_activation(x, s, "silu_exact");
++  auto fallback = [s](const std::vector<array>& inputs) {
++    return std::vector<array>{multiply(inputs[0], sigmoid(inputs[0], s), s)};
++  };
++  return array(
++      x.shape(),
++      x.dtype(),
++      std::make_shared<ExactActivation>(s, fallback, ExactActivationKind::SiLU),
++      {x});
++}
++
++array gelu_tanh_exact(const array& x, StreamOrDevice s_ /* = {} */) {
++  auto s = to_stream(s_);
++  validate_exact_activation(x, s, "gelu_tanh_exact");
++  auto fallback = [s](const std::vector<array>& inputs) {
++    const auto& x = inputs[0];
++    const auto dtype = x.dtype();
++    // f32(std::sqrt(2.0_f64 / pi)); matches MLX-Python's host-f64 constant.
++    constexpr float c = 0.7978845834732056f;
++    auto x3 = power(x, array(3, dtype), s);
++    auto inner = multiply(
++        add(x, multiply(x3, array(0.044715f, dtype), s), s),
++        array(c, dtype),
++        s);
++    auto gate = add(tanh(inner, s), array(1.0f, dtype), s);
++    return std::vector<array>{
++        multiply(multiply(x, array(0.5f, dtype), s), gate, s)};
++  };
++  return array(
++      x.shape(),
++      x.dtype(),
++      std::make_shared<ExactActivation>(
++          s, fallback, ExactActivationKind::GeluTanh),
++      {x});
++}
++
++bool ExactActivation::is_equivalent(const Primitive& other) const {
++  const ExactActivation& a_other = static_cast<const ExactActivation&>(other);
++  return kind_ == a_other.kind_;
++}
++
+ array rope(
+     std::vector<array> inputs,
+     int dims,
+diff --git a/mlx/fast.h b/mlx/fast.h
+index 7184d18..8698c03 100644
+--- a/mlx/fast.h
++++ b/mlx/fast.h
+@@ -41,6 +41,12 @@ MLX_API array group_norm_affine(
+     float eps,
+     StreamOrDevice s = {});
+ 
++/** Fused Metal SiLU preserving eager ``sigmoid -> multiply`` rounding. */
++MLX_API array silu_exact(const array& x, StreamOrDevice s = {});
++
++/** Fused Metal tanh-GELU preserving every eager elementwise boundary. */
++MLX_API array gelu_tanh_exact(const array& x, StreamOrDevice s = {});
++
+ MLX_API array rope(
+     const array& x,
+     int dims,
+diff --git a/mlx/fast_primitives.h b/mlx/fast_primitives.h
+index 022b2cb..55709a5 100644
+--- a/mlx/fast_primitives.h
++++ b/mlx/fast_primitives.h
+@@ -187,6 +187,38 @@ class GroupNormAffine : public Custom {
+   float eps_;
+ };
+ 
++enum class ExactActivationKind {
++  SiLU,
++  GeluTanh,
++};
++
++class ExactActivation : public Custom {
++ public:
++  ExactActivation(
++      Stream stream,
++      std::function<std::vector<array>(std::vector<array>)> fallback,
++      ExactActivationKind kind)
++      : Custom(stream, std::move(fallback)), kind_(kind) {}
++
++  void eval_cpu(const std::vector<array>& inputs, std::vector<array>& outputs)
++      override {
++    throw std::runtime_error(
++        "[exact_activation] Exact fused activations are Metal-only.");
++  }
++  void eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs)
++      override;
++
++  DEFINE_NAME(ExactActivation)
++  bool is_equivalent(const Primitive& other) const override;
++  DEFINE_INPUT_OUTPUT_SHAPE()
++  auto state() const {
++    return std::make_pair(nullptr, kind_);
++  }
++
++ private:
++  ExactActivationKind kind_;
++};
++
+ class RoPE : public Custom {
+  public:
+   RoPE(
+diff --git a/tests/gpu_tests.cpp b/tests/gpu_tests.cpp
+index 8663b34..f4bec6e 100644
+--- a/tests/gpu_tests.cpp
++++ b/tests/gpu_tests.cpp
+@@ -741,3 +741,57 @@ TEST_CASE("test exact group norm affine epilogue") {
+       "[group_norm_affine] The exact fused epilogue is Metal-only.",
+       std::invalid_argument);
+ }
++
++TEST_CASE("test exact eager activation fusions") {
++  auto eager_silu = [](const array& x) {
++    return multiply(x, sigmoid(x, Device::gpu), Device::gpu);
++  };
++  auto eager_gelu_tanh = [](const array& x) {
++    const auto dtype = x.dtype();
++    constexpr float c = 0.7978845834732056f;
++    auto x3 = power(x, array(3, dtype), Device::gpu);
++    auto inner = multiply(
++        add(x, multiply(x3, array(0.044715f, dtype), Device::gpu), Device::gpu),
++        array(c, dtype),
++        Device::gpu);
++    auto gate = add(tanh(inner, Device::gpu), array(1.0f, dtype), Device::gpu);
++    return multiply(
++        multiply(x, array(0.5f, dtype), Device::gpu), gate, Device::gpu);
++  };
++
++  for (auto dtype : {float32, float16, bfloat16}) {
++    auto x = astype(
++        random::normal({3, 17, 65}, float32, 0.0f, 2.0f, random::key(30)),
++        dtype);
++    CHECK(array_equal(
++              eager_silu(x), fast::silu_exact(x, Device::gpu), Device::cpu)
++              .item<bool>());
++    CHECK(array_equal(
++              eager_gelu_tanh(x),
++              fast::gelu_tanh_exact(x, Device::gpu),
++              Device::cpu)
++              .item<bool>());
++
++    auto noncontiguous = transpose(x, {1, 0, 2});
++    CHECK(array_equal(
++              eager_silu(noncontiguous),
++              fast::silu_exact(noncontiguous, Device::gpu),
++              Device::cpu)
++              .item<bool>());
++    CHECK(array_equal(
++              eager_gelu_tanh(noncontiguous),
++              fast::gelu_tanh_exact(noncontiguous, Device::gpu),
++              Device::cpu)
++              .item<bool>());
++  }
++
++  auto x = array({-2.0f, -0.0f, 0.0f, 2.0f});
++  CHECK_THROWS_WITH_AS(
++      fast::silu_exact(x, Device::cpu),
++      "[silu_exact] The exact fused activation is Metal-only.",
++      std::invalid_argument);
++  CHECK_THROWS_WITH_AS(
++      fast::gelu_tanh_exact(x, Device::cpu),
++      "[gelu_tanh_exact] The exact fused activation is Metal-only.",
++      std::invalid_argument);
++}
+-- 
+2.50.1 (Apple Git-155)
+

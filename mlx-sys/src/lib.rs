@@ -54,4 +54,14 @@ extern "C" {
         eps: f32,
         stream: mlx_stream,
     ) -> ::std::os::raw::c_int;
+    pub fn mlx_pmetal_silu_exact(
+        res: *mut mlx_array,
+        x: mlx_array,
+        stream: mlx_stream,
+    ) -> ::std::os::raw::c_int;
+    pub fn mlx_pmetal_gelu_tanh_exact(
+        res: *mut mlx_array,
+        x: mlx_array,
+        stream: mlx_stream,
+    ) -> ::std::os::raw::c_int;
 }

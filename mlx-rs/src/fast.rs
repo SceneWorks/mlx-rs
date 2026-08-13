@@ -274,6 +274,40 @@ pub fn group_norm_affine_device(
     })
 }
 
+/// Fused Metal SiLU preserving the eager `sigmoid` then multiply rounding
+/// boundary exactly.
+///
+/// This strict operation supports float32, float16, and bfloat16 on Metal. It
+/// returns an error for unsupported inputs so callers can truthfully execute
+/// the eager expression instead.
+#[generate_macro(customize(root = "$crate::fast"))]
+#[default_device]
+pub fn silu_exact_device(
+    x: impl AsRef<Array>,
+    #[optional] stream: impl AsRef<Stream>,
+) -> Result<Array> {
+    Array::try_from_op(|res| unsafe {
+        mlx_sys::mlx_pmetal_silu_exact(res, x.as_ref().as_ptr(), stream.as_ref().as_ptr())
+    })
+}
+
+/// Fused Metal tanh-GELU preserving every eager power/multiply/add/tanh dtype
+/// rounding boundary exactly.
+///
+/// This strict operation supports float32, float16, and bfloat16 on Metal. It
+/// returns an error for unsupported inputs so callers can truthfully execute
+/// the eager expression instead.
+#[generate_macro(customize(root = "$crate::fast"))]
+#[default_device]
+pub fn gelu_tanh_exact_device(
+    x: impl AsRef<Array>,
+    #[optional] stream: impl AsRef<Stream>,
+) -> Result<Array> {
+    Array::try_from_op(|res| unsafe {
+        mlx_sys::mlx_pmetal_gelu_tanh_exact(res, x.as_ref().as_ptr(), stream.as_ref().as_ptr())
+    })
+}
+
 /// A template parameter for a JIT-compiled [`MetalKernel`].
 ///
 /// Template parameters are substituted into the generated kernel at JIT-compile

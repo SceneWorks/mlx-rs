@@ -1,0 +1,75 @@
+From 96a5475eb12ee9f7e2bd96e95bafc5c7b88d1e4a Mon Sep 17 00:00:00 2001
+From: Michael Trefry <michael@trefry.net>
+Date: Wed, 12 Aug 2026 23:38:22 -0400
+Subject: [PATCH] feat(fast): expose exact eager activations
+
+Signed-off-by: Michael Trefry <michael@trefry.net>
+---
+ mlx/c/fast.cpp | 29 +++++++++++++++++++++++++++++
+ mlx/c/fast.h   | 10 ++++++++++
+ 2 files changed, 39 insertions(+)
+
+diff --git a/mlx/c/fast.cpp b/mlx/c/fast.cpp
+index 801107f..c870491 100644
+--- a/mlx/c/fast.cpp
++++ b/mlx/c/fast.cpp
+@@ -301,6 +301,35 @@ extern "C" int mlx_pmetal_group_norm_affine(
+   return 0;
+ }
+ 
++extern "C" int
++mlx_pmetal_silu_exact(mlx_array* res, const mlx_array x, const mlx_stream s) {
++  try {
++    mlx_array_set_(
++        *res,
++        mlx::core::fast::silu_exact(mlx_array_get_(x), mlx_stream_get_(s)));
++  } catch (std::exception& e) {
++    mlx_error(e.what());
++    return 1;
++  }
++  return 0;
++}
++
++extern "C" int mlx_pmetal_gelu_tanh_exact(
++    mlx_array* res,
++    const mlx_array x,
++    const mlx_stream s) {
++  try {
++    mlx_array_set_(
++        *res,
++        mlx::core::fast::gelu_tanh_exact(
++            mlx_array_get_(x), mlx_stream_get_(s)));
++  } catch (std::exception& e) {
++    mlx_error(e.what());
++    return 1;
++  }
++  return 0;
++}
++
+ struct mlx_fast_metal_kernel_config_cpp_ {
+   std::vector<mlx::core::Shape> output_shapes;
+   std::vector<mlx::core::Dtype> output_dtypes;
+diff --git a/mlx/c/fast.h b/mlx/c/fast.h
+index f4d13f9..76ce82e 100644
+--- a/mlx/c/fast.h
++++ b/mlx/c/fast.h
+@@ -107,6 +107,16 @@ int mlx_pmetal_group_norm_affine(
+     float eps,
+     const mlx_stream s);
+ 
++int mlx_pmetal_silu_exact(
++    mlx_array* res,
++    const mlx_array x,
++    const mlx_stream s);
++
++int mlx_pmetal_gelu_tanh_exact(
++    mlx_array* res,
++    const mlx_array x,
++    const mlx_stream s);
++
+ typedef struct mlx_fast_metal_kernel_config_ {
+   void* ctx;
+ } mlx_fast_metal_kernel_config;
+-- 
+2.50.1 (Apple Git-155)
+

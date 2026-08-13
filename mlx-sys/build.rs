@@ -499,6 +499,25 @@ fn prepare_mlx_c_source() -> PathBuf {
     );
     println!("cargo:rerun-if-changed=patches/exact-group-norm-affine-c.patch");
 
+    // sc-18318: expose the exact eager SiLU and tanh-GELU bridges added by
+    // exact-eager-activations.patch.
+    let exact_activations_c_patch =
+        std::fs::canonicalize("patches/exact-eager-activations-c.patch")
+            .expect("find exact-eager-activations-c.patch");
+    let status = Command::new("patch")
+        .arg("-p1")
+        .arg("-d")
+        .arg(&staged)
+        .arg("-i")
+        .arg(&exact_activations_c_patch)
+        .status()
+        .expect("Failed to run `patch` for exact-eager-activations-c.patch");
+    assert!(
+        status.success(),
+        "exact-eager-activations-c.patch failed to apply to staged mlx-c (sc-18318)"
+    );
+    println!("cargo:rerun-if-changed=patches/exact-eager-activations-c.patch");
+
     // Copy our patch files into the staged source. FetchContent allows only one
     // PATCH_COMMAND, so build.rs generates apply_patches.sh (below) which applies
     // each MLX source patch individually and idempotently.
@@ -632,8 +651,12 @@ fn prepare_mlx_c_source() -> PathBuf {
     // still assert 16-bit correctness — now they guard the deployment-target fix.
     let patches_dir = staged.join("patches");
     std::fs::create_dir_all(&patches_dir).expect("Failed to create patches dir");
-    // (basename, required). `required = true` means the build MUST fail if the patch
-    // does not apply; `false` means best-effort (a fully-failing patch is a safe no-op).
+    // (basename, required, applied_probe). `required = true` means the build MUST fail if the
+    // patch does not apply; `false` means best-effort (a fully-failing patch is a safe no-op).
+    // `applied_probe` is reserved for sequential extension patches that overlap files: after a
+    // later patch lands, an earlier patch may no longer reverse-apply even though its complete,
+    // unique surface is present. The probe checks multiple unique artifacts and only skips when
+    // that complete surface is already installed.
     //
     // sc-12746: the MLX source patches are applied INDIVIDUALLY, not concatenated into
     // one `combined.patch`. `git apply` is atomic PER INVOCATION, so a single combined patch
@@ -651,24 +674,50 @@ fn prepare_mlx_c_source() -> PathBuf {
     // instead of producing a binary missing pmetal's metallib resolver or the recoverable-error
     // test hook. See the per-patch notes above and the idempotency guard below.
     let patch_files = [
-        ("patches/metallib-search-path.patch", true),
-        ("patches/command-buffer-recoverable.patch", true),
-        ("patches/pad-copy-int64.patch", true),
-        ("patches/thread-shared-streams.patch", true),
-        ("patches/thread-safe-eval.patch", true),
-        ("patches/apple-metal-sdk.patch", true),
-        ("patches/apple-cpu-no-jit.patch", true),
-        ("patches/exact-qmm-bias.patch", true),
-        ("patches/exact-conv-bias.patch", true),
-        ("patches/exact-group-norm-affine.patch", true),
+        ("patches/metallib-search-path.patch", true, None),
+        ("patches/command-buffer-recoverable.patch", true, None),
+        ("patches/pad-copy-int64.patch", true, None),
+        ("patches/thread-shared-streams.patch", true, None),
+        ("patches/thread-safe-eval.patch", true, None),
+        ("patches/apple-metal-sdk.patch", true, None),
+        ("patches/apple-cpu-no-jit.patch", true, None),
+        (
+            "patches/exact-qmm-bias.patch",
+            true,
+            Some(
+                "grep -Fq 'quantized_matmul_bias(' mlx/ops.h && grep -Fq 'affine_qmm_bias_t' mlx/backend/metal/kernels/quantized.metal && grep -Fq 'affine_qmm_bias_t_nax' mlx/backend/metal/kernels/quantized_nax.metal",
+            ),
+        ),
+        (
+            "patches/exact-conv-bias.patch",
+            true,
+            Some(
+                "grep -Fq 'conv_general_bias(' mlx/ops.h && grep -Fq 'HAS_OUTPUT_BIAS' mlx/backend/metal/kernels/steel/conv/kernels/steel_conv.h && grep -Fq 'HAS_OUTPUT_BIAS' mlx/backend/metal/kernels/steel/conv/kernels/steel_conv_3d.h",
+            ),
+        ),
+        (
+            "patches/exact-group-norm-affine.patch",
+            true,
+            Some(
+                "test -f mlx/backend/metal/kernels/group_norm.metal && grep -Fq 'group_norm_affine(' mlx/fast.h && grep -Fq 'GroupNormAffine::eval_gpu' mlx/backend/metal/normalization.cpp",
+            ),
+        ),
+        (
+            "patches/exact-eager-activations.patch",
+            true,
+            Some(
+                "test -f mlx/backend/metal/kernels/exact_activations.metal && grep -Fq 'silu_exact(' mlx/fast.h && grep -Fq 'ExactActivation::eval_gpu' mlx/backend/metal/normalization.cpp",
+            ),
+        ),
     ];
     // sc-12780 idempotency guard: CMake FetchContent may re-run PATCH_COMMAND against an
     // mlx-src that is ALREADY patched (e.g. an incremental rebuild that does not re-fetch).
     // `git apply` is not idempotent — re-applying an applied patch fails "patch does not apply".
-    // So each patch is guarded: if it reverse-applies cleanly it is already present and we SKIP
-    // (no-op); otherwise we apply it forward. A `required` patch that genuinely cannot apply
-    // (neither already-present nor forward-applicable) aborts the build. This keeps re-runs a
-    // no-op while still hard-failing on a real apply failure — the whole point of required=true.
+    // So each patch is guarded: independent patches use a reverse-apply check; sequential exact
+    // epilogue patches that overlap files use complete-surface probes because a later patch can
+    // invalidate an earlier reverse check. An already-present patch is skipped; otherwise it is
+    // applied forward. A `required` patch that genuinely cannot apply aborts the build. This keeps
+    // re-runs a no-op while still hard-failing on a real apply failure — the point of required=true.
     let mut script = String::from(
         "#!/bin/sh\n\
          # Generated by mlx-sys/build.rs. Apply each MLX source patch individually,\n\
@@ -676,7 +725,7 @@ fn prepare_mlx_c_source() -> PathBuf {
          # live next to this script.\n\
          d=\"$(dirname \"$0\")\"\n",
     );
-    for (pf, required) in patch_files {
+    for (pf, required, applied_probe) in patch_files {
         let name = std::path::Path::new(pf)
             .file_name()
             .unwrap()
@@ -686,8 +735,13 @@ fn prepare_mlx_c_source() -> PathBuf {
         std::fs::copy(pf, patches_dir.join(&name))
             .unwrap_or_else(|e| panic!("Failed to copy {pf}: {e}"));
         if required {
+            let probe = applied_probe
+                .map(|probe| format!("{probe}; then\n  "))
+                .unwrap_or_else(|| {
+                    format!("git apply --reverse --check \"$d/{name}\" 2>/dev/null; then\n  ")
+                });
             script.push_str(&format!(
-                "if git apply --reverse --check \"$d/{name}\" 2>/dev/null; then\n  \
+                "if {probe}\
                  echo \"pmetal: {name} already applied; skipping\" >&2\n\
                  elif git apply \"$d/{name}\"; then\n  :\n\
                  else\n  \
@@ -723,7 +777,7 @@ fn prepare_mlx_c_source() -> PathBuf {
     std::fs::write(&cmake_path, patched).expect("Failed to write patched CMakeLists.txt");
 
     // Tell cargo to rerun if any patch changes
-    for (pf, _required) in patch_files {
+    for (pf, _required, _applied_probe) in patch_files {
         println!("cargo:rerun-if-changed={pf}");
     }
 
