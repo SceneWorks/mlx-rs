@@ -713,14 +713,24 @@ fn prepare_mlx_c_source() -> PathBuf {
         (
             "patches/exact-epilogue-dispatcher-tests.patch",
             true,
-            None,
+            Some(
+                "grep -Fq 'constexpr int ODD_M = 257;' tests/ops_tests.cpp && grep -Fq 'bool noncontiguous = false' tests/ops_tests.cpp",
+            ),
         ),
         (
             "patches/exact-dispatch-and-affine-lifetime.patch",
             true,
-            None,
+            Some(
+                "grep -Fq 'const bool eval_row_contiguous' mlx/ops.cpp && grep -Fq 'if (weight_copied)' mlx/backend/metal/normalization.cpp && grep -Fq 'constexpr int BATCH_M = 33;' tests/ops_tests.cpp",
+            ),
         ),
-        ("patches/exact-qmm-empty-dimensions.patch", true, None),
+        (
+            "patches/exact-qmm-empty-dimensions.patch",
+            true,
+            Some(
+                "grep -Fq 'Empty inner dimensions must use the eager' mlx/ops.cpp && grep -Fq 'zeros({0, K})' tests/ops_tests.cpp",
+            ),
+        ),
     ];
     // sc-12780 idempotency guard: CMake FetchContent may re-run PATCH_COMMAND against an
     // mlx-src that is ALREADY patched (e.g. an incremental rebuild that does not re-fetch).
