@@ -739,6 +739,13 @@ fn prepare_mlx_c_source() -> PathBuf {
                 "grep -Fq 'Input and weight must promote to float32' mlx/ops.cpp && grep -Fq 'Only float32, float16, and bfloat16 are' mlx/ops.cpp && grep -Fq 'zeros({1, 8, 8, 16}, float64)' tests/ops_tests.cpp",
             ),
         ),
+        (
+            "patches/exact-strict-metal-output.patch",
+            true,
+            Some(
+                "test \"$(grep -Fc 's.device != Device::gpu || !metal::is_available()' mlx/fast.cpp)\" -eq 2 && grep -Fq 'Empty weight or output dimensions' mlx/ops.cpp && grep -Fq 'test exact fast primitives reject without Metal' tests/ops_tests.cpp && grep -Fq 'zeros({2, 33, K})' tests/ops_tests.cpp",
+            ),
+        ),
     ];
     // sc-12780 idempotency guard: CMake FetchContent may re-run PATCH_COMMAND against an
     // mlx-src that is ALREADY patched (e.g. an incremental rebuild that does not re-fetch).

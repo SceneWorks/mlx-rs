@@ -1,0 +1,149 @@
+From a03a61a0a91df888a728504f18198789a2ef4136 Mon Sep 17 00:00:00 2001
+From: Michael Trefry <michael@trefry.net>
+Date: Thu, 13 Aug 2026 02:29:58 -0400
+Subject: [PATCH] fix(exact): reject non-Metal and empty-output dispatches
+
+Signed-off-by: Michael Trefry <michael@trefry.net>
+---
+ mlx/fast.cpp        |  5 +++--
+ mlx/ops.cpp         |  6 +++---
+ tests/gpu_tests.cpp |  8 ++++++++
+ tests/ops_tests.cpp | 33 +++++++++++++++++++++++++++++++--
+ 4 files changed, 45 insertions(+), 7 deletions(-)
+
+diff --git a/mlx/fast.cpp b/mlx/fast.cpp
+index d8e7427..abcfc9c 100644
+--- a/mlx/fast.cpp
++++ b/mlx/fast.cpp
+@@ -2,6 +2,7 @@
+ #include <cassert>
+ #include <numeric>
+ 
++#include "mlx/backend/metal/metal.h"
+ #include "mlx/fast.h"
+ #include "mlx/fast_primitives.h"
+ #include "mlx/ops.h"
+@@ -407,7 +408,7 @@ array group_norm_affine(
+   }
+ 
+   auto s = to_stream(s_);
+-  if (s.device != Device::gpu) {
++  if (s.device != Device::gpu || !metal::is_available()) {
+     throw std::invalid_argument(
+         "[group_norm_affine] The exact fused epilogue is Metal-only.");
+   }
+@@ -464,7 +465,7 @@ void validate_exact_activation(const array& x, Stream s, std::string_view tag) {
+         << "] Input must have float32, float16, or bfloat16 dtype.";
+     throw std::invalid_argument(msg.str());
+   }
+-  if (s.device != Device::gpu) {
++  if (s.device != Device::gpu || !metal::is_available()) {
+     std::ostringstream msg;
+     msg << "[" << tag << "] The exact fused activation is Metal-only.";
+     throw std::invalid_argument(msg.str());
+diff --git a/mlx/ops.cpp b/mlx/ops.cpp
+index e216673..c421854 100644
+--- a/mlx/ops.cpp
++++ b/mlx/ops.cpp
+@@ -4874,10 +4874,10 @@ array quantized_matmul_bias(
+         << ".";
+     throw std::invalid_argument(msg.str());
+   }
+-  if (w_inner_dims <= 0) {
++  if (w_inner_dims <= 0 || w_outer_dims <= 0) {
+     throw std::invalid_argument(
+-        "[quantized_matmul_bias] Empty inner dimensions must use the eager "
+-        "fallback.");
++        "[quantized_matmul_bias] Empty weight or output dimensions must use "
++        "the eager fallback.");
+   }
+ 
+   // Mirror ensure_row_contiguous_matrix + QuantizedMatmul::eval_gpu when
+diff --git a/tests/gpu_tests.cpp b/tests/gpu_tests.cpp
+index 3733506..0b3715b 100644
+--- a/tests/gpu_tests.cpp
++++ b/tests/gpu_tests.cpp
+@@ -688,6 +688,10 @@ TEST_CASE("test layer norm vjp bias grad race") {
+ }
+ 
+ TEST_CASE("test exact group norm affine epilogue") {
++  if (!metal::is_available()) {
++    return;
++  }
++
+   auto eager = [](const array& x,
+                   const array& weight,
+                   const array& bias,
+@@ -751,6 +755,10 @@ TEST_CASE("test exact group norm affine epilogue") {
+ }
+ 
+ TEST_CASE("test exact eager activation fusions") {
++  if (!metal::is_available()) {
++    return;
++  }
++
+   auto eager_silu = [](const array& x) {
+     return multiply(x, sigmoid(x, Device::gpu), Device::gpu);
+   };
+diff --git a/tests/ops_tests.cpp b/tests/ops_tests.cpp
+index d68d96a..6e94e96 100644
+--- a/tests/ops_tests.cpp
++++ b/tests/ops_tests.cpp
+@@ -3312,8 +3312,25 @@ TEST_CASE("test quantize dequantize") {
+   }
+ }
+ 
++TEST_CASE("test exact fast primitives reject without Metal") {
++  if (metal::is_available()) {
++    return;
++  }
++
++  auto x = zeros({1, 2, 2, 8});
++  auto weight = ones({8});
++  auto bias = zeros({8});
++  CHECK_THROWS_AS(
++      fast::group_norm_affine(x, weight, bias, 2, 1e-5f, Device::gpu),
++      std::invalid_argument);
++  CHECK_THROWS_AS(
++      fast::silu_exact(x, Device::gpu), std::invalid_argument);
++  CHECK_THROWS_AS(
++      fast::gelu_tanh_exact(x, Device::gpu), std::invalid_argument);
++}
++
+ TEST_CASE("test exact quantized matmul output-bias epilogue") {
+-  if (!is_available(Device::gpu)) {
++  if (!metal::is_available()) {
+     return;
+   }
+ 
+@@ -3411,6 +3428,18 @@ TEST_CASE("test exact quantized matmul output-bias epilogue") {
+           4),
+       std::invalid_argument);
+ 
++  CHECK_THROWS_AS(
++      quantized_matmul_bias(
++          zeros({2, 33, K}),
++          zeros({0, K * 4 / 32}, uint32),
++          zeros({0, K / 64}),
++          zeros({0, K / 64}),
++          zeros({0}),
++          true,
++          64,
++          4),
++      std::invalid_argument);
++
+   CHECK_THROWS_AS(
+       quantized_matmul_bias(
+           zeros({0, K}),
+@@ -3464,7 +3493,7 @@ TEST_CASE("test exact quantized matmul output-bias epilogue") {
+ }
+ 
+ TEST_CASE("test exact convolution output-bias epilogues") {
+-  if (!is_available(Device::gpu)) {
++  if (!metal::is_available()) {
+     return;
+   }
+ 
+-- 
+2.50.1 (Apple Git-155)
+
