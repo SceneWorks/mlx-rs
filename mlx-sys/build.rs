@@ -729,7 +729,7 @@ fn prepare_mlx_c_source() -> PathBuf {
             "patches/exact-qmm-empty-dimensions.patch",
             true,
             Some(
-                "grep -Fq 'w_inner_dims <= 0' mlx/ops.cpp && awk '/if \\(M < 32\\)/ { m=NR } /int B = x_cast.size\\(\\) \\/ M \\/ w_inner_dims/ { b=NR } END { exit !(m && b && m < b) }' mlx/ops.cpp && grep -Fq 'zeros({0, K})' tests/ops_tests.cpp && grep -Fq 'zeros({32, 0})' tests/ops_tests.cpp",
+                "grep -Fq 'w_inner_dims <= 0 || w_outer_dims <= 0' mlx/ops.cpp && grep -Fq 'M_size < 32' mlx/ops.cpp && grep -Fq 'const size_t B_size' mlx/ops.cpp && grep -Fq 'zeros({0, K})' tests/ops_tests.cpp && grep -Fq 'zeros({32, 0})' tests/ops_tests.cpp",
             ),
         ),
         (
@@ -744,6 +744,27 @@ fn prepare_mlx_c_source() -> PathBuf {
             true,
             Some(
                 "test \"$(grep -Fc 's.device != Device::gpu || !metal::is_available()' mlx/fast.cpp)\" -eq 2 && grep -Fq 'Empty weight or output dimensions' mlx/ops.cpp && grep -Fq 'test exact fast primitives reject without Metal' tests/ops_tests.cpp && grep -Fq 'zeros({2, 33, K})' tests/ops_tests.cpp",
+            ),
+        ),
+        (
+            "patches/exact-strict-abi-domains.patch",
+            true,
+            Some(
+                "grep -Fq 'enum class DispatchRejection' mlx/ops.cpp && grep -Fq 'test exact primitives reject oversized Metal ABI domains' tests/ops_tests.cpp && grep -Fq 'test exact qmm selector handles provisional view flags' tests/ops_tests.cpp && grep -Fq 'Row count must fit the Metal' mlx/fast.cpp",
+            ),
+        ),
+        (
+            "patches/exact-strict-indexing-domains.patch",
+            true,
+            Some(
+                "grep -Fq 'Stored input and output logical sizes must' mlx/ops.cpp && grep -Fq 'Packed weight row offsets must fit' mlx/ops.cpp && grep -Fq 'OVERSIZED_OUTPUT_BATCH' tests/ops_tests.cpp && grep -Fq 'PACKED_OFFSET_K' tests/ops_tests.cpp",
+            ),
+        ),
+        (
+            "patches/exact-conv-selector-overflow.patch",
+            true,
+            Some(
+                "grep -Fq 'static_cast<int64_t>(C) + static_cast<int64_t>(O)' mlx/ops.cpp && grep -Fq 'OVERFLOW_CHANNELS' tests/ops_tests.cpp",
             ),
         ),
     ];
