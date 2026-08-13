@@ -767,6 +767,13 @@ fn prepare_mlx_c_source() -> PathBuf {
                 "grep -Fq 'static_cast<int64_t>(C) + static_cast<int64_t>(O)' mlx/ops.cpp && grep -Fq 'OVERFLOW_CHANNELS' tests/ops_tests.cpp",
             ),
         ),
+        (
+            "patches/exact-dispatch-parameter-domains.patch",
+            true,
+            Some(
+                "grep -Fq 'complete_conv_parameters' mlx/ops.cpp && grep -Fq 'host_parameters_fit' mlx/ops.cpp && grep -Fq '512 / tile_count' mlx/ops.cpp && grep -Fq 'test exact qmm mirrors split-k direct delegation' tests/ops_tests.cpp && grep -Fq '65535, 65535' tests/ops_tests.cpp",
+            ),
+        ),
     ];
     // sc-12780 idempotency guard: CMake FetchContent may re-run PATCH_COMMAND against an
     // mlx-src that is ALREADY patched (e.g. an incremental rebuild that does not re-fetch).
