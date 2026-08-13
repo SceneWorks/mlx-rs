@@ -1,0 +1,208 @@
+From 98289fe8b2cfdcc10501cbe7bcf21b3258e284e2 Mon Sep 17 00:00:00 2001
+From: Michael Trefry <michael@trefry.net>
+Date: Thu, 13 Aug 2026 01:48:32 -0400
+Subject: [PATCH] fix(exact): mirror dispatch and retain copied affine inputs
+
+Signed-off-by: Michael Trefry <michael@trefry.net>
+---
+ mlx/backend/metal/normalization.cpp | 21 ++++++++++++---
+ mlx/ops.cpp                         | 30 ++++++++++++++++-----
+ tests/gpu_tests.cpp                 | 12 +++++++--
+ tests/ops_tests.cpp                 | 41 ++++++++++++++++++++++++++---
+ 4 files changed, 89 insertions(+), 15 deletions(-)
+
+diff --git a/mlx/backend/metal/normalization.cpp b/mlx/backend/metal/normalization.cpp
+index 462a6a5..4410f94 100644
+--- a/mlx/backend/metal/normalization.cpp
++++ b/mlx/backend/metal/normalization.cpp
+@@ -1,5 +1,6 @@
+ // Copyright © 2024 Apple Inc.
+ #include <algorithm>
++#include <utility>
+ 
+ #include "mlx/backend/gpu/copy.h"
+ #include "mlx/backend/metal/device.h"
+@@ -306,12 +307,15 @@ void GroupNormAffine::eval_gpu(
+   auto& out = outputs[0];
+ 
+   auto ensure_row_contiguous = [&s](const array& input) {
+-    return input.flags().row_contiguous ? input : contiguous_copy_gpu(input, s);
++    if (input.flags().row_contiguous) {
++      return std::pair<array, bool>{input, false};
++    }
++    return std::pair<array, bool>{contiguous_copy_gpu(input, s), true};
+   };
+ 
+-  const array x = ensure_row_contiguous(inputs[0]);
+-  const array weight = ensure_row_contiguous(inputs[1]);
+-  const array bias = ensure_row_contiguous(inputs[2]);
++  auto [x, x_copied] = ensure_row_contiguous(inputs[0]);
++  auto [weight, weight_copied] = ensure_row_contiguous(inputs[1]);
++  auto [bias, bias_copied] = ensure_row_contiguous(inputs[2]);
+   if (x.is_donatable()) {
+     out.copy_shared_buffer(x);
+   } else {
+@@ -340,6 +344,15 @@ void GroupNormAffine::eval_gpu(
+   op_name += type_to_name(out);
+ 
+   auto& compute_encoder = metal::get_command_encoder(s);
++  if (x_copied) {
++    compute_encoder.add_temporary(x);
++  }
++  if (weight_copied) {
++    compute_encoder.add_temporary(weight);
++  }
++  if (bias_copied) {
++    compute_encoder.add_temporary(bias);
++  }
+   auto kernel = d.get_kernel(op_name);
+ 
+   MTL::Size grid_dims;
+diff --git a/mlx/ops.cpp b/mlx/ops.cpp
+index e870498..f8c7d84 100644
+--- a/mlx/ops.cpp
++++ b/mlx/ops.cpp
+@@ -4861,20 +4861,38 @@ array quantized_matmul_bias(
+     throw std::invalid_argument(msg.str());
+   }
+ 
++  // Mirror ensure_row_contiguous_matrix + QuantizedMatmul::eval_gpu when
++  // deriving M/B. A view whose last two dimensions are already contiguous
++  // preserves its leading batch strides, while every other view is copied to
++  // one row-contiguous matrix and collapsed across its leading dimensions.
++  auto x_cast = astype(x, dtype);
++  bool matrix_contiguous = false;
++  if (x_cast.ndim() < 2) {
++    matrix_contiguous = x_cast.strides()[0] == 1;
++  } else {
++    matrix_contiguous =
++        x_cast.strides()[x_cast.ndim() - 2] == x_cast.shape(-1) &&
++        x_cast.strides()[x_cast.ndim() - 1] == 1;
++  }
++  const bool eval_row_contiguous =
++      matrix_contiguous ? x_cast.flags().row_contiguous : true;
++  int M = eval_row_contiguous ? x_cast.size() / w_inner_dims
++                              : x_cast.shape(-2);
++  int B = x_cast.size() / M / w_inner_dims;
++
+   // The eager baseline selects qmm only above the device-dependent vector
+-  // threshold (never greater than 32), and its split-K path delegates to qmm
+-  // exactly when there are at least 512 32x32 output tiles.  Requiring both
+-  // conditions keeps the fused and eager qmm algorithms identical.
+-  int M = x.size() / w_inner_dims;
++  // threshold (never greater than 32). For B == 1 it first selects split-K,
++  // which delegates to qmm exactly at 512 or more 32x32 output tiles; batched
++  // inputs route directly to qmm and therefore do not need the tile condition.
+   int tile_count = ((M + 31) / 32) * ((w_outer_dims + 31) / 32);
+-  if (M < 32 || tile_count < 512) {
++  if (M < 32 || (B == 1 && tile_count < 512)) {
+     throw std::invalid_argument(
+         "[quantized_matmul_bias] Shape does not select the direct qmm path; "
+         "use the eager fallback.");
+   }
+ 
+   std::vector<array> inputs{
+-      astype(x, dtype),
++      std::move(x_cast),
+       std::move(w),
+       astype(scales, dtype),
+       astype(biases, dtype),
+diff --git a/tests/gpu_tests.cpp b/tests/gpu_tests.cpp
+index f4bec6e..3733506 100644
+--- a/tests/gpu_tests.cpp
++++ b/tests/gpu_tests.cpp
+@@ -728,8 +728,16 @@ TEST_CASE("test exact group norm affine epilogue") {
+ 
+   auto x = random::normal({2, 4, 3, 32}, float32, 0.0f, 1.0f, random::key(24));
+   x = transpose(x, {0, 2, 1, 3});
+-  auto weight = random::normal({32}, float32, 0.0f, 1.0f, random::key(25));
+-  auto bias = random::normal({32}, float32, 0.0f, 1.0f, random::key(26));
++  auto weight = slice(
++      random::normal({64}, float32, 0.0f, 1.0f, random::key(25)),
++      {0},
++      {64},
++      {2});
++  auto bias = slice(
++      random::normal({64}, float32, 0.0f, 1.0f, random::key(26)),
++      {1},
++      {64},
++      {2});
+   CHECK(array_equal(
+             eager(x, weight, bias, 8, 1e-5f),
+             fast::group_norm_affine(x, weight, bias, 8, 1e-5f, Device::gpu),
+diff --git a/tests/ops_tests.cpp b/tests/ops_tests.cpp
+index f05a086..7ab85a6 100644
+--- a/tests/ops_tests.cpp
++++ b/tests/ops_tests.cpp
+@@ -3355,9 +3355,9 @@ TEST_CASE("test exact quantized matmul output-bias epilogue") {
+       reshape(cos(arange(0, N * K, float32) * 0.002f), {N, K});
+   auto output_bias_f32 = sin(arange(0, N, float32) * 0.01f);
+ 
+-  // The odd case is simultaneously batched and non-contiguous. Its 1-D bias
+-  // broadcasts over both leading axes, and its tile count still selects direct
+-  // qmm rather than split-K, exercising the exact standard/NAX epilogues.
++  // The odd transpose is non-contiguous but becomes one row-contiguous matrix
++  // when the dispatcher copies it. Its 1-D bias broadcasts over the leading
++  // axis and its tile count selects direct qmm rather than split-K.
+   constexpr int ODD_M = 257;
+   constexpr int ODD_N = 1001;
+   auto odd_input_base_f32 = reshape(
+@@ -3367,6 +3367,21 @@ TEST_CASE("test exact quantized matmul output-bias epilogue") {
+       cos(arange(0, ODD_N * K, float32) * 0.002f), {ODD_N, K});
+   auto odd_output_bias_f32 = sin(arange(0, ODD_N, float32) * 0.01f);
+ 
++  // A broadcast leading dimension preserves contiguous matrix strides while
++  // making the input non-row-contiguous. The dispatcher therefore treats this
++  // as B=2, M=33 (not one aggregate M=66 matrix) and routes straight to the
++  // batched standard/NAX qmm even though a single matrix has fewer than 512
++  // output tiles.
++  constexpr int BATCH_M = 33;
++  constexpr int BATCH_N = 1001;
++  auto batch_input_base_f32 = reshape(
++      sin(arange(0, BATCH_M * K, float32) * 0.004f),
++      {1, BATCH_M, K});
++  auto batch_weight_f32 = reshape(
++      cos(arange(0, BATCH_N * K, float32) * 0.005f), {BATCH_N, K});
++  auto batch_output_bias_f32 =
++      cos(arange(0, BATCH_N, float32) * 0.012f);
++
+   for (auto dtype : {float32, float16, bfloat16}) {
+     check(
+         astype(input_f32, dtype),
+@@ -3376,6 +3391,11 @@ TEST_CASE("test exact quantized matmul output-bias epilogue") {
+         transpose(astype(odd_input_base_f32, dtype), {0, 2, 1}),
+         astype(odd_weight_f32, dtype),
+         astype(odd_output_bias_f32, dtype));
++    check(
++        broadcast_to(
++            astype(batch_input_base_f32, dtype), {2, BATCH_M, K}),
++        astype(batch_weight_f32, dtype),
++        astype(batch_output_bias_f32, dtype));
+   }
+ 
+   auto quantized = quantize(weight_f32, 64, 4);
+@@ -3390,6 +3410,21 @@ TEST_CASE("test exact quantized matmul output-bias epilogue") {
+           64,
+           4),
+       std::invalid_argument);
++
++  // Aggregate rows across a broadcast batch must not admit a per-matrix M=5
++  // input: the eager baseline selects qmv for every supported Metal device.
++  auto qmv_input = broadcast_to(zeros({1, 5, K}), {128, 5, K});
++  CHECK_THROWS_AS(
++      quantized_matmul_bias(
++          qmv_input,
++          quantized[0],
++          quantized[1],
++          quantized[2],
++          output_bias_f32,
++          true,
++          64,
++          4),
++      std::invalid_argument);
+ }
+ 
+ TEST_CASE("test exact convolution output-bias epilogues") {
+-- 
+2.50.1 (Apple Git-155)
+
