@@ -121,10 +121,17 @@ jobs:
       - name: Link a real binary for ${{ matrix.target }}
         run: |
           set -euo pipefail
-          # `*pmetal-mlx-sys*/out`, not `*/pmetal-mlx-sys-*/out`: a -Z build-std run nests the
-          # build dir one level deeper (pmetal-mlx-sys/<hash>/out) than a normal one
-          # (pmetal-mlx-sys-<hash>/out), and the stricter glob silently matches neither.
-          out=$(find target/${{ matrix.target }} -type d -path '*pmetal-mlx-sys*/out' -print -quit)
+          # A -Z build-std run can leave multiple pmetal-mlx-sys `out` directories behind. Pick
+          # the one that owns the staged C example instead of whichever directory `find` sees
+          # first; only the completed native build-script output contains this file and the
+          # static archives linked below.
+          example=$(find target/${{ matrix.target }} -type f \
+            -path '*pmetal-mlx-sys*/out/mlx-c-staged/examples/example.c' -print -quit)
+          if [ -z "$example" ]; then
+            echo "::error::no completed pmetal-mlx-sys build output for ${{ matrix.target }}"
+            exit 1
+          fi
+          out=${example%/mlx-c-staged/examples/example.c}
           sdk=$(xcrun --sdk ${{ matrix.sdk }} --show-sdk-path)
           # Empty on the device SDKs, which export everything metal-cpp references.
           shim=$(find "$out" -name 'libmlx_metal_cpp_absent.a' -print -quit)
