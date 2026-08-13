@@ -722,7 +722,7 @@ fn prepare_mlx_c_source() -> PathBuf {
             "patches/exact-dispatch-and-affine-lifetime.patch",
             true,
             Some(
-                "grep -Fq 'const bool eval_row_contiguous' mlx/ops.cpp && grep -Fq 'if (weight_copied)' mlx/backend/metal/normalization.cpp && grep -Fq 'constexpr int BATCH_M = 33;' tests/ops_tests.cpp",
+                "grep -Fq 'ensure_row_contiguous_matrix + QuantizedMatmul::eval_gpu' mlx/ops.cpp && grep -Fq 'if (weight_copied)' mlx/backend/metal/normalization.cpp && grep -Fq 'if (bias_copied)' mlx/backend/metal/normalization.cpp && grep -Fq 'constexpr int BATCH_M = 33;' tests/ops_tests.cpp",
             ),
         ),
         (
