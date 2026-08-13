@@ -44,12 +44,14 @@ jobs:
             clang_target: arm64-apple-ios18.0
             toolchain: stable
             build_std: ""
+            deployment_env: IPHONEOS_DEPLOYMENT_TARGET
           - target: aarch64-apple-ios-sim
             metallib_triple: air64_v27-apple-ios18.0.0-simulator
             sdk: iphonesimulator
             clang_target: arm64-apple-ios18.0-simulator
             toolchain: stable
             build_std: ""
+            deployment_env: IPHONEOS_DEPLOYMENT_TARGET
           # tvOS is a tier-3 Rust target with no prebuilt std, so it needs -Z build-std on
           # nightly. That is also the only way anyone can consume this crate on tvOS, so the
           # nightly pin mirrors reality rather than working around CI. It does mean these legs
@@ -61,12 +63,14 @@ jobs:
             clang_target: arm64-apple-tvos18.0
             toolchain: nightly
             build_std: "-Z build-std=std,panic_abort"
+            deployment_env: TVOS_DEPLOYMENT_TARGET
           - target: aarch64-apple-tvos-sim
             metallib_triple: air64_v27-apple-tvos18.0.0-simulator
             sdk: appletvsimulator
             clang_target: arm64-apple-tvos18.0-simulator
             toolchain: nightly
             build_std: "-Z build-std=std,panic_abort"
+            deployment_env: TVOS_DEPLOYMENT_TARGET
     steps:
       - uses: actions/checkout@v5
         with:
@@ -82,7 +86,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}-${{ hashFiles('**/Cargo.toml') }}
-      - run: cargo build ${{ matrix.build_std }} -p pmetal-mlx-sys --target ${{ matrix.target }}
+      - name: Build pmetal-mlx-sys for ${{ matrix.target }}
+        run: |
+          export "${{ matrix.deployment_env }}=18.0"
+          cargo build ${{ matrix.build_std }} -p pmetal-mlx-sys --target ${{ matrix.target }}
 
       - name: Assert the metallib targets ${{ matrix.target }}
         run: |

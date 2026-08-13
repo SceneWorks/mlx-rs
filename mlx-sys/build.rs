@@ -1146,6 +1146,12 @@ fn main() {
         .header("src/mlx-c/mlx/c/error.h")
         .header("src/mlx-c/mlx/c/transforms_impl.h")
         .clang_arg("-Isrc/mlx-c")
+        // System headers pulled in by mlx-c declare malloc/realloc with the SDK's
+        // c_ulong spelling of size_t. They are not part of the mlx-c API, and on
+        // tier-3 Apple targets a nightly build-std rustc rejects those generated
+        // declarations under suspicious_runtime_symbol_definitions even though
+        // the ABI width matches. Do not bind unrelated libc allocation symbols.
+        .blocklist_function("^(malloc|realloc)$")
         .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
         .generate()
         .expect("Unable to generate bindings");
