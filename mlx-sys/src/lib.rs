@@ -26,4 +26,23 @@ extern "C" {
         bits: mlx_optional_int,
         stream: mlx_stream,
     ) -> ::std::os::raw::c_int;
+    pub fn mlx_pmetal_conv_general_bias(
+        res: *mut mlx_array,
+        input: mlx_array,
+        weight: mlx_array,
+        output_bias: mlx_array,
+        stride: *const ::std::os::raw::c_int,
+        stride_num: usize,
+        padding_lo: *const ::std::os::raw::c_int,
+        padding_lo_num: usize,
+        padding_hi: *const ::std::os::raw::c_int,
+        padding_hi_num: usize,
+        kernel_dilation: *const ::std::os::raw::c_int,
+        kernel_dilation_num: usize,
+        input_dilation: *const ::std::os::raw::c_int,
+        input_dilation_num: usize,
+        groups: ::std::os::raw::c_int,
+        flip: bool,
+        stream: mlx_stream,
+    ) -> ::std::os::raw::c_int;
 }
