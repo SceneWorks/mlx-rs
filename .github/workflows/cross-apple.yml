@@ -39,14 +39,14 @@ jobs:
             # Device and simulator differ only in the `-simulator` suffix — which is exactly the
             # bug this matrix exists to catch, since nothing else about an arm64 simulator build
             # distinguishes it from the device.
-            metallib_triple: air64_v27-apple-ios18.0.0
+            metallib_triple: air64-apple-ios18.0.0
             sdk: iphoneos
             clang_target: arm64-apple-ios18.0
             toolchain: stable
             build_std: ""
             deployment_env: IPHONEOS_DEPLOYMENT_TARGET
           - target: aarch64-apple-ios-sim
-            metallib_triple: air64_v27-apple-ios18.0.0-simulator
+            metallib_triple: air64-apple-ios18.0.0-simulator
             sdk: iphonesimulator
             clang_target: arm64-apple-ios18.0-simulator
             toolchain: stable
@@ -58,14 +58,14 @@ jobs:
           # can break for reasons unrelated to this repo — which is part of why the whole
           # workflow is nightly/label-gated rather than a PR requirement.
           - target: aarch64-apple-tvos
-            metallib_triple: air64_v27-apple-tvos18.0.0
+            metallib_triple: air64-apple-tvos18.0.0
             sdk: appletvos
             clang_target: arm64-apple-tvos18.0
             toolchain: nightly
             build_std: "-Z build-std=std,panic_abort"
             deployment_env: TVOS_DEPLOYMENT_TARGET
           - target: aarch64-apple-tvos-sim
-            metallib_triple: air64_v27-apple-tvos18.0.0-simulator
+            metallib_triple: air64-apple-tvos18.0.0-simulator
             sdk: appletvsimulator
             clang_target: arm64-apple-tvos18.0-simulator
             toolchain: nightly
@@ -106,7 +106,7 @@ jobs:
           # `|| true` so an empty result is reported by the comparison below rather than as a
           # bare grep exit code.
           found=$(LC_ALL=C strings -a "$metallib" \
-                  | grep -oE 'air64[_a-z0-9]*-apple-[a-z0-9.]+(-simulator)?' \
+                  | grep -oE 'air64(_v[0-9]+)?-apple-(ios|tvos)[0-9]+(\.[0-9]+){2}(-simulator)?' \
                   | sort -u || true)
           echo "triples: $found"
           if [ "$found" != "${{ matrix.metallib_triple }}" ]; then
