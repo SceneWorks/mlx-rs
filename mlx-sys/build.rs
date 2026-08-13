@@ -710,6 +710,11 @@ fn prepare_mlx_c_source() -> PathBuf {
                 "test -f mlx/backend/metal/kernels/exact_activations.metal && grep -Fq 'silu_exact(' mlx/fast.h && grep -Fq 'ExactActivation::eval_gpu' mlx/backend/metal/normalization.cpp",
             ),
         ),
+        (
+            "patches/exact-epilogue-dispatcher-tests.patch",
+            true,
+            None,
+        ),
     ];
     // sc-12780 idempotency guard: CMake FetchContent may re-run PATCH_COMMAND against an
     // mlx-src that is ALREADY patched (e.g. an incremental rebuild that does not re-fetch).
