@@ -1,0 +1,117 @@
+From b72318643c24531846c2b174dc1b691344c36b71 Mon Sep 17 00:00:00 2001
+From: Michael Trefry <michael@trefry.net>
+Date: Thu, 13 Aug 2026 02:08:18 -0400
+Subject: [PATCH] fix(exact): reject unsupported and empty dispatches
+
+Signed-off-by: Michael Trefry <michael@trefry.net>
+---
+ mlx/ops.cpp         | 18 +++++++++++++++--
+ tests/ops_tests.cpp | 48 +++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 64 insertions(+), 2 deletions(-)
+
+diff --git a/mlx/ops.cpp b/mlx/ops.cpp
+index 55808eb..e216673 100644
+--- a/mlx/ops.cpp
++++ b/mlx/ops.cpp
+@@ -4513,6 +4513,19 @@ array conv_general_impl(
+           "[conv_general_bias] Only ungrouped 2D and 3D convolutions are "
+           "supported.");
+     }
++    if (out_type != float32 && out_type != float16 && out_type != bfloat16) {
++      throw std::invalid_argument(
++          "[conv_general_bias] Input and weight must promote to float32, "
++          "float16, or bfloat16.");
++    }
++    if (in.size() == 0 || wt.size() == 0 ||
++        std::any_of(out_shape.begin(), out_shape.end(), [](int dim) {
++          return dim == 0;
++        })) {
++      throw std::invalid_argument(
++          "[conv_general_bias] Empty inputs and outputs must use the eager "
++          "fallback.");
++    }
+     if (output_bias->ndim() != 1 || output_bias->shape(0) != out_shape.back()) {
+       std::ostringstream msg;
+       msg << "[" << tag << "] Output bias must have shape (" << out_shape.back()
+@@ -4843,9 +4856,10 @@ array quantized_matmul_bias(
+       group_size,
+       bits);
+   dtype = promote_types(x.dtype(), dtype);
+-  if (!issubdtype(dtype, floating)) {
++  if (dtype != float32 && dtype != float16 && dtype != bfloat16) {
+     throw std::invalid_argument(
+-        "[quantized_matmul_bias] Only real floating types are supported.");
++        "[quantized_matmul_bias] Only float32, float16, and bfloat16 are "
++        "supported.");
+   }
+   if (output_bias.ndim() != 1 || output_bias.shape(0) != w_outer_dims) {
+     std::ostringstream msg;
+diff --git a/tests/ops_tests.cpp b/tests/ops_tests.cpp
+index bd0ec44..d68d96a 100644
+--- a/tests/ops_tests.cpp
++++ b/tests/ops_tests.cpp
+@@ -3449,6 +3449,18 @@ TEST_CASE("test exact quantized matmul output-bias epilogue") {
+           64,
+           4),
+       std::invalid_argument);
++
++  CHECK_THROWS_AS(
++      quantized_matmul_bias(
++          astype(input_f32, float64),
++          quantized[0],
++          quantized[1],
++          quantized[2],
++          astype(output_bias_f32, float64),
++          true,
++          64,
++          4),
++      std::invalid_argument);
+ }
+ 
+ TEST_CASE("test exact convolution output-bias epilogues") {
+@@ -3531,6 +3543,42 @@ TEST_CASE("test exact convolution output-bias epilogues") {
+           {1, 1},
+           {1, 1}),
+       std::invalid_argument);
++
++  CHECK_THROWS_AS(
++      conv_general_bias(
++          zeros({0, 8, 8, 16}),
++          zeros({16, 3, 3, 16}),
++          zeros({16}),
++          {1, 1},
++          {1, 1},
++          {1, 1},
++          {1, 1},
++          {1, 1}),
++      std::invalid_argument);
++
++  CHECK_THROWS_AS(
++      conv_general_bias(
++          zeros({1, 8, 8, 16}),
++          zeros({0, 3, 3, 16}),
++          zeros({0}),
++          {1, 1},
++          {1, 1},
++          {1, 1},
++          {1, 1},
++          {1, 1}),
++      std::invalid_argument);
++
++  CHECK_THROWS_AS(
++      conv_general_bias(
++          zeros({1, 8, 8, 16}, float64),
++          zeros({16, 3, 3, 16}, float64),
++          zeros({16}, float64),
++          {1, 1},
++          {1, 1},
++          {1, 1},
++          {1, 1},
++          {1, 1}),
++      std::invalid_argument);
+ }
+ 
+ TEST_CASE("test repeat") {
+-- 
+2.50.1 (Apple Git-155)
+

@@ -731,6 +731,13 @@ fn prepare_mlx_c_source() -> PathBuf {
                 "grep -Fq 'Empty inner dimensions must use the eager' mlx/ops.cpp && grep -Fq 'zeros({0, K})' tests/ops_tests.cpp",
             ),
         ),
+        (
+            "patches/exact-supported-dispatch.patch",
+            true,
+            Some(
+                "grep -Fq 'Input and weight must promote to float32' mlx/ops.cpp && grep -Fq 'Only float32, float16, and bfloat16 are' mlx/ops.cpp && grep -Fq 'zeros({1, 8, 8, 16}, float64)' tests/ops_tests.cpp",
+            ),
+        ),
     ];
     // sc-12780 idempotency guard: CMake FetchContent may re-run PATCH_COMMAND against an
     // mlx-src that is ALREADY patched (e.g. an incremental rebuild that does not re-fetch).
