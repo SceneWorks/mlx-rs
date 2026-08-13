@@ -1,0 +1,49 @@
+diff --git a/mlx/backend/metal/nojit_kernels.cpp b/mlx/backend/metal/nojit_kernels.cpp
+index 5dd605b..743ca23 100644
+--- a/mlx/backend/metal/nojit_kernels.cpp
++++ b/mlx/backend/metal/nojit_kernels.cpp
+@@ -206,7 +206,6 @@ MTL::ComputePipelineState* get_steel_gemm_gather_kernel(
+     int,
+     int,
+     int,
+-    bool,
+     bool) {
+   return d.get_kernel(kernel_name, hash_name, func_consts);
+ }
+@@ -270,7 +269,6 @@ MTL::ComputePipelineState* get_gemv_masked_kernel(
+     int,
+     int,
+     int,
+-    bool,
+     bool) {
+   return d.get_kernel(kernel_name);
+ }
+@@ -278,13 +276,14 @@
+ MTL::ComputePipelineState* get_steel_conv_kernel(
+     metal::Device& d,
+     const std::string& kernel_name,
+     const array&,
+     int,
+     int,
+     int,
+     int,
+     int,
+     int,
++    bool,
+     bool) {
+   return d.get_kernel(kernel_name);
+ }
+@@ -292,12 +291,13 @@
+ MTL::ComputePipelineState* get_steel_conv_3d_kernel(
+     metal::Device& d,
+     const std::string& kernel_name,
+     const array&,
+     int,
+     int,
+     int,
+     int,
+     int,
++    bool,
+     bool) {
+   return d.get_kernel(kernel_name);
+ }

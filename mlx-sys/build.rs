@@ -695,6 +695,7 @@ fn prepare_mlx_c_source() -> PathBuf {
                 "grep -Fq 'conv_general_bias(' mlx/ops.h && grep -Fq 'HAS_OUTPUT_BIAS' mlx/backend/metal/kernels/steel/conv/kernels/steel_conv.h && grep -Fq 'HAS_OUTPUT_BIAS' mlx/backend/metal/kernels/steel/conv/kernels/steel_conv_3d.h",
             ),
         ),
+        ("patches/exact-conv-bias-nojit.patch", true, None),
         (
             "patches/exact-group-norm-affine.patch",
             true,
