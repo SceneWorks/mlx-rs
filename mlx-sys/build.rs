@@ -729,7 +729,7 @@ fn prepare_mlx_c_source() -> PathBuf {
             "patches/exact-qmm-empty-dimensions.patch",
             true,
             Some(
-                "grep -Fq 'Empty inner dimensions must use the eager' mlx/ops.cpp && grep -Fq 'zeros({0, K})' tests/ops_tests.cpp",
+                "grep -Fq 'w_inner_dims <= 0' mlx/ops.cpp && awk '/if \\(M < 32\\)/ { m=NR } /int B = x_cast.size\\(\\) \\/ M \\/ w_inner_dims/ { b=NR } END { exit !(m && b && m < b) }' mlx/ops.cpp && grep -Fq 'zeros({0, K})' tests/ops_tests.cpp && grep -Fq 'zeros({32, 0})' tests/ops_tests.cpp",
             ),
         ),
         (
