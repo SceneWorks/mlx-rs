@@ -243,6 +243,37 @@ pub fn layer_norm_device<'a>(
     })
 }
 
+/// PyTorch-compatible GroupNorm over a channels-last tensor with per-channel
+/// affine weight and bias applied in the native Metal normalization epilogue.
+///
+/// This strict operation preserves the eager `layer_norm`, multiply, then add
+/// dtype-rounding boundaries. It returns an error for non-Metal execution,
+/// mismatched dtypes, malformed group/channel shapes, or unsupported dtypes.
+/// Callers must use the eager expression for rejected inputs and must not
+/// report fusion as applied.
+#[generate_macro(customize(root = "$crate::fast"))]
+#[default_device]
+pub fn group_norm_affine_device(
+    x: impl AsRef<Array>,
+    weight: impl AsRef<Array>,
+    bias: impl AsRef<Array>,
+    num_groups: i32,
+    eps: f32,
+    #[optional] stream: impl AsRef<Stream>,
+) -> Result<Array> {
+    Array::try_from_op(|res| unsafe {
+        mlx_sys::mlx_pmetal_group_norm_affine(
+            res,
+            x.as_ref().as_ptr(),
+            weight.as_ref().as_ptr(),
+            bias.as_ref().as_ptr(),
+            num_groups,
+            eps,
+            stream.as_ref().as_ptr(),
+        )
+    })
+}
+
 /// A template parameter for a JIT-compiled [`MetalKernel`].
 ///
 /// Template parameters are substituted into the generated kernel at JIT-compile

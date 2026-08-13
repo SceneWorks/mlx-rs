@@ -1,0 +1,70 @@
+From 6e946d5958351a571713ca9b3c41953432cdbc6b Mon Sep 17 00:00:00 2001
+From: Michael Trefry <michael@trefry.net>
+Date: Wed, 12 Aug 2026 23:29:56 -0400
+Subject: [PATCH] feat(fast): expose exact group norm affine bridge
+
+Signed-off-by: Michael Trefry <michael@trefry.net>
+---
+ mlx/c/fast.cpp | 25 +++++++++++++++++++++++++
+ mlx/c/fast.h   |  9 +++++++++
+ 2 files changed, 34 insertions(+)
+
+diff --git a/mlx/c/fast.cpp b/mlx/c/fast.cpp
+index ac17d54..801107f 100644
+--- a/mlx/c/fast.cpp
++++ b/mlx/c/fast.cpp
+@@ -276,6 +276,31 @@ extern "C" int mlx_fast_layer_norm(
+   return 0;
+ }
+ 
++extern "C" int mlx_pmetal_group_norm_affine(
++    mlx_array* res,
++    const mlx_array x,
++    const mlx_array weight,
++    const mlx_array bias,
++    int num_groups,
++    float eps,
++    const mlx_stream s) {
++  try {
++    mlx_array_set_(
++        *res,
++        mlx::core::fast::group_norm_affine(
++            mlx_array_get_(x),
++            mlx_array_get_(weight),
++            mlx_array_get_(bias),
++            num_groups,
++            eps,
++            mlx_stream_get_(s)));
++  } catch (std::exception& e) {
++    mlx_error(e.what());
++    return 1;
++  }
++  return 0;
++}
++
+ struct mlx_fast_metal_kernel_config_cpp_ {
+   std::vector<mlx::core::Shape> output_shapes;
+   std::vector<mlx::core::Dtype> output_dtypes;
+diff --git a/mlx/c/fast.h b/mlx/c/fast.h
+index c825d00..f4d13f9 100644
+--- a/mlx/c/fast.h
++++ b/mlx/c/fast.h
+@@ -98,6 +98,15 @@ int mlx_fast_layer_norm(
+     float eps,
+     const mlx_stream s);
+ 
++int mlx_pmetal_group_norm_affine(
++    mlx_array* res,
++    const mlx_array x,
++    const mlx_array weight,
++    const mlx_array bias,
++    int num_groups,
++    float eps,
++    const mlx_stream s);
++
+ typedef struct mlx_fast_metal_kernel_config_ {
+   void* ctx;
+ } mlx_fast_metal_kernel_config;
+-- 
+2.50.1 (Apple Git-155)
+

@@ -480,6 +480,25 @@ fn prepare_mlx_c_source() -> PathBuf {
     );
     println!("cargo:rerun-if-changed=patches/exact-conv-bias-c.patch");
 
+    // sc-18318: expose the group-aware exact normalization+affine bridge
+    // added by exact-group-norm-affine.patch.
+    let group_norm_affine_c_patch =
+        std::fs::canonicalize("patches/exact-group-norm-affine-c.patch")
+            .expect("find exact-group-norm-affine-c.patch");
+    let status = Command::new("patch")
+        .arg("-p1")
+        .arg("-d")
+        .arg(&staged)
+        .arg("-i")
+        .arg(&group_norm_affine_c_patch)
+        .status()
+        .expect("Failed to run `patch` for exact-group-norm-affine-c.patch");
+    assert!(
+        status.success(),
+        "exact-group-norm-affine-c.patch failed to apply to staged mlx-c (sc-18318)"
+    );
+    println!("cargo:rerun-if-changed=patches/exact-group-norm-affine-c.patch");
+
     // Copy our patch files into the staged source. FetchContent allows only one
     // PATCH_COMMAND, so build.rs generates apply_patches.sh (below) which applies
     // each MLX source patch individually and idempotently.
@@ -641,6 +660,7 @@ fn prepare_mlx_c_source() -> PathBuf {
         ("patches/apple-cpu-no-jit.patch", true),
         ("patches/exact-qmm-bias.patch", true),
         ("patches/exact-conv-bias.patch", true),
+        ("patches/exact-group-norm-affine.patch", true),
     ];
     // sc-12780 idempotency guard: CMake FetchContent may re-run PATCH_COMMAND against an
     // mlx-src that is ALREADY patched (e.g. an incremental rebuild that does not re-fetch).

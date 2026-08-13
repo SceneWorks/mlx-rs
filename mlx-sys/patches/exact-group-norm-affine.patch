@@ -1,0 +1,579 @@
+From f2aaad238ba4fae427ee008f25c8ec738bf066ab Mon Sep 17 00:00:00 2001
+From: Michael Trefry <michael@trefry.net>
+Date: Wed, 12 Aug 2026 23:29:44 -0400
+Subject: [PATCH] feat(normalization): add exact group norm affine epilogue
+
+Signed-off-by: Michael Trefry <michael@trefry.net>
+---
+ mlx/backend/metal/kernels/CMakeLists.txt   |   1 +
+ mlx/backend/metal/kernels/group_norm.metal | 229 +++++++++++++++++++++
+ mlx/backend/metal/normalization.cpp        |  77 +++++++
+ mlx/fast.cpp                               |  80 +++++++
+ mlx/fast.h                                 |  17 ++
+ mlx/fast_primitives.h                      |  31 +++
+ tests/gpu_tests.cpp                        |  55 +++++
+ 7 files changed, 490 insertions(+)
+ create mode 100644 mlx/backend/metal/kernels/group_norm.metal
+
+diff --git a/mlx/backend/metal/kernels/CMakeLists.txt b/mlx/backend/metal/kernels/CMakeLists.txt
+index edc169e..1194ea1 100644
+--- a/mlx/backend/metal/kernels/CMakeLists.txt
++++ b/mlx/backend/metal/kernels/CMakeLists.txt
+@@ -48,6 +48,7 @@ endfunction(build_kernel)
+ 
+ build_kernel(arg_reduce)
+ build_kernel(conv steel/conv/params.h)
++build_kernel(group_norm)
+ build_kernel(layer_norm)
+ build_kernel(random)
+ build_kernel(rms_norm)
+diff --git a/mlx/backend/metal/kernels/group_norm.metal b/mlx/backend/metal/kernels/group_norm.metal
+new file mode 100644
+index 0000000..0202b42
+--- /dev/null
++++ b/mlx/backend/metal/kernels/group_norm.metal
+@@ -0,0 +1,229 @@
++// Copyright © 2026 Apple Inc.
++
++#include <metal_common>
++#include <metal_simdgroup>
++
++#include "mlx/backend/metal/kernels/utils.h"
++
++using namespace metal;
++
++template <int N = 1>
++inline void group_norm_initialize_buffer(
++    threadgroup float* xs,
++    uint simd_lane_id [[thread_index_in_simdgroup]],
++    uint simd_group_id [[simdgroup_index_in_threadgroup]]) {
++  if (simd_group_id == 0) {
++    for (int i = 0; i < N; i++) {
++      xs[N * simd_lane_id + i] = 0;
++    }
++  }
++  threadgroup_barrier(mem_flags::mem_threadgroup);
++}
++
++template <int N = 1>
++inline void group_norm_threadgroup_sum(
++    thread float* x,
++    threadgroup float* xs,
++    uint simd_lane_id [[thread_index_in_simdgroup]],
++    uint simd_group_id [[simdgroup_index_in_threadgroup]]) {
++  for (int i = 0; i < N; i++) {
++    x[i] = simd_sum(x[i]);
++  }
++  threadgroup_barrier(mem_flags::mem_threadgroup);
++  if (simd_lane_id == 0) {
++    for (int i = 0; i < N; i++) {
++      xs[N * simd_group_id + i] = x[i];
++    }
++  }
++  threadgroup_barrier(mem_flags::mem_threadgroup);
++  for (int i = 0; i < N; i++) {
++    x[i] = xs[N * simd_lane_id + i];
++    x[i] = simd_sum(x[i]);
++  }
++}
++
++inline size_t group_norm_offset(
++    uint gid,
++    uint group_offset,
++    uint axis_size,
++    uint group_size,
++    uint num_groups) {
++  const uint batch = gid / num_groups;
++  const uint group = gid % num_groups;
++  const uint spatial = group_offset / group_size;
++  const uint channel_in_group = group_offset % group_size;
++  const uint channels = group_size * num_groups;
++  return static_cast<size_t>(batch) * axis_size * num_groups +
++      static_cast<size_t>(spatial) * channels + group * group_size +
++      channel_in_group;
++}
++
++// The reduction and launch geometry intentionally mirror layer_norm_single_row
++// exactly. The only difference is the channel-aware affine index. The explicit
++// T temporaries preserve eager GroupNorm's three boundaries: LayerNorm writes
++// T, multiply writes T, and add writes T.
++template <typename T, int N_READS = 8>
++[[kernel]] void group_norm_affine_single_row(
++    const device T* x,
++    const device T* weight,
++    const device T* bias,
++    device T* out,
++    constant float& eps,
++    constant uint& axis_size,
++    constant uint& group_size,
++    constant uint& num_groups,
++    uint gid [[threadgroup_position_in_grid]],
++    uint lid [[thread_position_in_threadgroup]],
++    uint simd_lane_id [[thread_index_in_simdgroup]],
++    uint simd_group_id [[simdgroup_index_in_threadgroup]]) {
++  constexpr int SIMD_SIZE = 32;
++
++  float thread_x[N_READS] = {0};
++  threadgroup float local_buffer[SIMD_SIZE] = {0};
++  group_norm_initialize_buffer(local_buffer, simd_lane_id, simd_group_id);
++
++  const uint lane_base = lid * N_READS;
++  const bool safe = lane_base + N_READS <= axis_size;
++  const int n = axis_size - lane_base;
++
++  if (safe) {
++    for (int i = 0; i < N_READS; i++) {
++      thread_x[i] = x[group_norm_offset(
++          gid, lane_base + i, axis_size, group_size, num_groups)];
++    }
++  } else {
++    for (int i = 0; i < n; i++) {
++      thread_x[i] = x[group_norm_offset(
++          gid, lane_base + i, axis_size, group_size, num_groups)];
++    }
++  }
++
++  float mean = 0;
++  for (int i = 0; i < N_READS; i++) {
++    mean += thread_x[i];
++  }
++  group_norm_threadgroup_sum(&mean, local_buffer, simd_lane_id, simd_group_id);
++  mean /= axis_size;
++
++  float normalizer = 0;
++  if (!safe) {
++    for (int i = n; i < N_READS; i++) {
++      thread_x[i] = mean;
++    }
++  }
++  for (int i = 0; i < N_READS; i++) {
++    thread_x[i] -= mean;
++    normalizer += thread_x[i] * thread_x[i];
++  }
++  group_norm_threadgroup_sum(
++      &normalizer, local_buffer, simd_lane_id, simd_group_id);
++  normalizer = metal::precise::rsqrt(normalizer / axis_size + eps);
++
++  const uint group = gid % num_groups;
++  const int count = safe ? N_READS : n;
++  for (int i = 0; i < count; i++) {
++    thread_x[i] *= normalizer;
++    const uint group_offset = lane_base + i;
++    const uint channel = group * group_size + group_offset % group_size;
++    const size_t offset =
++        group_norm_offset(gid, group_offset, axis_size, group_size, num_groups);
++    const T normed = static_cast<T>(thread_x[i]);
++    const T scaled = static_cast<T>(normed * weight[channel]);
++    out[offset] = static_cast<T>(scaled + bias[channel]);
++  }
++}
++
++template <typename T, int N_READS = 4>
++[[kernel]] void group_norm_affine_looped(
++    const device T* x,
++    const device T* weight,
++    const device T* bias,
++    device T* out,
++    constant float& eps,
++    constant uint& axis_size,
++    constant uint& group_size,
++    constant uint& num_groups,
++    uint gid [[threadgroup_position_in_grid]],
++    uint lid [[thread_position_in_threadgroup]],
++    uint lsize [[threads_per_threadgroup]],
++    uint simd_lane_id [[thread_index_in_simdgroup]],
++    uint simd_group_id [[simdgroup_index_in_threadgroup]]) {
++  constexpr int SIMD_SIZE = 32;
++
++  threadgroup float local_buffer[SIMD_SIZE];
++  group_norm_initialize_buffer(local_buffer, simd_lane_id, simd_group_id);
++
++  float mean = 0;
++  for (uint r = 0; r < axis_size; r += lsize * N_READS) {
++    if (r + lid * N_READS + N_READS <= axis_size) {
++      for (int i = 0; i < N_READS; i++) {
++        const uint group_offset = r + lid * N_READS + i;
++        mean += x[group_norm_offset(
++            gid, group_offset, axis_size, group_size, num_groups)];
++      }
++    } else {
++      for (int i = 0; i < N_READS; i++) {
++        if ((r + lid * N_READS + i) < axis_size) {
++          const uint group_offset = r + lid * N_READS + i;
++          mean += x[group_norm_offset(
++              gid, group_offset, axis_size, group_size, num_groups)];
++        }
++      }
++    }
++  }
++  group_norm_threadgroup_sum(&mean, local_buffer, simd_lane_id, simd_group_id);
++  mean /= axis_size;
++
++  float normalizer = 0;
++  for (uint r = 0; r < axis_size; r += lsize * N_READS) {
++    if (r + lid * N_READS + N_READS <= axis_size) {
++      for (int i = 0; i < N_READS; i++) {
++        const uint group_offset = r + lid * N_READS + i;
++        float t = x[group_norm_offset(
++                      gid, group_offset, axis_size, group_size, num_groups)] -
++            mean;
++        normalizer += t * t;
++      }
++    } else {
++      for (int i = 0; i < N_READS; i++) {
++        if ((r + lid * N_READS + i) < axis_size) {
++          const uint group_offset = r + lid * N_READS + i;
++          float t = x[group_norm_offset(
++                        gid, group_offset, axis_size, group_size, num_groups)] -
++              mean;
++          normalizer += t * t;
++        }
++      }
++    }
++  }
++  group_norm_threadgroup_sum(
++      &normalizer, local_buffer, simd_lane_id, simd_group_id);
++  normalizer = metal::precise::rsqrt(normalizer / axis_size + eps);
++
++  const uint group = gid % num_groups;
++  for (uint r = 0; r < axis_size; r += lsize * N_READS) {
++    for (int i = 0; i < N_READS; i++) {
++      const uint group_offset = r + lid * N_READS + i;
++      if (group_offset < axis_size) {
++        const size_t offset = group_norm_offset(
++            gid, group_offset, axis_size, group_size, num_groups);
++        float xi = (x[offset] - mean) * normalizer;
++        const uint channel = group * group_size + group_offset % group_size;
++        const T normed = static_cast<T>(xi);
++        const T scaled = static_cast<T>(normed * weight[channel]);
++        out[offset] = static_cast<T>(scaled + bias[channel]);
++      }
++    }
++  }
++}
++
++// clang-format off
++#define instantiate_group_norm(name, itype)                                     \
++  instantiate_kernel(                                                          \
++      "group_norm_affine" #name, group_norm_affine_single_row, itype)          \
++  instantiate_kernel(                                                          \
++      "group_norm_affine_looped" #name, group_norm_affine_looped, itype)
++
++instantiate_group_norm(float32, float)
++instantiate_group_norm(float16, half)
++instantiate_group_norm(bfloat16, bfloat16_t) // clang-format on
+diff --git a/mlx/backend/metal/normalization.cpp b/mlx/backend/metal/normalization.cpp
+index 9a222cd..3776375 100644
+--- a/mlx/backend/metal/normalization.cpp
++++ b/mlx/backend/metal/normalization.cpp
+@@ -298,6 +298,83 @@ void LayerNorm::eval_gpu(
+   }
+ }
+ 
++void GroupNormAffine::eval_gpu(
++    const std::vector<array>& inputs,
++    std::vector<array>& outputs) {
++  auto& s = stream();
++  auto& d = metal::device(s.device);
++  auto& out = outputs[0];
++
++  auto ensure_row_contiguous = [&s](const array& input) {
++    return input.flags().row_contiguous ? input : contiguous_copy_gpu(input, s);
++  };
++
++  const array x = ensure_row_contiguous(inputs[0]);
++  const array weight = ensure_row_contiguous(inputs[1]);
++  const array bias = ensure_row_contiguous(inputs[2]);
++  if (x.is_donatable()) {
++    out.copy_shared_buffer(x);
++  } else {
++    out.set_data(
++        allocator::malloc(x.data_size() * x.itemsize()),
++        x.data_size(),
++        x.strides(),
++        x.flags());
++  }
++
++  const uint32_t batch = x.shape(0);
++  const uint32_t channels = x.shape(-1);
++  const uint32_t num_groups = num_groups_;
++  const uint32_t group_size = channels / num_groups;
++  const uint32_t axis_size = x.size() / (batch * num_groups);
++  const size_t n_rows = static_cast<size_t>(batch) * num_groups;
++
++  constexpr int simd_size = 32;
++  int n_reads = 8;
++  constexpr int looped_limit = 6656;
++  std::string op_name = "group_norm_affine";
++  if (axis_size > looped_limit) {
++    op_name += "_looped";
++    n_reads = 4;
++  }
++  op_name += type_to_name(out);
++
++  auto& compute_encoder = metal::get_command_encoder(s);
++  auto kernel = d.get_kernel(op_name);
++
++  MTL::Size grid_dims;
++  MTL::Size group_dims;
++  if (axis_size <= looped_limit) {
++    size_t threadgroup_needed = (axis_size + n_reads - 1) / n_reads;
++    size_t simds_needed = (threadgroup_needed + simd_size - 1) / simd_size;
++    size_t threadgroup_size = simd_size * simds_needed;
++    if (threadgroup_size > kernel->maxTotalThreadsPerThreadgroup()) {
++      std::ostringstream msg;
++      msg << "[group_norm_affine] Threadgroup size " << threadgroup_size
++          << " is larger than the maximum allowed threadgroup size "
++          << kernel->maxTotalThreadsPerThreadgroup();
++      throw std::runtime_error(msg.str());
++    }
++    grid_dims = MTL::Size(n_rows * threadgroup_size, 1, 1);
++    group_dims = MTL::Size(threadgroup_size, 1, 1);
++  } else {
++    size_t threadgroup_size = kernel->maxTotalThreadsPerThreadgroup();
++    grid_dims = MTL::Size(n_rows * threadgroup_size, 1, 1);
++    group_dims = MTL::Size(threadgroup_size, 1, 1);
++  }
++
++  compute_encoder.set_compute_pipeline_state(kernel);
++  compute_encoder.set_input_array(x, 0);
++  compute_encoder.set_input_array(weight, 1);
++  compute_encoder.set_input_array(bias, 2);
++  compute_encoder.set_output_array(out, 3);
++  compute_encoder.set_bytes(eps_, 4);
++  compute_encoder.set_bytes(axis_size, 5);
++  compute_encoder.set_bytes(group_size, 6);
++  compute_encoder.set_bytes(num_groups, 7);
++  compute_encoder.dispatch_threads(grid_dims, group_dims);
++}
++
+ void LayerNormVJP::eval_gpu(
+     const std::vector<array>& inputs,
+     std::vector<array>& outputs) {
+diff --git a/mlx/fast.cpp b/mlx/fast.cpp
+index a668fe9..6bf91b1 100644
+--- a/mlx/fast.cpp
++++ b/mlx/fast.cpp
+@@ -364,6 +364,86 @@ bool LayerNormVJP::is_equivalent(const Primitive& other) const {
+   return eps_ == a_other.eps_;
+ }
+ 
++array group_norm_affine(
++    const array& x,
++    const array& weight,
++    const array& bias,
++    int num_groups,
++    float eps,
++    StreamOrDevice s_ /* = {} */) {
++  constexpr std::string_view tag = "group_norm_affine";
++  if (x.ndim() < 2) {
++    std::ostringstream msg;
++    msg << "[" << tag << "] Input must have at least 2 dimensions but got "
++        << x.ndim() << " dimensions.";
++    throw std::invalid_argument(msg.str());
++  }
++  if (x.size() == 0) {
++    throw std::invalid_argument(
++        "[group_norm_affine] Empty inputs must use the eager fallback.");
++  }
++  const int channels = x.shape(-1);
++  if (num_groups <= 0 || channels % num_groups != 0) {
++    std::ostringstream msg;
++    msg << "[" << tag << "] Channel count " << channels
++        << " must be divisible by the positive group count " << num_groups
++        << ".";
++    throw std::invalid_argument(msg.str());
++  }
++  if (weight.ndim() != 1 || weight.size() != channels || bias.ndim() != 1 ||
++      bias.size() != channels) {
++    std::ostringstream msg;
++    msg << "[" << tag << "] Weight and bias must both have shape (" << channels
++        << ").";
++    throw std::invalid_argument(msg.str());
++  }
++  const bool supported_type =
++      x.dtype() == float32 || x.dtype() == float16 || x.dtype() == bfloat16;
++  if (!supported_type || weight.dtype() != x.dtype() ||
++      bias.dtype() != x.dtype()) {
++    throw std::invalid_argument(
++        "[group_norm_affine] Input, weight, and bias must have the same "
++        "float32, float16, or bfloat16 dtype.");
++  }
++
++  auto s = to_stream(s_);
++  if (s.device != Device::gpu) {
++    throw std::invalid_argument(
++        "[group_norm_affine] The exact fused epilogue is Metal-only.");
++  }
++
++  auto fallback = [num_groups, eps, s](const std::vector<array>& inputs) {
++    const auto& x = inputs[0];
++    const auto& weight = inputs[1];
++    const auto& bias = inputs[2];
++    const auto original_shape = x.shape();
++    const int batch = x.shape(0);
++    const int channels = x.shape(-1);
++    const int group_size = channels / num_groups;
++
++    auto grouped = reshape(x, {batch, -1, num_groups, group_size}, s);
++    grouped = transpose(grouped, {0, 2, 1, 3}, s);
++    grouped = reshape(grouped, {batch, num_groups, -1}, s);
++    grouped = layer_norm(grouped, std::nullopt, std::nullopt, eps, s);
++    grouped = reshape(grouped, {batch, num_groups, -1, group_size}, s);
++    grouped = transpose(grouped, {0, 2, 1, 3}, s);
++    auto normed = reshape(grouped, original_shape, s);
++    auto scaled = multiply(normed, weight, s);
++    return std::vector<array>{add(scaled, bias, s)};
++  };
++
++  return array(
++      x.shape(),
++      x.dtype(),
++      std::make_shared<GroupNormAffine>(s, fallback, num_groups, eps),
++      {x, weight, bias});
++}
++
++bool GroupNormAffine::is_equivalent(const Primitive& other) const {
++  const GroupNormAffine& a_other = static_cast<const GroupNormAffine&>(other);
++  return num_groups_ == a_other.num_groups_ && eps_ == a_other.eps_;
++}
++
+ array rope(
+     std::vector<array> inputs,
+     int dims,
+diff --git a/mlx/fast.h b/mlx/fast.h
+index 934fadc..7184d18 100644
+--- a/mlx/fast.h
++++ b/mlx/fast.h
+@@ -24,6 +24,23 @@ MLX_API array layer_norm(
+     float eps,
+     StreamOrDevice s = {});
+ 
++/**
++ * PyTorch-compatible GroupNorm over a channels-last tensor with affine weight
++ * and bias applied in the native Metal normalization epilogue.
++ *
++ * This strict operation preserves the eager
++ * ``layer_norm -> multiply -> add`` dtype-rounding boundaries. It supports
++ * matching float32, float16, or bfloat16 inputs on Metal only and throws for
++ * any unsupported dispatch so callers can truthfully use the eager fallback.
++ */
++MLX_API array group_norm_affine(
++    const array& x,
++    const array& weight,
++    const array& bias,
++    int num_groups,
++    float eps,
++    StreamOrDevice s = {});
++
+ MLX_API array rope(
+     const array& x,
+     int dims,
+diff --git a/mlx/fast_primitives.h b/mlx/fast_primitives.h
+index 0d2f861..022b2cb 100644
+--- a/mlx/fast_primitives.h
++++ b/mlx/fast_primitives.h
+@@ -156,6 +156,37 @@ class LayerNormVJP : public Custom {
+   float eps_;
+ };
+ 
++class GroupNormAffine : public Custom {
++ public:
++  GroupNormAffine(
++      Stream stream,
++      std::function<std::vector<array>(std::vector<array>)> fallback,
++      int num_groups,
++      float eps)
++      : Custom(stream, std::move(fallback)),
++        num_groups_(num_groups),
++        eps_(eps) {}
++
++  void eval_cpu(const std::vector<array>& inputs, std::vector<array>& outputs)
++      override {
++    throw std::runtime_error(
++        "[group_norm_affine] The exact fused epilogue is Metal-only.");
++  }
++  void eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs)
++      override;
++
++  DEFINE_NAME(GroupNormAffine)
++  bool is_equivalent(const Primitive& other) const override;
++  DEFINE_INPUT_OUTPUT_SHAPE()
++  auto state() const {
++    return std::make_tuple(nullptr, num_groups_, eps_);
++  }
++
++ private:
++  int num_groups_;
++  float eps_;
++};
++
+ class RoPE : public Custom {
+  public:
+   RoPE(
+diff --git a/tests/gpu_tests.cpp b/tests/gpu_tests.cpp
+index d920da4..8663b34 100644
+--- a/tests/gpu_tests.cpp
++++ b/tests/gpu_tests.cpp
+@@ -686,3 +686,58 @@ TEST_CASE("test layer norm vjp bias grad race") {
+   }
+   CHECK(worst <= 1e-5);
+ }
++
++TEST_CASE("test exact group norm affine epilogue") {
++  auto eager = [](const array& x,
++                  const array& weight,
++                  const array& bias,
++                  int num_groups,
++                  float eps) {
++    const auto shape = x.shape();
++    const int batch = shape.front();
++    const int channels = shape.back();
++    const int group_size = channels / num_groups;
++    auto grouped = reshape(x, {batch, -1, num_groups, group_size});
++    grouped = transpose(grouped, {0, 2, 1, 3});
++    grouped = reshape(grouped, {batch, num_groups, -1});
++    grouped =
++        fast::layer_norm(grouped, std::nullopt, std::nullopt, eps, Device::gpu);
++    grouped = reshape(grouped, {batch, num_groups, -1, group_size});
++    grouped = transpose(grouped, {0, 2, 1, 3});
++    auto normed = reshape(grouped, shape);
++    return add(multiply(normed, weight, Device::gpu), bias, Device::gpu);
++  };
++
++  for (auto dtype : {float32, float16, bfloat16}) {
++    for (auto shape : {Shape{2, 3, 5, 32}, Shape{1, 67, 101, 64}}) {
++      auto x = astype(
++          random::normal(shape, float32, 0.0f, 1.0f, random::key(21)), dtype);
++      auto weight = astype(
++          random::normal({shape.back()}, float32, 0.0f, 1.0f, random::key(22)),
++          dtype);
++      auto bias = astype(
++          random::normal({shape.back()}, float32, 0.0f, 1.0f, random::key(23)),
++          dtype);
++
++      auto reference = eager(x, weight, bias, 8, 1e-5f);
++      auto fused =
++          fast::group_norm_affine(x, weight, bias, 8, 1e-5f, Device::gpu);
++      CHECK(array_equal(reference, fused, Device::cpu).item<bool>());
++    }
++  }
++
++  auto x = random::normal({2, 4, 3, 32}, float32, 0.0f, 1.0f, random::key(24));
++  x = transpose(x, {0, 2, 1, 3});
++  auto weight = random::normal({32}, float32, 0.0f, 1.0f, random::key(25));
++  auto bias = random::normal({32}, float32, 0.0f, 1.0f, random::key(26));
++  CHECK(array_equal(
++            eager(x, weight, bias, 8, 1e-5f),
++            fast::group_norm_affine(x, weight, bias, 8, 1e-5f, Device::gpu),
++            Device::cpu)
++            .item<bool>());
++
++  CHECK_THROWS_WITH_AS(
++      fast::group_norm_affine(x, weight, bias, 8, 1e-5f, Device::cpu),
++      "[group_norm_affine] The exact fused epilogue is Metal-only.",
++      std::invalid_argument);
++}
+-- 
+2.50.1 (Apple Git-155)
+

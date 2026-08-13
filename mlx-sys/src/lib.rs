@@ -45,4 +45,13 @@ extern "C" {
         flip: bool,
         stream: mlx_stream,
     ) -> ::std::os::raw::c_int;
+    pub fn mlx_pmetal_group_norm_affine(
+        res: *mut mlx_array,
+        x: mlx_array,
+        weight: mlx_array,
+        bias: mlx_array,
+        num_groups: ::std::os::raw::c_int,
+        eps: f32,
+        stream: mlx_stream,
+    ) -> ::std::os::raw::c_int;
 }
