@@ -61,11 +61,14 @@ jobs:
       - name: Build pmetal-mlx-sys (${{ matrix.build_type }})
         run: |
           set -euo pipefail
+          # No --locked: this repository does not commit Cargo.lock (see .gitignore; validate.yml
+          # builds unlocked too). The build-dependency versions do not reach libmlx's bytes; the
+          # manifest fingerprint covers everything that does.
           if [ "${{ matrix.build_type }}" = "Release" ]; then
-            cargo build --locked --release -p pmetal-mlx-sys
+            cargo build --release -p pmetal-mlx-sys
             profile_dir=release
           else
-            cargo build --locked -p pmetal-mlx-sys
+            cargo build -p pmetal-mlx-sys
             profile_dir=debug
           fi
           lib_dirs=(target/$profile_dir/build/pmetal-mlx-sys-*/out/build/lib)
