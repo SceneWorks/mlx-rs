@@ -1,7 +1,30 @@
 extern crate cmake;
 
 use cmake::Config;
-use std::{env, path::PathBuf, process::Command};
+use sha2::{Digest, Sha256};
+use std::{
+    collections::BTreeMap,
+    env,
+    path::{Path, PathBuf},
+    process::Command,
+};
+
+/// Environment variable naming a directory that holds a **prebuilt** MLX: the `build/lib` output
+/// of a previous cmake build of this crate (`libmlx.a`, `libmlxc.a`, `mlx.metallib` when built
+/// with `metal`, and the `pmetal-mlx-prebuilt.txt` manifest this script writes next to them).
+///
+/// When set, the cmake build (≈6 min on a 3-core hosted Mac, with a network fetch of MLX) is
+/// skipped and the archives in that directory are linked instead — after the manifest is checked
+/// against THIS build's key (source fingerprint, target triple, deployment target, features,
+/// Debug/Release). A mismatch is a hard error, never a silent fallback: a libmlx built for the
+/// wrong deployment target links fine and miscompiles NAX kernels at runtime (sc-2772).
+///
+/// Unset or empty ⇒ exactly the cmake path, unchanged. Bindgen still runs against the headers
+/// in `src/mlx-c`, which ship with the crate.
+const PREBUILT_ENV: &str = "PMETAL_MLX_PREBUILT_DIR";
+/// Manifest file name, written into `build/lib` by every cmake build and read from the prebuilt dir.
+const PREBUILT_MANIFEST: &str = "pmetal-mlx-prebuilt.txt";
+const PREBUILT_SCHEMA: &str = "1";
 
 /// The clang runtime variant to link, chosen for the **target**, not the host.
 ///
@@ -877,6 +900,181 @@ fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> std::io::
     Ok(())
 }
 
+/// SHA-256 over every input that determines what cmake produces: this script, the crate
+/// manifest, every patch, and the whole `src/mlx-c` tree (MLX itself is pinned by mlx-c's
+/// CMakeLists and the patches). Two checkouts with the same fingerprint build byte-identical
+/// inputs; a prebuilt carrying a different fingerprint came from other sources.
+fn source_fingerprint() -> String {
+    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+        let mut entries: Vec<_> = std::fs::read_dir(dir)
+            .unwrap_or_else(|e| panic!("mlx-sys: cannot read {}: {e}", dir.display()))
+            .flatten()
+            .map(|e| e.path())
+            .collect();
+        entries.sort();
+        for path in entries {
+            if path.file_name().is_some_and(|n| n == ".git") {
+                continue;
+            }
+            if path.is_dir() {
+                walk(&path, out);
+            } else {
+                out.push(path);
+            }
+        }
+    }
+    let mut hasher = Sha256::new();
+    let mut files = vec![PathBuf::from("build.rs"), PathBuf::from("Cargo.toml")];
+    walk(Path::new("patches"), &mut files);
+    walk(Path::new("src/mlx-c"), &mut files);
+    for path in files {
+        let bytes = std::fs::read(&path)
+            .unwrap_or_else(|e| panic!("mlx-sys: cannot read {}: {e}", path.display()));
+        hasher.update(path.to_string_lossy().replace('\\', "/").as_bytes());
+        hasher.update([0u8]);
+        hasher.update((bytes.len() as u64).to_le_bytes());
+        hasher.update(&bytes);
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+/// The key a prebuilt must match. Every field is something that changes the bytes cmake
+/// produces or the bytes the final link needs.
+fn prebuilt_key(deployment_target: Option<&str>) -> BTreeMap<&'static str, String> {
+    let mut features = Vec::new();
+    if cfg!(feature = "accelerate") {
+        features.push("accelerate");
+    }
+    if cfg!(feature = "metal") {
+        features.push("metal");
+    }
+    let mut key = BTreeMap::new();
+    key.insert("schema", PREBUILT_SCHEMA.to_string());
+    key.insert("fingerprint", source_fingerprint());
+    key.insert("target", env::var("TARGET").expect("cargo sets TARGET"));
+    key.insert(
+        "deployment_target",
+        deployment_target.unwrap_or("-").to_string(),
+    );
+    key.insert("features", features.join(","));
+    key.insert(
+        "build_type",
+        if cfg!(debug_assertions) {
+            "Debug"
+        } else {
+            "Release"
+        }
+        .to_string(),
+    );
+    key
+}
+
+/// Write the manifest next to the freshly built archives so `build/lib` can be tarred as-is.
+/// Informational fields (toolchain versions) are recorded but not compared.
+fn write_prebuilt_manifest(lib_dir: &Path, deployment_target: Option<&str>) {
+    let mut text = String::new();
+    for (k, v) in prebuilt_key(deployment_target) {
+        text.push_str(&format!("{k}={v}\n"));
+    }
+    let probe = |cmd: &str, args: &[&str]| -> String {
+        Command::new(cmd)
+            .args(args)
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| {
+                String::from_utf8_lossy(&o.stdout)
+                    .lines()
+                    .map(str::trim)
+                    .filter(|l| !l.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(" | ")
+            })
+            .unwrap_or_else(|| "-".to_string())
+    };
+    text.push_str(&format!(
+        "info.sdk_version={}\n",
+        probe("xcrun", &["--show-sdk-version"])
+    ));
+    text.push_str(&format!(
+        "info.xcodebuild={}\n",
+        probe("xcodebuild", &["-version"])
+    ));
+    text.push_str(&format!(
+        "info.metal={}\n",
+        probe("xcrun", &["metal", "--version"])
+    ));
+    text.push_str(&format!(
+        "info.host={}\n",
+        probe("sw_vers", &["-productVersion"])
+    ));
+    let path = lib_dir.join(PREBUILT_MANIFEST);
+    std::fs::write(&path, text)
+        .unwrap_or_else(|e| panic!("mlx-sys: cannot write {}: {e}", path.display()));
+}
+
+/// `$PMETAL_MLX_PREBUILT_DIR` when set and non-empty.
+fn prebuilt_dir() -> Option<PathBuf> {
+    println!("cargo:rerun-if-env-changed={PREBUILT_ENV}");
+    env::var_os(PREBUILT_ENV)
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+}
+
+/// Check `dir` against this build's key and return it as the link directory. Every failure is a
+/// panic with both keys spelled out — a prebuilt for the wrong deployment target links fine and
+/// is only wrong at runtime (sc-2772), so "fall back to cmake" is not an acceptable answer here.
+fn verify_prebuilt(dir: &Path, deployment_target: Option<&str>) {
+    let manifest = dir.join(PREBUILT_MANIFEST);
+    let text = std::fs::read_to_string(&manifest).unwrap_or_else(|e| {
+        panic!(
+            "mlx-sys: {PREBUILT_ENV}={} but {} cannot be read ({e}). A prebuilt dir is the \
+             `build/lib` output of a cmake build of this crate (libmlx.a, libmlxc.a, \
+             mlx.metallib, {PREBUILT_MANIFEST}); unset {PREBUILT_ENV} to build from source.",
+            dir.display(),
+            manifest.display()
+        )
+    });
+    let have: BTreeMap<String, String> = text
+        .lines()
+        .filter_map(|l| l.split_once('='))
+        .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+        .collect();
+    let want = prebuilt_key(deployment_target);
+    let mismatches: Vec<String> = want
+        .iter()
+        .filter(|(k, v)| have.get(**k) != Some(v))
+        .map(|(k, v)| {
+            format!(
+                "  {k}: prebuilt={} this build={v}",
+                have.get(*k).map(String::as_str).unwrap_or("<missing>")
+            )
+        })
+        .collect();
+    assert!(
+        mismatches.is_empty(),
+        "mlx-sys: the prebuilt MLX at {} does not match this build:\n{}\nRe-fetch the prebuilt \
+         for this key or unset {PREBUILT_ENV} to build from source.",
+        dir.display(),
+        mismatches.join("\n")
+    );
+    let mut required = vec!["libmlx.a", "libmlxc.a"];
+    if cfg!(feature = "metal") {
+        required.push("mlx.metallib");
+    }
+    for name in required {
+        assert!(
+            dir.join(name).is_file(),
+            "mlx-sys: the prebuilt MLX at {} matches this build's key but is missing {name}",
+            dir.display()
+        );
+    }
+    println!(
+        "cargo:warning=mlx-sys: linking prebuilt MLX from {} (cmake skipped)",
+        dir.display()
+    );
+}
+
 fn build_and_link_mlx_c() {
     // Resolve and export the deployment target early so the cmake crate (and the cc crate) don't
     // inject a lower -m<platform>-version-min into CFLAGS/CXXFLAGS. Without this, cargo's default
@@ -884,6 +1082,10 @@ fn build_and_link_mlx_c() {
     // an unset target also drops __chkstk_darwin (libSystem, iOS 12+) at link time.
     let platform = apple_platform();
     let deployment_target = platform.as_ref().map(|platform| {
+        // The deployment target is a build input (it selects the Metal version and therefore
+        // which kernels exist — sc-2772), so a change must re-run this script. Until sc-21382
+        // it did not, and a stale OUT_DIR silently kept the old target's libmlx.
+        println!("cargo:rerun-if-env-changed={}", platform.deployment_env);
         let target = resolve_deployment_target(platform);
         // `env::set_var` reaches the cmake/cc child processes, but NOT rustc's link of a
         // downstream binary — that is a separate cargo invocation with its own environment. Off
@@ -953,6 +1155,115 @@ fn build_and_link_mlx_c() {
         );
     }
 
+    // Prebuilt path: verify, then link from the directory instead of building. Everything below
+    // the `lib_dir` assignment is shared with the cmake path.
+    let prebuilt = prebuilt_dir();
+    let lib_dir: PathBuf = if let Some(dir) = &prebuilt {
+        verify_prebuilt(dir, deployment_target.as_deref());
+        dir.clone()
+    } else {
+        build_from_source(&platform, deployment_target.as_deref())
+    };
+
+    println!("cargo:rustc-link-search=native={}", lib_dir.display());
+    println!("cargo:rustc-link-lib=static=mlx");
+    println!("cargo:rustc-link-lib=static=mlxc");
+
+    println!("cargo:rustc-link-lib=c++");
+    println!("cargo:rustc-link-lib=dylib=objc");
+    println!("cargo:rustc-link-lib=framework=Foundation");
+
+    #[cfg(feature = "metal")]
+    {
+        println!("cargo:rustc-link-lib=framework=Metal");
+
+        // Must come after the Metal/mlx link directives — see the function's doc comment.
+        if let Some(platform) = &platform {
+            if platform.cmake_system_name.is_some() {
+                shim_unexported_metal_cpp_symbols(platform, &lib_dir);
+            }
+        }
+    }
+
+    #[cfg(feature = "accelerate")]
+    {
+        println!("cargo:rustc-link-lib=framework=Accelerate");
+    }
+
+    // Link against Xcode's clang runtime for ___isPlatformVersionAtLeast symbol
+    // This is needed on macOS 26+ where the bundled LLVM runtime may be outdated
+    // See: https://github.com/conda-forge/llvmdev-feedstock/issues/244
+    if let Some(clang_rt) = clang_rt_variant() {
+        if let Some(clang_rt_path) = find_clang_rt_path(clang_rt) {
+            println!("cargo:rustc-link-search={}", clang_rt_path);
+            println!("cargo:rustc-link-lib=static=clang_rt.{clang_rt}");
+        }
+    }
+
+    // Publish the built metallib's path to dependents as DEP_MLX_METALLIB (requires the `links`
+    // key in Cargo.toml). This is the supported way off the host: `~/.cache/pmetal/lib` does not
+    // exist inside an iOS app sandbox, and the compiled-in METAL_PATH points into the cargo
+    // target directory, which is not shipped. An iOS packaging step reads this and copies the
+    // metallib into the .app, where MLX's `load_colocated_library` finds it next to the
+    // executable. Emitted on every platform — it is just a path — so a macOS packager can use it
+    // too rather than reaching into target/ by hand.
+    #[cfg(feature = "metal")]
+    {
+        let metallib = lib_dir.join("mlx.metallib");
+        if metallib.exists() {
+            println!("cargo:metallib={}", metallib.display());
+        }
+    }
+
+    // Cache mlx.metallib to ~/.cache/pmetal/lib/ so the binary works regardless
+    // of where it's installed. This is critical for `cargo install` where the
+    // build directory is cleaned up after the binary is placed.
+    //
+    // macOS ONLY. The cache is a single shared, platform-agnostic path, so a cross-compiled
+    // build would silently overwrite the host's metallib with kernels for another platform —
+    // and the resolver has no way to tell them apart. Local `cargo test`/`run` binaries have no
+    // compiled-in metallib and resolve *solely* through this cache, so poisoning it breaks every
+    // subsequent macOS test run until a native build repairs it. An iOS app bundles its metallib
+    // in the `.app` and never reads `$HOME` anyway (there is nothing useful there in the sandbox).
+    // A prebuilt metallib goes through the same cache: the resolver does not care who compiled it.
+    #[cfg(feature = "metal")]
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
+        let metallib = lib_dir.join("mlx.metallib");
+        if metallib.exists() {
+            if let Ok(home) = env::var("HOME") {
+                let cache_dir = PathBuf::from(home).join(".cache/pmetal/lib");
+                let dest = cache_dir.join("mlx.metallib");
+                let should_copy = if dest.exists() {
+                    // Replace if the build artifact is newer
+                    dest.metadata()
+                        .and_then(|d| {
+                            metallib.metadata().map(|s| {
+                                s.modified()
+                                    .ok()
+                                    .zip(d.modified().ok())
+                                    .is_some_and(|(src_t, dst_t)| src_t > dst_t)
+                            })
+                        })
+                        .unwrap_or(false)
+                } else {
+                    true
+                };
+                if should_copy {
+                    let _ = std::fs::create_dir_all(&cache_dir);
+                    match std::fs::copy(&metallib, &dest) {
+                        Ok(_) => {
+                            println!("cargo:warning=Cached mlx.metallib to {}", dest.display())
+                        }
+                        Err(e) => println!("cargo:warning=Failed to cache mlx.metallib: {}", e),
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The cmake build. Returns the `build/lib` directory holding the archives (and the manifest).
+fn build_from_source(platform: &Option<ApplePlatform>, deployment_target: Option<&str>) -> PathBuf {
     let mlx_c_src = prepare_mlx_c_source();
     let mut config = Config::new(&mlx_c_src);
     config.very_verbose(true);
@@ -973,7 +1284,7 @@ fn build_and_link_mlx_c() {
         // CMAKE_OSX_DEPLOYMENT_TARGET is the knob for every Apple platform, not just macOS.
         config.define(
             "CMAKE_OSX_DEPLOYMENT_TARGET",
-            deployment_target.as_deref().unwrap_or_default(),
+            deployment_target.unwrap_or_default(),
         );
 
         // Hand MLX the SDK and version-min flag for THIS platform. apple-metal-sdk.patch reads
@@ -1038,101 +1349,9 @@ fn build_and_link_mlx_c() {
 
     // build the mlx-c project
     let dst = config.build();
-
-    println!("cargo:rustc-link-search=native={}/build/lib", dst.display());
-    println!("cargo:rustc-link-lib=static=mlx");
-    println!("cargo:rustc-link-lib=static=mlxc");
-
-    println!("cargo:rustc-link-lib=c++");
-    println!("cargo:rustc-link-lib=dylib=objc");
-    println!("cargo:rustc-link-lib=framework=Foundation");
-
-    #[cfg(feature = "metal")]
-    {
-        println!("cargo:rustc-link-lib=framework=Metal");
-
-        // Must come after the Metal/mlx link directives — see the function's doc comment.
-        if let Some(platform) = &platform {
-            if platform.cmake_system_name.is_some() {
-                shim_unexported_metal_cpp_symbols(platform, &dst.join("build/lib"));
-            }
-        }
-    }
-
-    #[cfg(feature = "accelerate")]
-    {
-        println!("cargo:rustc-link-lib=framework=Accelerate");
-    }
-
-    // Link against Xcode's clang runtime for ___isPlatformVersionAtLeast symbol
-    // This is needed on macOS 26+ where the bundled LLVM runtime may be outdated
-    // See: https://github.com/conda-forge/llvmdev-feedstock/issues/244
-    if let Some(clang_rt) = clang_rt_variant() {
-        if let Some(clang_rt_path) = find_clang_rt_path(clang_rt) {
-            println!("cargo:rustc-link-search={}", clang_rt_path);
-            println!("cargo:rustc-link-lib=static=clang_rt.{clang_rt}");
-        }
-    }
-
-    // Publish the built metallib's path to dependents as DEP_MLX_METALLIB (requires the `links`
-    // key in Cargo.toml). This is the supported way off the host: `~/.cache/pmetal/lib` does not
-    // exist inside an iOS app sandbox, and the compiled-in METAL_PATH points into the cargo
-    // target directory, which is not shipped. An iOS packaging step reads this and copies the
-    // metallib into the .app, where MLX's `load_colocated_library` finds it next to the
-    // executable. Emitted on every platform — it is just a path — so a macOS packager can use it
-    // too rather than reaching into target/ by hand.
-    #[cfg(feature = "metal")]
-    {
-        let metallib = dst.join("build/lib/mlx.metallib");
-        if metallib.exists() {
-            println!("cargo:metallib={}", metallib.display());
-        }
-    }
-
-    // Cache mlx.metallib to ~/.cache/pmetal/lib/ so the binary works regardless
-    // of where it's installed. This is critical for `cargo install` where the
-    // build directory is cleaned up after the binary is placed.
-    //
-    // macOS ONLY. The cache is a single shared, platform-agnostic path, so a cross-compiled
-    // build would silently overwrite the host's metallib with kernels for another platform —
-    // and the resolver has no way to tell them apart. Local `cargo test`/`run` binaries have no
-    // compiled-in metallib and resolve *solely* through this cache, so poisoning it breaks every
-    // subsequent macOS test run until a native build repairs it. An iOS app bundles its metallib
-    // in the `.app` and never reads `$HOME` anyway (there is nothing useful there in the sandbox).
-    #[cfg(feature = "metal")]
-    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
-        let metallib = dst.join("build/lib/mlx.metallib");
-        if metallib.exists() {
-            if let Ok(home) = env::var("HOME") {
-                let cache_dir = PathBuf::from(home).join(".cache/pmetal/lib");
-                let dest = cache_dir.join("mlx.metallib");
-                let should_copy = if dest.exists() {
-                    // Replace if the build artifact is newer
-                    dest.metadata()
-                        .and_then(|d| {
-                            metallib.metadata().map(|s| {
-                                s.modified()
-                                    .ok()
-                                    .zip(d.modified().ok())
-                                    .is_some_and(|(src_t, dst_t)| src_t > dst_t)
-                            })
-                        })
-                        .unwrap_or(false)
-                } else {
-                    true
-                };
-                if should_copy {
-                    let _ = std::fs::create_dir_all(&cache_dir);
-                    match std::fs::copy(&metallib, &dest) {
-                        Ok(_) => {
-                            println!("cargo:warning=Cached mlx.metallib to {}", dest.display())
-                        }
-                        Err(e) => println!("cargo:warning=Failed to cache mlx.metallib: {}", e),
-                    }
-                }
-            }
-        }
-    }
+    let lib_dir = dst.join("build/lib");
+    write_prebuilt_manifest(&lib_dir, deployment_target);
+    lib_dir
 }
 
 fn main() {

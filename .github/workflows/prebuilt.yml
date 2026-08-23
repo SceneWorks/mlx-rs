@@ -1,0 +1,108 @@
+name: prebuilt-mlx
+
+# Publishes prebuilt MLX archives for `pmetal-mlx-sys` (sc-21382).
+#
+# Every cmake build of mlx-sys writes `pmetal-mlx-prebuilt.txt` next to its archives; this
+# workflow runs that build for each (deployment target × Debug/Release) cell the consumers use,
+# tars `build/lib`, and attaches the tarballs to a GitHub Release named `prebuilt-<sha12>` for
+# the commit that was built. A consumer sets `PMETAL_MLX_PREBUILT_DIR` to the extracted
+# directory and mlx-sys's build.rs links it after checking the manifest against its own key
+# (source fingerprint, target, deployment target, features, build type) — a mismatch is a hard
+# error, so a stale or wrong tarball cannot link silently.
+#
+# Cells:
+#   15.0 / macos-15 — what inference's hosted `macos-metal` lane builds (SDK 15 cannot compile
+#                     the 26.2 NAX path, so 15.0 is built where it is consumed).
+#   26.2 / macos-26 — the shipping target (inference `.cargo/config.toml`) for local builds,
+#                     the self-hosted NAX lanes and SceneWorks' `macos-26` lane.
+#   Debug and Release — mlx-sys picks CMAKE_BUILD_TYPE from the build script's own
+#                     debug_assertions, so `cargo build/test` consume Debug and `--release`
+#                     consumes Release.
+# Features are the crate defaults (accelerate + metal); a consumer with other features gets a
+# manifest mismatch and builds from source.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.deployment_target }} ${{ matrix.build_type }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: macos-15, deployment_target: "15.0", build_type: Debug }
+          - { runner: macos-15, deployment_target: "15.0", build_type: Release }
+          - { runner: macos-26, deployment_target: "26.2", build_type: Debug }
+          - { runner: macos-26, deployment_target: "26.2", build_type: Release }
+    env:
+      MACOSX_DEPLOYMENT_TARGET: ${{ matrix.deployment_target }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: true
+      - name: Toolchain versions
+        run: |
+          sw_vers
+          xcodebuild -version
+          xcrun --show-sdk-version
+          xcrun metal --version || true
+          cmake --version
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: false
+      - name: Build pmetal-mlx-sys (${{ matrix.build_type }})
+        run: |
+          set -euo pipefail
+          if [ "${{ matrix.build_type }}" = "Release" ]; then
+            cargo build --locked --release -p pmetal-mlx-sys
+            profile_dir=release
+          else
+            cargo build --locked -p pmetal-mlx-sys
+            profile_dir=debug
+          fi
+          lib_dirs=(target/$profile_dir/build/pmetal-mlx-sys-*/out/build/lib)
+          [ "${#lib_dirs[@]}" -eq 1 ] || { echo "expected exactly one OUT_DIR, got: ${lib_dirs[*]}"; exit 1; }
+          echo "LIB_DIR=${lib_dirs[0]}" >> "$GITHUB_ENV"
+          cat "${lib_dirs[0]}/pmetal-mlx-prebuilt.txt"
+      - name: Package
+        run: |
+          set -euo pipefail
+          manifest="$LIB_DIR/pmetal-mlx-prebuilt.txt"
+          # The manifest IS the key: assert the cell we meant to build is the one we built.
+          grep -qx "deployment_target=${{ matrix.deployment_target }}" "$manifest"
+          grep -qx "build_type=${{ matrix.build_type }}" "$manifest"
+          target=$(sed -n 's/^target=//p' "$manifest")
+          features=$(sed -n 's/^features=//p' "$manifest" | tr ',' '-')
+          sha12=$(git rev-parse --short=12 HEAD)
+          # Record the source commit for humans; build.rs compares the fingerprint, not this.
+          echo "info.source_rev=$(git rev-parse HEAD)" >> "$manifest"
+          name="pmetal-mlx-${sha12}-${target}-dt${{ matrix.deployment_target }}-${{ matrix.build_type }}-${features}.tar.zst"
+          # build/lib also holds a cmake/ config dir and libjaccl.a; the consumer needs only the
+          # two archives, the metallib and the manifest. Keep the tarball to those.
+          tar -C "$LIB_DIR" -cf - libmlx.a libmlxc.a mlx.metallib pmetal-mlx-prebuilt.txt | zstd -T0 -10 -o "$name"
+          shasum -a 256 "$name" > "$name.sha256"
+          ls -la "$name"*
+          echo "ASSET=$name" >> "$GITHUB_ENV"
+          echo "SHA12=$sha12" >> "$GITHUB_ENV"
+      - name: Publish to release prebuilt-${{ env.SHA12 }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="prebuilt-$SHA12"
+          if ! gh release view "$tag" >/dev/null 2>&1; then
+            gh release create "$tag" --target "$(git rev-parse HEAD)" \
+              --title "Prebuilt MLX for $SHA12" \
+              --notes "Prebuilt \`pmetal-mlx-sys\` archives for commit $(git rev-parse HEAD). Extract a tarball and set \`PMETAL_MLX_PREBUILT_DIR\` to the directory; mlx-sys verifies \`pmetal-mlx-prebuilt.txt\` against its own key. See .github/workflows/prebuilt.yml." \
+              || true  # a sibling matrix job may have created it first
+          fi
+          gh release upload "$tag" "$ASSET" "$ASSET.sha256" --clobber
+          gh release view "$tag" --json assets --jq '.assets[].name'
