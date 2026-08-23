@@ -913,7 +913,15 @@ fn source_fingerprint() -> String {
             .collect();
         entries.sort();
         for path in entries {
-            if path.file_name().is_some_and(|n| n == ".git") {
+            // Skip dotfiles: `.git` (a dir in a clone, a FILE in a submodule working tree) and
+            // cargo's `.cargo-ok` checkout marker, which exists only in `~/.cargo/git/checkouts`
+            // consumers and made the same sources fingerprint differently there than in the
+            // publisher's plain clone. No dotfile is a cmake input.
+            if path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_none_or(|n| n.starts_with('.'))
+            {
                 continue;
             }
             if path.is_dir() {
