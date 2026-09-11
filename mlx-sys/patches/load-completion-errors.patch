@@ -1,0 +1,267 @@
+diff --git a/mlx/array.cpp b/mlx/array.cpp
+index 07d3acd..946b9eb 100644
+--- a/mlx/array.cpp
++++ b/mlx/array.cpp
+@@ -150,6 +150,9 @@ void array::wait() {
+     }
+     set_status(Status::available);
+   }
++  if (load_completion()) {
++    load_completion()->wait();
++  }
+ }
+ 
+ void array::eval() {
+diff --git a/mlx/array.h b/mlx/array.h
+index 8e14ca4..d43a43a 100644
+--- a/mlx/array.h
++++ b/mlx/array.h
+@@ -11,6 +11,7 @@
+ #include "mlx/api.h"
+ #include "mlx/dtype.h"
+ #include "mlx/event.h"
++#include "mlx/load_completion.h"
+ #include "mlx/small_vector.h"
+ 
+ namespace mlx::core {
+@@ -407,6 +408,14 @@ class MLX_API array {
+   // `true`.
+   void wait();
+ 
++  const std::shared_ptr<LoadCompletion>& load_completion() const {
++    return array_desc_->load_completion;
++  }
++
++  void attach_load_completion(std::shared_ptr<LoadCompletion> completion) const {
++    array_desc_->load_completion = std::move(completion);
++  }
++
+   Status status() const {
+     return array_desc_->status;
+   }
+@@ -511,6 +520,8 @@ class MLX_API array {
+     // The arrays position in the output list
+     uint32_t position{0};
+ 
++    std::shared_ptr<LoadCompletion> load_completion;
++
+     explicit ArrayDesc(Shape shape, Dtype dtype);
+ 
+     explicit ArrayDesc(
+diff --git a/mlx/backend/common/load.cpp b/mlx/backend/common/load.cpp
+index ce41963..4274956 100644
+--- a/mlx/backend/common/load.cpp
++++ b/mlx/backend/common/load.cpp
+@@ -51,6 +51,12 @@ void Load::eval_cpu(const std::vector<array>& inputs, array& out) {
+     }
+   };
+   auto fut = io::thread_pool().enqueue(std::move(read_task)).share();
++  // The stream must keep progressing and signal its fences even on a read
++  // failure. Retrieve the exception on the host in array::wait(), not on the
++  // scheduler thread (where throwing would terminate the process).
++  auto completion = std::make_shared<LoadCompletion>();
++  completion->add(fut);
++  out.attach_load_completion(std::move(completion));
+   scheduler::enqueue(stream(), [fut = std::move(fut)]() { fut.wait(); });
+ }
+ 
+diff --git a/mlx/io/load.cpp b/mlx/io/load.cpp
+index de3bb60..79d5727 100644
+--- a/mlx/io/load.cpp
++++ b/mlx/io/load.cpp
+@@ -1,5 +1,7 @@
+ // Copyright © 2023-2026 Apple Inc.
+ #include <algorithm>
++#include <cerrno>
++#include <system_error>
+ #include <cstring>
+ #include <fstream>
+ #include <limits>
+@@ -360,25 +362,37 @@ void ParallelFileReader::read(char* data, size_t n) {
+ }
+ 
+ void ParallelFileReader::read(char* data, size_t n, size_t offset) {
+-  auto readfn = [fd = fd_](size_t offset, size_t size, char* buffer) -> bool {
++  auto readfn = [fd = fd_, file = label()](
++                    size_t offset, size_t size, char* buffer) {
+     while (size != 0) {
+       auto m = pread(fd, buffer, size, offset);
++      if (m < 0 && errno == EINTR) {
++        continue;
++      }
+       if (m <= 0) {
+-        return false;
++        const int error = errno;
++        std::ostringstream msg;
++        msg << "[read] " << file << ": pread offset=" << offset
++            << " bytes=" << size;
++        if (m == 0) {
++          throw std::runtime_error(msg.str() + ": unexpected EOF");
++        }
++        msg << " errno=" << error;
++        throw std::system_error(error, std::generic_category(), msg.str());
+       }
+       buffer += m;
+       size -= m;
++      offset += m;
+     }
+-    return true;
+   };
+-  std::vector<std::future<bool>> futs;
+-  while (n != 0) {
+-    if (n < batch_size_) {
+-      if (!readfn(offset, n, data)) {
+-        throw std::runtime_error("[read] Unable to read from file.");
++  std::vector<std::future<void>> futs;
++  std::exception_ptr error;
++  try {
++    while (n != 0) {
++      if (n < batch_size_) {
++        readfn(offset, n, data);
++        break;
+       }
+-      break;
+-    } else {
+       size_t m = batch_size_;
+       futs.emplace_back(
+           ParallelFileReader::thread_pool().enqueue(readfn, offset, m, data));
+@@ -386,12 +400,23 @@ void ParallelFileReader::read(char* data, size_t n, size_t offset) {
+       n -= m;
+       offset += m;
+     }
++  } catch (...) {
++    error = std::current_exception();
+   }
++  // Never leave queued writes running against a destination whose load has
++  // already failed and may be released by the caller.
+   for (auto& f : futs) {
+-    if (!f.get()) {
+-      throw std::runtime_error("[read] Unable to read from file.");
++    try {
++      f.get();
++    } catch (...) {
++      if (!error) {
++        error = std::current_exception();
++      }
+     }
+   }
++  if (error) {
++    std::rethrow_exception(error);
++  }
+ }
+ 
+ } // namespace io
+diff --git a/mlx/load_completion.h b/mlx/load_completion.h
+new file mode 100644
+index 0000000..311e734
+--- /dev/null
++++ b/mlx/load_completion.h
+@@ -0,0 +1,71 @@
++// Copyright © 2026 SceneWorks. MIT license.
++#pragma once
++
++#include <algorithm>
++#include <exception>
++#include <future>
++#include <memory>
++#include <mutex>
++#include <vector>
++
++namespace mlx::core {
++
++// A load failure belongs to its evaluated arrays, not a process-global error
++// slot. Keep it across graph detachment and repeated waits, including when an
++// async result becomes an input to another evaluation. No array is retained.
++class LoadCompletion {
++ public:
++  void add(std::shared_future<void> load) {
++    std::lock_guard<std::mutex> lock(mutex_);
++    loads_.push_back(std::move(load));
++  }
++
++  void depend_on(const std::shared_ptr<LoadCompletion>& parent) {
++    if (!parent || parent.get() == this) {
++      return;
++    }
++    std::lock_guard<std::mutex> lock(mutex_);
++    if (std::find(parents_.begin(), parents_.end(), parent) == parents_.end()) {
++      parents_.push_back(parent);
++    }
++  }
++
++  void wait() {
++    std::lock_guard<std::mutex> lock(mutex_);
++    // Drain every outstanding read before surfacing an error: its destination
++    // must remain alive even if another read in the same evaluation failed.
++    for (auto& parent : parents_) {
++      try {
++        parent->wait();
++      } catch (...) {
++        if (!error_) {
++          error_ = std::current_exception();
++        }
++      }
++    }
++    for (auto& load : loads_) {
++      try {
++        load.get();
++      } catch (...) {
++        if (!error_) {
++          error_ = std::current_exception();
++        }
++      }
++    }
++    // Successful evaluations do not keep an ever-growing dependency history.
++    // A failed evaluation retains only the exception, so every alias refuses.
++    parents_.clear();
++    loads_.clear();
++    if (error_) {
++      std::rethrow_exception(error_);
++    }
++  }
++
++ private:
++  std::mutex mutex_;
++  std::vector<std::shared_future<void>> loads_;
++  std::vector<std::shared_ptr<LoadCompletion>> parents_;
++  std::exception_ptr error_;
++};
++
++} // namespace mlx::core
+diff --git a/mlx/transforms.cpp b/mlx/transforms.cpp
+index a8585c9..8f8e25c 100644
+--- a/mlx/transforms.cpp
++++ b/mlx/transforms.cpp
+@@ -244,6 +244,32 @@ array eval_impl(std::vector<array> outputs, bool async) {
+     auto stream = arr.primitive().stream();
+     open_streams.insert(stream);
+ 
++    // Only data dependencies carry read failures. Independent outputs in the
++    // same evaluation must not poison each other; the synchronizer joins them.
++    std::shared_ptr<LoadCompletion> load_completion;
++    bool joined = false;
++    for (const auto& in : arr.inputs()) {
++      const auto& parent = in.load_completion();
++      if (!parent || parent == load_completion) {
++        continue;
++      }
++      if (!load_completion) {
++        load_completion = parent;
++      } else {
++        if (!joined) {
++          auto previous = std::move(load_completion);
++          load_completion = std::make_shared<LoadCompletion>();
++          load_completion->depend_on(previous);
++          joined = true;
++        }
++        load_completion->depend_on(parent);
++      }
++    }
++    arr.attach_load_completion(load_completion);
++    for (const auto& sibling : arr.siblings()) {
++      sibling.attach_load_completion(load_completion);
++    }
++
+     if (async) {
+       // Lookup corresponding event
+       auto e = events.find(stream.index);

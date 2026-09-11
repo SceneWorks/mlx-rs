@@ -702,6 +702,7 @@ fn prepare_mlx_c_source() -> PathBuf {
         ("patches/pad-copy-int64.patch", true, None),
         ("patches/thread-shared-streams.patch", true, None),
         ("patches/thread-safe-eval.patch", true, None),
+        ("patches/load-completion-errors.patch", true, None),
         ("patches/apple-metal-sdk.patch", true, None),
         ("patches/apple-cpu-no-jit.patch", true, None),
         (
