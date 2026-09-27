@@ -21,11 +21,11 @@ jobs:
     # wedged job eating the 6h default (macOS concurrency pool is only 5 jobs).
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           submodules: true
       - run: sudo xcodes select 16.4
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
         with:
           components: rustfmt, clippy
       - run: cargo --version
@@ -41,16 +41,16 @@ jobs:
         runner: [macos-15]
         rust: [1.85.0, stable]
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           submodules: true
       - run: sudo xcodes select 16.4
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
         with:
           cache: false
           toolchain: ${{ matrix.rust }}
           rustflags: "" # Disable when we're ready
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           key: ${{ matrix.rust }}-${{ matrix.runner }}-${{ hashFiles('**/Cargo.toml') }}
       # yoke-derive 0.8.3 (transitive, via the mistral example's hf-hub -> url -> icu) calls an API
