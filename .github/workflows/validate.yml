@@ -53,4 +53,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.rust }}-${{ matrix.runner }}-${{ hashFiles('**/Cargo.toml') }}
+      # yoke-derive 0.8.3 (transitive, via the mistral example's hf-hub -> url -> icu) calls an API
+      # rustc 1.85 lacks and declares no rust-version, so resolver = "3" cannot skip it. Hold the
+      # MSRV leg on 0.8.2; drop this step once yoke-derive fixes 1.85 or declares its rust-version.
+      - if: matrix.rust == '1.85.0'
+        run: cargo update -p yoke-derive --precise 0.8.2
       - run: cargo test --all -- --test-threads=1 # MLX is not thread safe
