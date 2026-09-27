@@ -45,7 +45,7 @@ jobs:
     env:
       MACOSX_DEPLOYMENT_TARGET: ${{ matrix.deployment_target }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           submodules: true
       - name: Toolchain versions
@@ -55,7 +55,7 @@ jobs:
           xcrun --show-sdk-version
           xcrun metal --version || true
           cmake --version
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
         with:
           cache: false
       - name: Build pmetal-mlx-sys (${{ matrix.build_type }})
