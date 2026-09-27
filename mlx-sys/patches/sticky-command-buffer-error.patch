@@ -1,0 +1,350 @@
+diff --git a/mlx/array.cpp b/mlx/array.cpp
+index 946b9eb..c1fa5e2 100644
+--- a/mlx/array.cpp
++++ b/mlx/array.cpp
+@@ -143,7 +143,11 @@ bool array::is_available() const {
+ }
+ 
+ void array::wait() {
+-  if (!is_available()) {
++  // pmetal: do not short-circuit through is_available(). It detaches an
++  // already-signaled event without checking it for an error, so a command
++  // buffer that failed before the host got here was reported as success.
++  // Event::wait() returns at once for a signaled event and re-raises its error.
++  if (status() != Status::available) {
+     if (event().valid()) {
+       event().wait();
+       detach_event();
+diff --git a/mlx/backend/metal/device.cpp b/mlx/backend/metal/device.cpp
+index 00d7a1f..fd61e39 100644
+--- a/mlx/backend/metal/device.cpp
++++ b/mlx/backend/metal/device.cpp
+@@ -1,7 +1,9 @@
+ // Copyright © 2023-2024 Apple Inc.
+ 
++#include <atomic>
+ #include <cstdlib>
+ #include <sstream>
++#include <thread>
+ 
+ #include <fmt/format.h>
+ 
+@@ -556,33 +558,71 @@ bool CommandEncoder::needs_commit() const {
+   return (buffer_ops_ > max_ops) || ((buffer_sizes_ >> 20) > max_mb);
+ }
+ 
++#ifndef NDEBUG
++// pmetal: debug-only test hook. Fails the next command buffer committed
++// WITHOUT a signal event (a buffer in the middle of an eval) and blocks the
++// committing host thread until that buffer's completion handler has finished.
++// That forces the production ordering deterministically: the failing buffer's
++// handler runs before the host opens the eval's next encoder, and the buffer
++// carrying the eval's signal event then completes successfully.
++namespace {
++std::atomic<bool> g_fail_next_intermediate_buffer{false};
++} // namespace
++#endif
++
+ void CommandEncoder::commit(std::function<void()> completion) {
++  bool forced_failure = false;
++#ifndef NDEBUG
++  if (signal_events_.empty()) {
++    forced_failure = g_fail_next_intermediate_buffer.exchange(false);
++  }
++#endif
++  auto handler_done = std::make_shared<std::atomic<bool>>(false);
+   buffer_->addCompletedHandler(
+       [&error_ = error_,
++       forced_failure,
++       handler_done,
+        wait_events = std::move(wait_events_),
+        signal_events = std::move(signal_events_),
+        completion = std::move(completion)](MTL::CommandBuffer* cbuf) {
+-        if (completion) {
+-          completion();
+-        }
++        // pmetal: record and propagate the error BEFORE `completion`, which
++        // notifies the scheduler and so wakes a host thread throttled on
++        // in-flight buffers. Upstream ran `completion` first and then wrote
++        // the (non-atomic) `error_` while the woken host opened the next
++        // encoder, whose `get_command_encoder()` reset it: a failed buffer in
++        // the middle of an eval was forgotten, the buffer carrying the eval's
++        // signal event completed cleanly, and `eval` returned corrupted
++        // arrays as success (the Qwen-Image real-weight mismatch after a GPU
++        // watchdog timeout).
++        bool failed = forced_failure ||
++            cbuf->status() == MTL::CommandBufferStatusError;
++        std::shared_ptr<std::string> error;
+         // If any of the waited event has error in it, poison the encoder.
+         for (auto& event : wait_events) {
+           if (event->error()) {
+-            error_ = event->error();
++            error = event->error();
+             break;
+           }
+         }
+-        // Set error only when no error happended before, to preserve the
+-        // earliest error.
+-        if (!error_ && cbuf->status() == MTL::CommandBufferStatusError) {
+-          error_ = std::make_shared<std::string>(fmt::format(
+-              "[METAL] Command buffer execution failed: {}.",
+-              cbuf->error()->localizedDescription()->utf8String()));
++        if (!error && failed) {
++          error = std::make_shared<std::string>(
++              forced_failure
++                  ? std::string(
++                        "[METAL] Command buffer execution failed: synthetic "
++                        "intermediate-buffer failure.")
++                  : fmt::format(
++                        "[METAL] Command buffer execution failed: {}.",
++                        cbuf->error()->localizedDescription()->utf8String()));
+         }
+-        // Poison all the signaled events when error happened.
+-        if (error_) {
++        // Keep the earliest error; it stays set until a host wait reports it.
++        if (error) {
++          std::shared_ptr<std::string> none;
++          std::atomic_compare_exchange_strong(&error_, &none, error);
++        }
++        // Poison all the signaled events while an unreported error is pending.
++        if (auto pending = std::atomic_load(&error_)) {
+           for (auto& [event, value] : signal_events) {
+-            event->set_error(error_);
++            event->set_error(pending);
+           }
+         }
+         // Metal won't signal the events for us on error, manually signal them
+@@ -592,11 +632,26 @@ void CommandEncoder::commit(std::function<void()> completion) {
+             event->signal(value);
+           }
+         }
++        // pmetal: release host waits only now that any error is on the events.
++        for (auto& [event, value] : signal_events) {
++          event->mark_completed(value);
++        }
++        if (completion) {
++          completion();
++        }
++        handler_done->store(true, std::memory_order_release);
+       });
++  auto committed = buffer_; // retained
+   buffer_->commit();
+   buffer_ = NS::RetainPtr(queue_->commandBufferWithUnretainedReferences());
+   buffer_ops_ = 0;
+   buffer_sizes_ = 0;
++  if (forced_failure) {
++    committed->waitUntilCompleted();
++    while (!handler_done->load(std::memory_order_acquire)) {
++      std::this_thread::yield();
++    }
++  }
+ }
+ 
+ void CommandEncoder::synchronize() {
+@@ -606,20 +661,29 @@ void CommandEncoder::synchronize() {
+   commit();
+   cbuf->waitUntilCompleted();
+ 
+-  if (error_ && !exiting_) {
+-    auto error = std::move(error_);
++  auto error = std::atomic_exchange(&error_, std::shared_ptr<std::string>{});
++  if (error && !exiting_) {
++    clear_reported_command_buffer_error(error);
+     throw std::runtime_error(*error);
+   }
+ }
+ 
++void CommandEncoder::clear_reported_error(
++    const std::shared_ptr<std::string>& reported) {
++  auto expected = reported;
++  std::atomic_compare_exchange_strong(
++      &error_, &expected, std::shared_ptr<std::string>{});
++}
++
+ MTL::ComputeCommandEncoder* CommandEncoder::get_command_encoder() {
+   if (!encoder_) {
+     encoder_ = NS::RetainPtr(
+         buffer_->computeCommandEncoder(MTL::DispatchTypeConcurrent));
+     fence_ = NS::TransferPtr(device_.mtl_device()->newFence());
+-    // Reset error when user starts to encode new commands, they are supposed to
+-    // have handled the error in synchronize() or Event::wait().
+-    error_.reset();
++    // pmetal: do NOT reset `error_` here. A host thread opens new encoders
++    // while earlier buffers are still completing, so a reset here erased
++    // errors nobody had reported yet. The error is cleared when a host wait
++    // throws it (clear_reported_command_buffer_error / synchronize()).
+   }
+   return encoder_.get();
+ }
+@@ -984,6 +1048,17 @@ std::unordered_map<int, CommandEncoder>& get_global_command_encoders() {
+   return encoders;
+ }
+ 
++void clear_reported_command_buffer_error(
++    const std::shared_ptr<std::string>& reported) {
++  for (auto& [index, encoder] : get_command_encoders()) {
++    encoder.clear_reported_error(reported);
++  }
++  std::shared_lock lock(get_global_command_encoders_mutex());
++  for (auto& [index, encoder] : get_global_command_encoders()) {
++    encoder.clear_reported_error(reported);
++  }
++}
++
+ std::shared_mutex& get_global_command_encoders_mutex() {
+   // Leaked like the scheduler singleton: worker threads may still look up
+   // encoders during static destruction.
+@@ -1017,3 +1092,10 @@ bool is_nax_available() {
+ }
+ 
+ } // namespace mlx::core::metal
++
++#ifndef NDEBUG
++// pmetal: debug-only test hook (see CommandEncoder::commit).
++extern "C" void mlx_pmetal_test_fail_next_intermediate_command_buffer() {
++  mlx::core::metal::g_fail_next_intermediate_buffer.store(true);
++}
++#endif
+diff --git a/mlx/backend/metal/device.h b/mlx/backend/metal/device.h
+index 02d5caa..da8bf61 100644
+--- a/mlx/backend/metal/device.h
++++ b/mlx/backend/metal/device.h
+@@ -97,6 +97,9 @@ class MLX_API CommandEncoder {
+   bool needs_commit() const;
+   void commit(std::function<void()> completion = nullptr);
+   void synchronize();
++  // pmetal: drop this encoder's sticky command-buffer error if it is the one a
++  // host wait has just reported (see clear_reported_command_buffer_error).
++  void clear_reported_error(const std::shared_ptr<std::string>& reported);
+ 
+   MTL::CommandBuffer* get_command_buffer() const {
+     return buffer_.get();
+@@ -118,7 +121,10 @@ class MLX_API CommandEncoder {
+   std::vector<std::shared_ptr<EventImpl>> wait_events_;
+   std::vector<std::tuple<std::shared_ptr<EventImpl>, uint64_t>> signal_events_;
+ 
+-  // Error from previous commited command buffer.
++  // Error from previous commited command buffer. pmetal: written by Metal's
++  // completion-handler thread and read by the host, so every access goes
++  // through the std::atomic_* shared_ptr free functions; it stays set until a
++  // host wait reports it (it is no longer reset when a new encoder opens).
+   std::shared_ptr<std::string> error_;
+ 
+   // Encoder for issuing GPU commands.
+@@ -256,6 +262,10 @@ std::unordered_map<int, CommandEncoder>& get_global_command_encoders();
+ // unordered_map element references remain valid after unlock (rehash never
+ // invalidates references), so returning an encoder reference is safe.
+ std::shared_mutex& get_global_command_encoders_mutex();
++// pmetal: a host wait has thrown `reported`; clear it from every encoder that
++// still carries it so later, unrelated work on those streams is not poisoned.
++void clear_reported_command_buffer_error(
++    const std::shared_ptr<std::string>& reported);
+ NS::SharedPtr<NS::AutoreleasePool> new_scoped_memory_pool();
+ 
+ bool is_nax_available();
+diff --git a/mlx/backend/metal/event.cpp b/mlx/backend/metal/event.cpp
+index 1e76e8c..3779fff 100644
+--- a/mlx/backend/metal/event.cpp
++++ b/mlx/backend/metal/event.cpp
+@@ -1,5 +1,7 @@
+ // Copyright © 2024 Apple Inc.
+ 
++#include <thread>
++
+ #include "mlx/backend/metal/event.h"
+ #include "mlx/scheduler.h"
+ 
+@@ -35,14 +37,29 @@ EventImpl::~EventImpl() {
+   mtl_event_.reset();
+ }
+ 
+-void EventImpl::wait(uint64_t value) {
++void EventImpl::wait(uint64_t value, bool await_handler) {
+   check_error();
+   mtl_event_->waitUntilSignaledValue(value, -1); // never times out
++  // pmetal: the GPU signals a successful buffer's events before its completion
++  // handler runs, and the handler is where a pending command-buffer error is
++  // put on this event — so a host wait also waits for it.
++  while (await_handler && !completed(value)) {
++    std::this_thread::yield();
++  }
+   check_error();
+ }
+ 
+ void EventImpl::signal(uint64_t value) {
+   mtl_event_->setSignaledValue(value);
++  mark_completed(value);
++}
++
++void EventImpl::mark_completed(uint64_t value) {
++  auto current = completed_value_.load(std::memory_order_relaxed);
++  while (current < value &&
++         !completed_value_.compare_exchange_weak(
++             current, value, std::memory_order_release)) {
++  }
+ }
+ 
+ void EventImpl::set_error(std::shared_ptr<std::string> error) {
+@@ -52,6 +69,8 @@ void EventImpl::set_error(std::shared_ptr<std::string> error) {
+ void EventImpl::check_error() {
+   auto error = std::atomic_exchange(&error_, {});
+   if (error) {
++    // pmetal: the host has now seen this error; stop it poisoning later work.
++    clear_reported_command_buffer_error(error);
+     throw std::runtime_error(*error);
+   }
+ }
+@@ -67,7 +86,8 @@ Event::Event(Stream stream) : stream_(stream) {
+ }
+ 
+ void Event::wait() {
+-  static_cast<metal::EventImpl*>(event_.get())->wait(value());
++  static_cast<metal::EventImpl*>(event_.get())
++      ->wait(value(), /* await_handler = */ true);
+ }
+ 
+ void Event::wait(Stream stream) {
+diff --git a/mlx/backend/metal/event.h b/mlx/backend/metal/event.h
+index c5c82a7..59e9c96 100644
+--- a/mlx/backend/metal/event.h
++++ b/mlx/backend/metal/event.h
+@@ -1,5 +1,7 @@
+ // Copyright © 2026 Apple Inc.
+ 
++#include <atomic>
++
+ #include "mlx/backend/metal/device.h"
+ #include "mlx/event.h"
+ 
+@@ -10,8 +12,17 @@ class EventImpl {
+   EventImpl(Device& d);
+   ~EventImpl();
+ 
+-  void wait(uint64_t value);
++  // pmetal: `await_handler` also waits for the signaling buffer's completion
++  // handler. Only a host wait may do that: a CPU-stream task waiting here can
++  // be what a later GPU wait in that same buffer needs to make progress.
++  void wait(uint64_t value, bool await_handler = false);
+   void signal(uint64_t value);
++  // pmetal: the command buffer that signals `value` has finished its
++  // completion handler (so any error it carries is already on this event).
++  void mark_completed(uint64_t value);
++  bool completed(uint64_t value) const {
++    return completed_value_.load(std::memory_order_acquire) >= value;
++  }
+   void set_error(std::shared_ptr<std::string> error);
+   void check_error();
+ 
+@@ -28,6 +39,12 @@ class EventImpl {
+   std::shared_ptr<std::string> error_;
+ 
+   NS::SharedPtr<MTL::SharedEvent> mtl_event_;
++
++  // pmetal: highest value whose signaling command buffer has finished its
++  // completion handler. The GPU signals a successful buffer's events BEFORE
++  // that handler runs, so a host wait that returned on the GPU signal alone
++  // checked for an error before the handler could poison the event.
++  std::atomic<uint64_t> completed_value_{0};
+ };
+ 
+ } // namespace mlx::core::metal

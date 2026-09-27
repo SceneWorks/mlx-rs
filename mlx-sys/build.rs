@@ -798,6 +798,10 @@ fn prepare_mlx_c_source() -> PathBuf {
                 "grep -Fq 'complete_conv_parameters' mlx/ops.cpp && grep -Fq 'host_parameters_fit' mlx/ops.cpp && grep -Fq '512 / tile_count' mlx/ops.cpp && grep -Fq 'test exact qmm mirrors split-k direct delegation' tests/ops_tests.cpp && grep -Fq '65535, 65535' tests/ops_tests.cpp",
             ),
         ),
+        // A failed command buffer in the middle of an eval must fail that eval: record the error
+        // before waking the host, keep it until a host wait reports it, and never reset it when a
+        // new encoder opens. Last, because it edits device.cpp after every patch that touches it.
+        ("patches/sticky-command-buffer-error.patch", true, None),
     ];
     // sc-12780 idempotency guard: CMake FetchContent may re-run PATCH_COMMAND against an
     // mlx-src that is ALREADY patched (e.g. an incremental rebuild that does not re-fetch).
