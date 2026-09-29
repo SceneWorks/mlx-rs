@@ -69,6 +69,21 @@ pub fn eval<'a>(outputs: impl IntoIterator<Item = &'a Array>) -> Result<()> {
     <() as Guarded>::try_from_op(|_| unsafe { mlx_sys::mlx_eval(vec.as_ptr()) })
 }
 
+/// Evaluate only the pending safetensors loads that `outputs` depend on, not `outputs` themselves.
+///
+/// Walks each array's lazy graph, stopping at anything already scheduled or evaluated, and
+/// evaluates every not-yet-scheduled `Load` leaf it finds. MLX runs those on its CPU stream and I/O
+/// pool, so a caller can read a checkpoint's raw bytes before evaluating GPU-stream arrays derived
+/// from them (casts, transposes): a Metal command buffer that consumed an unread `Load` would
+/// otherwise wait on the disk read, and a slow drive can hold it past the GPU watchdog. No derived
+/// node is evaluated; a graph with no pending loads is a no-op.
+pub fn eval_pending_loads<'a>(outputs: impl IntoIterator<Item = &'a Array>) -> Result<()> {
+    let vec = VectorArray::try_from_iter(outputs.into_iter())?;
+    <() as Guarded>::try_from_op(|_| unsafe {
+        mlx_sys::mlx_pmetal_eval_pending_loads(vec.as_ptr())
+    })
+}
+
 /// Evaluate a module's parameters.
 ///
 /// This is a convenience function that flattens the parameters and evaluates them.
@@ -500,5 +515,56 @@ mod tests {
         // Check that the error is not just "mlx_closure returned a non-zero value"
         let err = result.unwrap_err();
         assert!(!err.what().contains("non-zero value"))
+    }
+
+    fn is_available(a: &Array) -> bool {
+        let mut available = false;
+        let status = unsafe { mlx_sys::_mlx_array_is_available(&mut available, a.as_ptr()) };
+        assert_eq!(status, 0);
+        available
+    }
+
+    // sc-24245: the pending `Load` is read, but the GPU-stream cast/transpose over it is not.
+    #[test]
+    fn test_eval_pending_loads_reads_loads_but_not_their_consumers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("w.safetensors");
+        let source = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3]);
+        Array::save_safetensors([("w", &source)], None, &path).unwrap();
+
+        let loaded = Array::load_safetensors(&path).unwrap();
+        let raw = loaded.get("w").unwrap();
+        let derived = raw
+            .as_dtype(crate::Dtype::Float16)
+            .unwrap()
+            .transpose_axes(&[1, 0])
+            .unwrap();
+        assert!(!is_available(raw));
+        assert!(!is_available(&derived));
+
+        eval_pending_loads([&derived]).unwrap();
+        assert!(is_available(raw), "the pending Load must be read");
+        assert!(
+            !is_available(&derived),
+            "a derived node must not be evaluated"
+        );
+
+        eval([&derived]).unwrap();
+        assert!(is_available(&derived));
+        let expected = Array::from_slice(&[1.0f32, 4.0, 2.0, 5.0, 3.0, 6.0], &[3, 2]);
+        assert_eq!(derived.as_dtype(crate::Dtype::Float32).unwrap(), expected);
+    }
+
+    #[test]
+    fn test_eval_pending_loads_without_loads_is_a_noop() {
+        let x = Array::from_slice(&[1.0f32, 2.0], &[2]);
+        let y = x.add(&x).unwrap();
+        eval_pending_loads([&y]).unwrap();
+        assert!(!is_available(&y), "a graph without loads must stay lazy");
+        eval_pending_loads(std::iter::empty::<&Array>()).unwrap();
+
+        eval([&y]).unwrap();
+        eval_pending_loads([&y]).unwrap();
+        assert_eq!(y, Array::from_slice(&[2.0f32, 4.0], &[2]));
     }
 }
