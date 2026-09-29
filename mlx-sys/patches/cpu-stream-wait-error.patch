@@ -1,8 +1,62 @@
 diff --git a/mlx/backend/metal/device.cpp b/mlx/backend/metal/device.cpp
-index fd61e39..fa69f35 100644
+index fd61e39..2561961 100644
 --- a/mlx/backend/metal/device.cpp
 +++ b/mlx/backend/metal/device.cpp
-@@ -1053,10 +1053,13 @@ void clear_reported_command_buffer_error(
+@@ -567,24 +567,44 @@ bool CommandEncoder::needs_commit() const {
+ // carrying the eval's signal event then completes successfully.
+ namespace {
+ std::atomic<bool> g_fail_next_intermediate_buffer{false};
++// pmetal: debug-only test hook. Hold the failing buffer's completion handler
++// (not the host) until a CPU stream signals an event, so the eval's later,
++// successful buffers signal their events — and a CPU stream waits on them —
++// before the failure is recorded (see
++// mlx_pmetal_test_fail_next_intermediate_command_buffer_until_cpu_signal).
++std::atomic<bool> g_hold_failed_handler{false};
++std::atomic<bool> g_cpu_stream_signaled{false};
+ } // namespace
++
++void note_cpu_stream_signal() {
++  g_cpu_stream_signaled.store(true, std::memory_order_release);
++}
+ #endif
+ 
+ void CommandEncoder::commit(std::function<void()> completion) {
+   bool forced_failure = false;
++  bool hold_handler = false;
+ #ifndef NDEBUG
+   if (signal_events_.empty()) {
+     forced_failure = g_fail_next_intermediate_buffer.exchange(false);
++    hold_handler = forced_failure && g_hold_failed_handler.exchange(false);
+   }
+ #endif
+   auto handler_done = std::make_shared<std::atomic<bool>>(false);
+   buffer_->addCompletedHandler(
+       [&error_ = error_,
+        forced_failure,
++       hold_handler,
+        handler_done,
+        wait_events = std::move(wait_events_),
+        signal_events = std::move(signal_events_),
+        completion = std::move(completion)](MTL::CommandBuffer* cbuf) {
++#ifndef NDEBUG
++        while (hold_handler &&
++               !g_cpu_stream_signaled.load(std::memory_order_acquire)) {
++          std::this_thread::yield();
++        }
++#endif
+         // pmetal: record and propagate the error BEFORE `completion`, which
+         // notifies the scheduler and so wakes a host thread throttled on
+         // in-flight buffers. Upstream ran `completion` first and then wrote
+@@ -646,7 +666,7 @@ void CommandEncoder::commit(std::function<void()> completion) {
+   buffer_ = NS::RetainPtr(queue_->commandBufferWithUnretainedReferences());
+   buffer_ops_ = 0;
+   buffer_sizes_ = 0;
+-  if (forced_failure) {
++  if (forced_failure && !hold_handler) {
+     committed->waitUntilCompleted();
+     while (!handler_done->load(std::memory_order_acquire)) {
+       std::this_thread::yield();
+@@ -1053,10 +1073,13 @@ void clear_reported_command_buffer_error(
    for (auto& [index, encoder] : get_command_encoders()) {
      encoder.clear_reported_error(reported);
    }
@@ -19,11 +73,26 @@ index fd61e39..fa69f35 100644
  }
  
  std::shared_mutex& get_global_command_encoders_mutex() {
+@@ -1098,4 +1121,14 @@ bool is_nax_available() {
+ extern "C" void mlx_pmetal_test_fail_next_intermediate_command_buffer() {
+   mlx::core::metal::g_fail_next_intermediate_buffer.store(true);
+ }
++
++// pmetal: debug-only test hook. Like the above, but the committing host thread
++// is not blocked; the failing buffer's completion handler is held until a CPU
++// stream next signals an event.
++extern "C" void
++mlx_pmetal_test_fail_next_intermediate_command_buffer_until_cpu_signal() {
++  mlx::core::metal::g_cpu_stream_signaled.store(false);
++  mlx::core::metal::g_hold_failed_handler.store(true);
++  mlx::core::metal::g_fail_next_intermediate_buffer.store(true);
++}
+ #endif
 diff --git a/mlx/backend/metal/device.h b/mlx/backend/metal/device.h
-index da8bf61..8ac36b9 100644
+index da8bf61..e807d0a 100644
 --- a/mlx/backend/metal/device.h
 +++ b/mlx/backend/metal/device.h
-@@ -266,6 +266,10 @@ std::shared_mutex& get_global_command_encoders_mutex();
+@@ -266,6 +266,15 @@ std::shared_mutex& get_global_command_encoders_mutex();
  // still carries it so later, unrelated work on those streams is not poisoned.
  void clear_reported_command_buffer_error(
      const std::shared_ptr<std::string>& reported);
@@ -31,23 +100,32 @@ index da8bf61..8ac36b9 100644
 +// CPU stream's pending error that is `reported`.
 +void clear_reported_cpu_stream_error(
 +    const std::shared_ptr<std::string>& reported);
++#ifndef NDEBUG
++// pmetal: debug-only test hook support (defined in device.cpp): a CPU stream
++// has signaled an event.
++void note_cpu_stream_signal();
++#endif
  NS::SharedPtr<NS::AutoreleasePool> new_scoped_memory_pool();
  
  bool is_nax_available();
 diff --git a/mlx/backend/metal/event.cpp b/mlx/backend/metal/event.cpp
-index 3779fff..002bb77 100644
+index 3779fff..6aeffc6 100644
 --- a/mlx/backend/metal/event.cpp
 +++ b/mlx/backend/metal/event.cpp
-@@ -1,6 +1,8 @@
+@@ -1,6 +1,12 @@
  // Copyright © 2024 Apple Inc.
  
++#include <algorithm>
++#include <iterator>
 +#include <mutex>
++#include <set>
  #include <thread>
 +#include <unordered_map>
++#include <utility>
  
  #include "mlx/backend/metal/event.h"
  #include "mlx/scheduler.h"
-@@ -23,6 +25,65 @@ namespace mlx::core {
+@@ -23,6 +29,101 @@ namespace mlx::core {
  
  namespace metal {
  
@@ -61,9 +139,18 @@ index 3779fff..002bb77 100644
 +// error, and every event the stream signals afterwards carries it to whoever
 +// waits on it (a host wait throws it; a GPU wait poisons its encoder). Like
 +// the GPU encoder's sticky error, it is kept until a host wait reports it.
++//
++// A CPU-stream wait cannot see every error, though: a successful command
++// buffer signals its events before its completion handler runs, and that
++// handler is where an earlier failed buffer's sticky error is put on them. The
++// CPU-stream wait may not wait for the handler (see EventImpl::wait), so it
++// records the awaited event as a dependency of the stream instead; the
++// stream's next signal attaches its dependencies to the signaled event, and a
++// host wait on that event waits for their handlers and throws their error.
 +struct CpuStreamErrors {
 +  std::mutex mutex;
 +  std::unordered_map<int, std::shared_ptr<std::string>> pending;
++  std::unordered_map<int, std::vector<EventImpl::Dependency>> deps;
 +  // The most recently reported error. A CPU-stream wait can still observe it
 +  // on an event after the host has thrown it (the host may report it through
 +  // another stream first); it must not become pending again.
@@ -94,6 +181,33 @@ index 3779fff..002bb77 100644
 +  return it == errors.pending.end() ? nullptr : it->second;
 +}
 +
++void record_cpu_stream_dependency(
++    int index,
++    std::shared_ptr<EventImpl> event,
++    uint64_t value) {
++  auto& errors = cpu_stream_errors();
++  std::lock_guard<std::mutex> lock(errors.mutex);
++  auto& deps = errors.deps[index];
++  // Fence events are reused with increasing values: keep one entry per event.
++  for (auto& [dep, dep_value] : deps) {
++    if (dep == event) {
++      dep_value = std::max(dep_value, value);
++      return;
++    }
++  }
++  deps.emplace_back(std::move(event), value);
++}
++
++std::vector<EventImpl::Dependency> take_cpu_stream_dependencies(int index) {
++  auto& errors = cpu_stream_errors();
++  std::lock_guard<std::mutex> lock(errors.mutex);
++  auto it = errors.deps.find(index);
++  if (it == errors.deps.end()) {
++    return {};
++  }
++  return std::exchange(it->second, {});
++}
++
 +} // namespace
 +
 +void clear_reported_cpu_stream_error(
@@ -113,19 +227,94 @@ index 3779fff..002bb77 100644
  EventImpl::EventImpl(Device& d) {
    auto p = new_scoped_memory_pool();
    mtl_event_ = NS::TransferPtr(d.mtl_device()->newSharedEvent());
-@@ -49,6 +110,11 @@ void EventImpl::wait(uint64_t value, bool await_handler) {
+@@ -47,6 +148,86 @@ void EventImpl::wait(uint64_t value, bool await_handler) {
+     std::this_thread::yield();
+   }
    check_error();
- }
- 
++  if (await_handler) {
++    check_dependencies(value);
++  }
++}
++
++void EventImpl::add_dependencies(
++    uint64_t value,
++    std::vector<Dependency> deps) {
++  std::lock_guard<std::mutex> lock(deps_mutex_);
++  for (auto& [dep, dep_value] : deps) {
++    deps_.emplace_back(value, std::move(dep), dep_value);
++  }
++}
++
++bool EventImpl::has_dependencies() {
++  std::lock_guard<std::mutex> lock(deps_mutex_);
++  return !deps_.empty();
++}
++
++std::vector<EventImpl::Dependency> EventImpl::take_dependencies(
++    uint64_t value) {
++  std::vector<Dependency> out;
++  std::lock_guard<std::mutex> lock(deps_mutex_);
++  auto kept = deps_.begin();
++  for (auto it = deps_.begin(); it != deps_.end(); ++it) {
++    if (std::get<0>(*it) <= value) {
++      out.emplace_back(std::move(std::get<1>(*it)), std::get<2>(*it));
++    } else {
++      if (kept != it) {
++        *kept = std::move(*it);
++      }
++      ++kept;
++    }
++  }
++  deps_.erase(kept, deps_.end());
++  return out;
++}
++
++std::vector<EventImpl::Dependency> EventImpl::copy_dependencies(
++    uint64_t value) {
++  std::vector<Dependency> out;
++  std::lock_guard<std::mutex> lock(deps_mutex_);
++  for (auto& [signaled, dep, dep_value] : deps_) {
++    if (signaled <= value) {
++      out.emplace_back(dep, dep_value);
++    }
++  }
++  return out;
++}
++
++void EventImpl::check_dependencies(uint64_t value) {
++  auto work = take_dependencies(value);
++  std::set<std::pair<EventImpl*, uint64_t>> visited;
++  std::shared_ptr<std::string> error;
++  // Drain every dependency (a CPU-signaled one may carry its own) before
++  // throwing, so none is left attached; report the first error found.
++  while (!work.empty()) {
++    auto [dep, dep_value] = std::move(work.back());
++    work.pop_back();
++    if (!visited.emplace(dep.get(), dep_value).second) {
++      continue;
++    }
++    while (!dep->completed(dep_value)) {
++      std::this_thread::yield();
++    }
++    if (!error) {
++      error = dep->peek_error();
++    }
++    auto nested = dep->take_dependencies(dep_value);
++    std::move(nested.begin(), nested.end(), std::back_inserter(work));
++  }
++  if (error) {
++    clear_reported_command_buffer_error(error);
++    throw std::runtime_error(*error);
++  }
++}
++
 +std::shared_ptr<std::string> EventImpl::wait_unchecked(uint64_t value) {
 +  mtl_event_->waitUntilSignaledValue(value, -1); // never times out
 +  return std::atomic_load(&error_);
-+}
-+
+ }
+ 
  void EventImpl::signal(uint64_t value) {
-   mtl_event_->setSignaledValue(value);
-   mark_completed(value);
-@@ -93,9 +159,14 @@ void Event::wait() {
+@@ -93,9 +274,16 @@ void Event::wait() {
  void Event::wait(Stream stream) {
    auto impl = std::static_pointer_cast<metal::EventImpl>(event_);
    if (stream.device == Device::cpu) {
@@ -138,12 +327,14 @@ index 3779fff..002bb77 100644
 +        [impl = std::move(impl), value = value(), index = stream.index]() {
 +          if (auto error = impl->wait_unchecked(value)) {
 +            metal::record_cpu_stream_error(index, std::move(error));
++          } else if (!impl->completed(value) || impl->has_dependencies()) {
++            metal::record_cpu_stream_dependency(index, std::move(impl), value);
 +          }
 +        });
    } else {
      auto& encoder = metal::get_command_encoder(stream);
      encoder.wait_event(std::move(impl), value());
-@@ -124,9 +195,17 @@ void Event::signal(Stream stream) {
+@@ -124,9 +312,37 @@ void Event::signal(Stream stream) {
    }
  #endif
    if (stream.device == Device::cpu) {
@@ -153,22 +344,52 @@ index 3779fff..002bb77 100644
 +    scheduler::enqueue(
 +        stream,
 +        [impl = std::move(impl), value = value(), index = stream.index]() {
++          // pmetal: resolve what can be resolved without waiting; attach the
++          // rest to this event for a host wait (see CpuStreamErrors).
++          std::vector<metal::EventImpl::Dependency> unresolved;
++          for (auto& [dep, dep_value] :
++               metal::take_cpu_stream_dependencies(index)) {
++            if (!dep->completed(dep_value)) {
++              unresolved.emplace_back(std::move(dep), dep_value);
++            } else if (auto error = dep->peek_error()) {
++              metal::record_cpu_stream_error(index, std::move(error));
++            } else {
++              auto nested = dep->copy_dependencies(dep_value);
++              std::move(
++                  nested.begin(), nested.end(), std::back_inserter(unresolved));
++            }
++          }
 +          // pmetal: work this stream ran after a failed wait is not valid;
 +          // hand the stream's pending error to whoever waits on this event.
 +          if (auto error = metal::pending_cpu_stream_error(index);
-+              error && !std::atomic_load(&impl->error())) {
++              error && !impl->peek_error()) {
 +            impl->set_error(std::move(error));
++          } else if (!unresolved.empty()) {
++            impl->add_dependencies(value, std::move(unresolved));
 +          }
 +          impl->signal(value);
++#ifndef NDEBUG
++          metal::note_cpu_stream_signal();
++#endif
 +        });
    } else {
      auto& encoder = metal::get_command_encoder(stream);
      encoder.signal_event(std::move(impl), value());
 diff --git a/mlx/backend/metal/event.h b/mlx/backend/metal/event.h
-index 59e9c96..4315db8 100644
+index 59e9c96..a516f6a 100644
 --- a/mlx/backend/metal/event.h
 +++ b/mlx/backend/metal/event.h
-@@ -16,6 +16,10 @@ class EventImpl {
+@@ -1,6 +1,9 @@
+ // Copyright © 2026 Apple Inc.
+ 
+ #include <atomic>
++#include <mutex>
++#include <tuple>
++#include <vector>
+ 
+ #include "mlx/backend/metal/device.h"
+ #include "mlx/event.h"
+@@ -16,6 +19,10 @@ class EventImpl {
    // handler. Only a host wait may do that: a CPU-stream task waiting here can
    // be what a later GPU wait in that same buffer needs to make progress.
    void wait(uint64_t value, bool await_handler = false);
@@ -179,3 +400,41 @@ index 59e9c96..4315db8 100644
    void signal(uint64_t value);
    // pmetal: the command buffer that signals `value` has finished its
    // completion handler (so any error it carries is already on this event).
+@@ -25,6 +32,23 @@ class EventImpl {
+   }
+   void set_error(std::shared_ptr<std::string> error);
+   void check_error();
++  // pmetal: this event's error without consuming it (null if none).
++  std::shared_ptr<std::string> peek_error() const {
++    return std::atomic_load(&error_);
++  }
++
++  // pmetal: events a CPU stream waited on before it signaled this event,
++  // whose signaling command buffer had not finished its completion handler
++  // yet — so an error that handler puts on them was not visible to the
++  // CPU-stream wait (which must not wait for handlers; see `wait`). A HOST
++  // wait for `value` waits for those handlers and throws their error.
++  using Dependency = std::pair<std::shared_ptr<EventImpl>, uint64_t>;
++  void add_dependencies(uint64_t value, std::vector<Dependency> deps);
++  bool has_dependencies();
++  // The dependencies attached by signals up to `value`: `take` removes them,
++  // `copy` leaves them in place.
++  std::vector<Dependency> take_dependencies(uint64_t value);
++  std::vector<Dependency> copy_dependencies(uint64_t value);
+ 
+   const auto& error() const {
+     return error_;
+@@ -45,6 +69,13 @@ class EventImpl {
+   // that handler runs, so a host wait that returned on the GPU signal alone
+   // checked for an error before the handler could poison the event.
+   std::atomic<uint64_t> completed_value_{0};
++
++  // pmetal: host-wait-only; see add_dependencies.
++  void check_dependencies(uint64_t value);
++  std::mutex deps_mutex_;
++  // (signaled value, dependency event, dependency value)
++  std::vector<std::tuple<uint64_t, std::shared_ptr<EventImpl>, uint64_t>>
++      deps_;
+ };
+ 
+ } // namespace mlx::core::metal
