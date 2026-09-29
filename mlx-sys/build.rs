@@ -822,6 +822,14 @@ fn prepare_mlx_c_source() -> PathBuf {
         // before waking the host, keep it until a host wait reports it, and never reset it when a
         // new encoder opens. Last, because it edits device.cpp after every patch that touches it.
         ("patches/sticky-command-buffer-error.patch", true, None),
+        // A GPU error seen by a CPU-stream wait must reach the host, not throw on MLX's scheduler
+        // thread (std::terminate): the wait records it as the CPU stream's pending error, the
+        // stream's later signals carry it, and a host wait that reports it clears it. An awaited
+        // event whose completion handler had not run yet (so its error was not visible) is attached
+        // to the stream's next signaled event, and a host wait on that event waits for the handler
+        // and throws its error. Last, because it builds on the sticky-error patch's
+        // event.cpp/device.cpp changes.
+        ("patches/cpu-stream-wait-error.patch", true, None),
     ];
     // sc-12780 idempotency guard: CMake FetchContent may re-run PATCH_COMMAND against an
     // mlx-src that is ALREADY patched (e.g. an incremental rebuild that does not re-fetch).
