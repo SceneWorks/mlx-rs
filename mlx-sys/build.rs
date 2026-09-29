@@ -541,6 +541,26 @@ fn prepare_mlx_c_source() -> PathBuf {
     );
     println!("cargo:rerun-if-changed=patches/exact-eager-activations-c.patch");
 
+    // sc-24245: expose `mlx_pmetal_eval_pending_loads`, which evaluates only the unscheduled
+    // safetensors `Load` leaves of a lazy graph (CPU stream + io pool), so a loader can read the
+    // raw bytes before any GPU-stream consumer is evaluated and the Metal command buffer never
+    // waits on a slow disk read. Bindgen reads the pristine submodule; lib.rs declares it.
+    let eval_pending_loads_c_patch = std::fs::canonicalize("patches/eval-pending-loads-c.patch")
+        .expect("find eval-pending-loads-c.patch");
+    let status = Command::new("patch")
+        .arg("-p1")
+        .arg("-d")
+        .arg(&staged)
+        .arg("-i")
+        .arg(&eval_pending_loads_c_patch)
+        .status()
+        .expect("Failed to run `patch` for eval-pending-loads-c.patch");
+    assert!(
+        status.success(),
+        "eval-pending-loads-c.patch failed to apply to staged mlx-c (sc-24245)"
+    );
+    println!("cargo:rerun-if-changed=patches/eval-pending-loads-c.patch");
+
     // Copy our patch files into the staged source. FetchContent allows only one
     // PATCH_COMMAND, so build.rs generates apply_patches.sh (below) which applies
     // each MLX source patch individually and idempotently.

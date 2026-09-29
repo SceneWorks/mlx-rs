@@ -64,4 +64,6 @@ extern "C" {
         x: mlx_array,
         stream: mlx_stream,
     ) -> ::std::os::raw::c_int;
+    // Added by eval-pending-loads-c.patch (sc-24245).
+    pub fn mlx_pmetal_eval_pending_loads(outputs: mlx_vector_array) -> ::std::os::raw::c_int;
 }

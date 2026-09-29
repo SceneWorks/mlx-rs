@@ -1,0 +1,72 @@
+diff --git a/mlx/c/transforms.cpp b/mlx/c/transforms.cpp
+--- a/mlx/c/transforms.cpp
++++ b/mlx/c/transforms.cpp
+@@ -8,6 +8,12 @@
+ #include "mlx/c/private/mlx.h"
+ #include "mlx/transforms.h"
+ 
++#include <typeinfo>
++#include <unordered_set>
++#include <vector>
++
++#include "mlx/primitives.h"
++
+ extern "C" int mlx_async_eval(const mlx_vector_array outputs) {
+   try {
+     mlx::core::async_eval(mlx_vector_array_get_(outputs));
+@@ -69,6 +75,44 @@
+ extern "C" int mlx_eval(const mlx_vector_array outputs) {
+   try {
+     mlx::core::eval(mlx_vector_array_get_(outputs));
++  } catch (std::exception& e) {
++    mlx_error(e.what());
++    return 1;
++  }
++  return 0;
++}
++// pmetal (sc-24245): evaluate only the not-yet-scheduled safetensors `Load`
++// leaves of `outputs`' lazy graphs, never a derived node. MLX runs `Load` on
++// its CPU stream (io thread pool); evaluating a GPU-stream consumer of an
++// unread `Load` makes the Metal command buffer wait on the disk read, which a
++// slow drive can hold past the GPU watchdog. Reading the pending loads first
++// leaves the later GPU evaluation with resident inputs only. The walk stops at
++// any node that is already scheduled or available; no pending loads is a
++// no-op.
++extern "C" int mlx_pmetal_eval_pending_loads(const mlx_vector_array outputs) {
++  try {
++    const auto& roots = mlx_vector_array_get_(outputs);
++    std::vector<mlx::core::array> loads;
++    std::unordered_set<std::uintptr_t> visited;
++    std::vector<mlx::core::array> stack(roots.begin(), roots.end());
++    while (!stack.empty()) {
++      auto a = std::move(stack.back());
++      stack.pop_back();
++      if (a.status() != mlx::core::array::Status::unscheduled ||
++          !a.has_primitive() || !visited.insert(a.id()).second) {
++        continue;
++      }
++      if (typeid(a.primitive()) == typeid(mlx::core::Load)) {
++        loads.push_back(std::move(a));
++        continue;
++      }
++      // Siblings share this node's primitive and inputs, so walking the inputs
++      // once covers every output of a multi-output primitive.
++      for (const auto& in : a.inputs()) {
++        stack.push_back(in);
++      }
++    }
++    mlx::core::eval(std::move(loads));
+   } catch (std::exception& e) {
+     mlx_error(e.what());
+     return 1;
+diff --git a/mlx/c/transforms.h b/mlx/c/transforms.h
+--- a/mlx/c/transforms.h
++++ b/mlx/c/transforms.h
+@@ -41,6 +41,7 @@
+     const mlx_closure fun,
+     const mlx_closure_custom fun_vjp);
+ int mlx_eval(const mlx_vector_array outputs);
++int mlx_pmetal_eval_pending_loads(const mlx_vector_array outputs);
+ int mlx_jvp(
+     mlx_vector_array* res_0,
+     mlx_vector_array* res_1,
