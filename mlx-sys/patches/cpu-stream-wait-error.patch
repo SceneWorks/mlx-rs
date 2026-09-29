@@ -1,0 +1,181 @@
+diff --git a/mlx/backend/metal/device.cpp b/mlx/backend/metal/device.cpp
+index fd61e39..fa69f35 100644
+--- a/mlx/backend/metal/device.cpp
++++ b/mlx/backend/metal/device.cpp
+@@ -1053,10 +1053,13 @@ void clear_reported_command_buffer_error(
+   for (auto& [index, encoder] : get_command_encoders()) {
+     encoder.clear_reported_error(reported);
+   }
+-  std::shared_lock lock(get_global_command_encoders_mutex());
+-  for (auto& [index, encoder] : get_global_command_encoders()) {
+-    encoder.clear_reported_error(reported);
++  {
++    std::shared_lock lock(get_global_command_encoders_mutex());
++    for (auto& [index, encoder] : get_global_command_encoders()) {
++      encoder.clear_reported_error(reported);
++    }
+   }
++  clear_reported_cpu_stream_error(reported);
+ }
+ 
+ std::shared_mutex& get_global_command_encoders_mutex() {
+diff --git a/mlx/backend/metal/device.h b/mlx/backend/metal/device.h
+index da8bf61..8ac36b9 100644
+--- a/mlx/backend/metal/device.h
++++ b/mlx/backend/metal/device.h
+@@ -266,6 +266,10 @@ std::shared_mutex& get_global_command_encoders_mutex();
+ // still carries it so later, unrelated work on those streams is not poisoned.
+ void clear_reported_command_buffer_error(
+     const std::shared_ptr<std::string>& reported);
++// pmetal: the CPU-stream half of the above (defined in event.cpp): drop every
++// CPU stream's pending error that is `reported`.
++void clear_reported_cpu_stream_error(
++    const std::shared_ptr<std::string>& reported);
+ NS::SharedPtr<NS::AutoreleasePool> new_scoped_memory_pool();
+ 
+ bool is_nax_available();
+diff --git a/mlx/backend/metal/event.cpp b/mlx/backend/metal/event.cpp
+index 3779fff..002bb77 100644
+--- a/mlx/backend/metal/event.cpp
++++ b/mlx/backend/metal/event.cpp
+@@ -1,6 +1,8 @@
+ // Copyright © 2024 Apple Inc.
+ 
++#include <mutex>
+ #include <thread>
++#include <unordered_map>
+ 
+ #include "mlx/backend/metal/event.h"
+ #include "mlx/scheduler.h"
+@@ -23,6 +25,65 @@ namespace mlx::core {
+ 
+ namespace metal {
+ 
++namespace {
++
++// pmetal: a CPU-stream task runs on MLX's scheduler thread, where nothing
++// catches an exception — a GPU command-buffer error thrown there by a
++// cross-stream wait called std::terminate (a GPU-watchdog timeout during
++// weight loading aborted the process instead of failing its eval). Instead, a
++// CPU-stream wait that sees an error records it here as that stream's pending
++// error, and every event the stream signals afterwards carries it to whoever
++// waits on it (a host wait throws it; a GPU wait poisons its encoder). Like
++// the GPU encoder's sticky error, it is kept until a host wait reports it.
++struct CpuStreamErrors {
++  std::mutex mutex;
++  std::unordered_map<int, std::shared_ptr<std::string>> pending;
++  // The most recently reported error. A CPU-stream wait can still observe it
++  // on an event after the host has thrown it (the host may report it through
++  // another stream first); it must not become pending again.
++  std::weak_ptr<std::string> last_reported;
++};
++
++CpuStreamErrors& cpu_stream_errors() {
++  // Leaked like the scheduler singleton: scheduler threads may still run
++  // tasks during static destruction.
++  static auto* errors = new CpuStreamErrors();
++  return *errors;
++}
++
++void record_cpu_stream_error(int index, std::shared_ptr<std::string> error) {
++  auto& errors = cpu_stream_errors();
++  std::lock_guard<std::mutex> lock(errors.mutex);
++  if (error == errors.last_reported.lock()) {
++    return;
++  }
++  // Keep the earliest error.
++  errors.pending.try_emplace(index, std::move(error));
++}
++
++std::shared_ptr<std::string> pending_cpu_stream_error(int index) {
++  auto& errors = cpu_stream_errors();
++  std::lock_guard<std::mutex> lock(errors.mutex);
++  auto it = errors.pending.find(index);
++  return it == errors.pending.end() ? nullptr : it->second;
++}
++
++} // namespace
++
++void clear_reported_cpu_stream_error(
++    const std::shared_ptr<std::string>& reported) {
++  auto& errors = cpu_stream_errors();
++  std::lock_guard<std::mutex> lock(errors.mutex);
++  errors.last_reported = reported;
++  for (auto it = errors.pending.begin(); it != errors.pending.end();) {
++    if (it->second == reported) {
++      it = errors.pending.erase(it);
++    } else {
++      ++it;
++    }
++  }
++}
++
+ EventImpl::EventImpl(Device& d) {
+   auto p = new_scoped_memory_pool();
+   mtl_event_ = NS::TransferPtr(d.mtl_device()->newSharedEvent());
+@@ -49,6 +110,11 @@ void EventImpl::wait(uint64_t value, bool await_handler) {
+   check_error();
+ }
+ 
++std::shared_ptr<std::string> EventImpl::wait_unchecked(uint64_t value) {
++  mtl_event_->waitUntilSignaledValue(value, -1); // never times out
++  return std::atomic_load(&error_);
++}
++
+ void EventImpl::signal(uint64_t value) {
+   mtl_event_->setSignaledValue(value);
+   mark_completed(value);
+@@ -93,9 +159,14 @@ void Event::wait() {
+ void Event::wait(Stream stream) {
+   auto impl = std::static_pointer_cast<metal::EventImpl>(event_);
+   if (stream.device == Device::cpu) {
+-    scheduler::enqueue(stream, [impl = std::move(impl), value = value()]() {
+-      impl->wait(value);
+-    });
++    // pmetal: never throw on the scheduler thread (see CpuStreamErrors).
++    scheduler::enqueue(
++        stream,
++        [impl = std::move(impl), value = value(), index = stream.index]() {
++          if (auto error = impl->wait_unchecked(value)) {
++            metal::record_cpu_stream_error(index, std::move(error));
++          }
++        });
+   } else {
+     auto& encoder = metal::get_command_encoder(stream);
+     encoder.wait_event(std::move(impl), value());
+@@ -124,9 +195,17 @@ void Event::signal(Stream stream) {
+   }
+ #endif
+   if (stream.device == Device::cpu) {
+-    scheduler::enqueue(stream, [impl = std::move(impl), value = value()]() {
+-      impl->signal(value);
+-    });
++    scheduler::enqueue(
++        stream,
++        [impl = std::move(impl), value = value(), index = stream.index]() {
++          // pmetal: work this stream ran after a failed wait is not valid;
++          // hand the stream's pending error to whoever waits on this event.
++          if (auto error = metal::pending_cpu_stream_error(index);
++              error && !std::atomic_load(&impl->error())) {
++            impl->set_error(std::move(error));
++          }
++          impl->signal(value);
++        });
+   } else {
+     auto& encoder = metal::get_command_encoder(stream);
+     encoder.signal_event(std::move(impl), value());
+diff --git a/mlx/backend/metal/event.h b/mlx/backend/metal/event.h
+index 59e9c96..4315db8 100644
+--- a/mlx/backend/metal/event.h
++++ b/mlx/backend/metal/event.h
+@@ -16,6 +16,10 @@ class EventImpl {
+   // handler. Only a host wait may do that: a CPU-stream task waiting here can
+   // be what a later GPU wait in that same buffer needs to make progress.
+   void wait(uint64_t value, bool await_handler = false);
++  // pmetal: wait for `value` WITHOUT throwing or consuming this event's error,
++  // and return that error (null if none). For a CPU-stream task, which runs on
++  // MLX's scheduler thread where a throw calls std::terminate.
++  std::shared_ptr<std::string> wait_unchecked(uint64_t value);
+   void signal(uint64_t value);
+   // pmetal: the command buffer that signals `value` has finished its
+   // completion handler (so any error it carries is already on this event).
