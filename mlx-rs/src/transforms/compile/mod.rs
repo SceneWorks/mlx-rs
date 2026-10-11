@@ -181,9 +181,19 @@ impl Drop for CompileLease {
 }
 
 fn new_compile_lease() -> Rc<CompileLease> {
-    let id = NEXT_COMPILE_ID
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
-        .expect("exhausted process-local MLX compile identities");
+    // Explicit CAS loop (what the now-deprecated `fetch_update` does): its replacement
+    // `try_update` is newer than the 1.85 MSRV.
+    let mut id = NEXT_COMPILE_ID.load(Ordering::Relaxed);
+    loop {
+        let next = id
+            .checked_add(1)
+            .expect("exhausted process-local MLX compile identities");
+        match NEXT_COMPILE_ID.compare_exchange_weak(id, next, Ordering::Relaxed, Ordering::Relaxed)
+        {
+            Ok(_) => break,
+            Err(current) => id = current,
+        }
+    }
     let cache_token = unsafe { mlx_sys::mlx_detail_compile_acquire_cache_token() };
     assert!(
         !cache_token.is_null(),
