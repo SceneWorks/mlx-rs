@@ -830,6 +830,12 @@ fn prepare_mlx_c_source() -> PathBuf {
         // and throws its error. Last, because it builds on the sticky-error patch's
         // event.cpp/device.cpp changes.
         ("patches/cpu-stream-wait-error.patch", true, None),
+        // The CPU direct convolution (grouped / depthwise / dilated) must clamp its border loops to
+        // the output: with padding taller or wider than the output (a 7x7 depthwise conv on a 2x2
+        // map, or the input-gradient conv of any such VJP) it wrote whole rows past the output
+        // buffer — silent heap corruption, or a segfault. Upstream's fix, ml-explore/mlx af9a5924
+        // (#4668, after v0.32.0); touches only cpu/conv.cpp's border arithmetic.
+        ("patches/cpu-conv-border-clamp.patch", true, None),
     ];
     // sc-12780 idempotency guard: CMake FetchContent may re-run PATCH_COMMAND against an
     // mlx-src that is ALREADY patched (e.g. an incremental rebuild that does not re-fetch).
