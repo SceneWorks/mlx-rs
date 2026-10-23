@@ -1,5 +1,7 @@
 extern crate cmake;
 
+mod patch_series;
+
 use cmake::Config;
 use sha2::{Digest, Sha256};
 use std::{
@@ -561,6 +563,24 @@ fn prepare_mlx_c_source() -> PathBuf {
     );
     println!("cargo:rerun-if-changed=patches/eval-pending-loads-c.patch");
 
+    // Additive Metal completion-owner retirement ABI. Bindgen still reads the
+    // pristine submodule; src/lib.rs declares the extension explicitly.
+    let retirement_c_patch = std::fs::canonicalize("patches/completion-retirement-c.patch")
+        .expect("find completion-retirement-c.patch");
+    let status = Command::new("patch")
+        .arg("-p1")
+        .arg("-d")
+        .arg(&staged)
+        .arg("-i")
+        .arg(&retirement_c_patch)
+        .status()
+        .expect("Failed to run patch for completion-retirement-c.patch");
+    assert!(
+        status.success(),
+        "completion-retirement-c.patch failed to apply"
+    );
+    println!("cargo:rerun-if-changed=patches/completion-retirement-c.patch");
+
     // Copy our patch files into the staged source. FetchContent allows only one
     // PATCH_COMMAND, so build.rs generates apply_patches.sh (below) which applies
     // each MLX source patch individually and idempotently.
@@ -692,201 +712,63 @@ fn prepare_mlx_c_source() -> PathBuf {
     // GEMM + SDPA correct, so the dispatch gates are unnecessary and 16-bit now uses the
     // (correct, faster) NAX matrix unit. The `bf16_matmul_sweep` + `sdpa_nax_repro` tripwires
     // still assert 16-bit correctness — now they guard the deployment-target fix.
+    println!("cargo:rerun-if-changed=patch_series.rs");
+    println!("cargo:rerun-if-changed=patches/native-upstream-baseline.txt");
+    println!("cargo:rerun-if-changed=patches/native-patched-baseline.txt");
     let patches_dir = staged.join("patches");
     std::fs::create_dir_all(&patches_dir).expect("Failed to create patches dir");
-    // (basename, required, applied_probe). `required = true` means the build MUST fail if the
-    // patch does not apply; `false` means best-effort (a fully-failing patch is a safe no-op).
-    // `applied_probe` is reserved for sequential extension patches that overlap files: after a
-    // later patch lands, an earlier patch may no longer reverse-apply even though its complete,
-    // unique surface is present. The probe checks multiple unique artifacts and only skips when
-    // that complete surface is already installed.
-    //
-    // sc-12746: the MLX source patches are applied INDIVIDUALLY, not concatenated into
-    // one `combined.patch`. `git apply` is atomic PER INVOCATION, so a single combined patch
-    // meant ANY stale hunk silently dropped ALL patches (the previous `git apply combined.patch
-    // || true` swallowed the failure). Applying each patch on its own keeps a genuine failure
-    // isolated to its own patch, and per-file atomicity prevents a dangerous half-apply of a
-    // partially-matching patch.
-    //
-    // sc-12780: ALL patches are `required = true` (three at the time; sc-12937
-    // adds a fourth under the same policy). The metallib and command-buffer
-    // patches were regenerated for MLX 0.32.0 (their 0.31.2 context had drifted and both were
-    // temporarily demoted to best-effort no-ops by sc-12746, which is exactly how the sc-12745
-    // bump silently shipped WITHOUT them). Re-arming them to required=true makes a future silent
-    // drop impossible: if a regenerated patch ever fails to apply again, the build aborts loudly
-    // instead of producing a binary missing pmetal's metallib resolver or the recoverable-error
-    // test hook. See the per-patch notes above and the idempotency guard below.
+    // Every native patch is required. A content-addressed FetchContent stage
+    // starts from the exact pinned upstream touched-file baseline. After the
+    // forward transaction, ordered patch bytes + actual final source bytes are
+    // atomically receipted. Reentry verifies that receipt, never grep markers or
+    // overlapping reverse hunks. Corrupt/partial/changed-input stages are refused.
     let patch_files = [
-        ("patches/metallib-search-path.patch", true, None),
-        ("patches/command-buffer-recoverable.patch", true, None),
-        ("patches/pad-copy-int64.patch", true, None),
-        ("patches/thread-shared-streams.patch", true, None),
-        ("patches/thread-safe-eval.patch", true, None),
-        ("patches/load-completion-errors.patch", true, None),
-        ("patches/apple-metal-sdk.patch", true, None),
-        ("patches/apple-cpu-no-jit.patch", true, None),
-        (
-            "patches/exact-qmm-bias.patch",
-            true,
-            Some(
-                "grep -Fq 'quantized_matmul_bias(' mlx/ops.h && grep -Fq 'affine_qmm_bias_t' mlx/backend/metal/kernels/quantized.metal && grep -Fq 'affine_qmm_bias_t_nax' mlx/backend/metal/kernels/quantized_nax.metal",
-            ),
-        ),
-        (
-            "patches/exact-conv-bias.patch",
-            true,
-            Some(
-                "grep -Fq 'conv_general_bias(' mlx/ops.h && grep -Fq 'HAS_OUTPUT_BIAS' mlx/backend/metal/kernels/steel/conv/kernels/steel_conv.h && grep -Fq 'HAS_OUTPUT_BIAS' mlx/backend/metal/kernels/steel/conv/kernels/steel_conv_3d.h",
-            ),
-        ),
-        ("patches/exact-conv-bias-nojit.patch", true, None),
-        (
-            "patches/exact-group-norm-affine.patch",
-            true,
-            Some(
-                "test -f mlx/backend/metal/kernels/group_norm.metal && grep -Fq 'group_norm_affine(' mlx/fast.h && grep -Fq 'GroupNormAffine::eval_gpu' mlx/backend/metal/normalization.cpp",
-            ),
-        ),
-        (
-            "patches/exact-eager-activations.patch",
-            true,
-            Some(
-                "test -f mlx/backend/metal/kernels/exact_activations.metal && grep -Fq 'silu_exact(' mlx/fast.h && grep -Fq 'ExactActivation::eval_gpu' mlx/backend/metal/normalization.cpp",
-            ),
-        ),
-        ("patches/exact-backend-stubs.patch", true, None),
-        (
-            "patches/exact-epilogue-dispatcher-tests.patch",
-            true,
-            Some(
-                "grep -Fq 'constexpr int ODD_M = 257;' tests/ops_tests.cpp && grep -Fq 'bool noncontiguous = false' tests/ops_tests.cpp",
-            ),
-        ),
-        (
-            "patches/exact-dispatch-and-affine-lifetime.patch",
-            true,
-            Some(
-                "grep -Fq 'ensure_row_contiguous_matrix + QuantizedMatmul::eval_gpu' mlx/ops.cpp && grep -Fq 'if (weight_copied)' mlx/backend/metal/normalization.cpp && grep -Fq 'if (bias_copied)' mlx/backend/metal/normalization.cpp && grep -Fq 'constexpr int BATCH_M = 33;' tests/ops_tests.cpp",
-            ),
-        ),
-        (
-            "patches/exact-qmm-empty-dimensions.patch",
-            true,
-            Some(
-                "grep -Fq 'w_inner_dims <= 0 || w_outer_dims <= 0' mlx/ops.cpp && grep -Fq 'M_size < 32' mlx/ops.cpp && grep -Fq 'const size_t B_size' mlx/ops.cpp && grep -Fq 'zeros({0, K})' tests/ops_tests.cpp && grep -Fq 'zeros({32, 0})' tests/ops_tests.cpp",
-            ),
-        ),
-        (
-            "patches/exact-supported-dispatch.patch",
-            true,
-            Some(
-                "grep -Fq 'Input and weight must promote to float32' mlx/ops.cpp && grep -Fq 'Only float32, float16, and bfloat16 are' mlx/ops.cpp && grep -Fq 'zeros({1, 8, 8, 16}, float64)' tests/ops_tests.cpp",
-            ),
-        ),
-        (
-            "patches/exact-strict-metal-output.patch",
-            true,
-            Some(
-                "test \"$(grep -Fc 's.device != Device::gpu || !metal::is_available()' mlx/fast.cpp)\" -eq 2 && grep -Fq 'Empty weight or output dimensions' mlx/ops.cpp && grep -Fq 'test exact fast primitives reject without Metal' tests/ops_tests.cpp && grep -Fq 'zeros({2, 33, K})' tests/ops_tests.cpp",
-            ),
-        ),
-        (
-            "patches/exact-strict-abi-domains.patch",
-            true,
-            Some(
-                "grep -Fq 'enum class DispatchRejection' mlx/ops.cpp && grep -Fq 'test exact primitives reject oversized Metal ABI domains' tests/ops_tests.cpp && grep -Fq 'test exact qmm selector handles provisional view flags' tests/ops_tests.cpp && grep -Fq 'Row count must fit the Metal' mlx/fast.cpp",
-            ),
-        ),
-        (
-            "patches/exact-strict-indexing-domains.patch",
-            true,
-            Some(
-                "grep -Fq 'Stored input and output logical sizes must' mlx/ops.cpp && grep -Fq 'Packed weight row offsets must fit' mlx/ops.cpp && grep -Fq 'OVERSIZED_OUTPUT_BATCH' tests/ops_tests.cpp && grep -Fq 'PACKED_OFFSET_K' tests/ops_tests.cpp",
-            ),
-        ),
-        (
-            "patches/exact-conv-selector-overflow.patch",
-            true,
-            Some(
-                "grep -Fq 'static_cast<int64_t>(C) + static_cast<int64_t>(O)' mlx/ops.cpp && grep -Fq 'OVERFLOW_CHANNELS' tests/ops_tests.cpp",
-            ),
-        ),
-        (
-            "patches/exact-dispatch-parameter-domains.patch",
-            true,
-            Some(
-                "grep -Fq 'complete_conv_parameters' mlx/ops.cpp && grep -Fq 'host_parameters_fit' mlx/ops.cpp && grep -Fq '512 / tile_count' mlx/ops.cpp && grep -Fq 'test exact qmm mirrors split-k direct delegation' tests/ops_tests.cpp && grep -Fq '65535, 65535' tests/ops_tests.cpp",
-            ),
-        ),
-        // A failed command buffer in the middle of an eval must fail that eval: record the error
-        // before waking the host, keep it until a host wait reports it, and never reset it when a
-        // new encoder opens. Last, because it edits device.cpp after every patch that touches it.
-        ("patches/sticky-command-buffer-error.patch", true, None),
-        // A GPU error seen by a CPU-stream wait must reach the host, not throw on MLX's scheduler
-        // thread (std::terminate): the wait records it as the CPU stream's pending error, the
-        // stream's later signals carry it, and a host wait that reports it clears it. An awaited
-        // event whose completion handler had not run yet (so its error was not visible) is attached
-        // to the stream's next signaled event, and a host wait on that event waits for the handler
-        // and throws its error. Last, because it builds on the sticky-error patch's
-        // event.cpp/device.cpp changes.
-        ("patches/cpu-stream-wait-error.patch", true, None),
-        // The CPU direct convolution (grouped / depthwise / dilated) must clamp its border loops to
-        // the output: with padding taller or wider than the output (a 7x7 depthwise conv on a 2x2
-        // map, or the input-gradient conv of any such VJP) it wrote whole rows past the output
-        // buffer — silent heap corruption, or a segfault. Upstream's fix, ml-explore/mlx af9a5924
-        // (#4668, after v0.32.0); touches only cpu/conv.cpp's border arithmetic.
-        ("patches/cpu-conv-border-clamp.patch", true, None),
+        "patches/metallib-search-path.patch",
+        "patches/command-buffer-recoverable.patch",
+        "patches/pad-copy-int64.patch",
+        "patches/thread-shared-streams.patch",
+        "patches/thread-safe-eval.patch",
+        "patches/load-completion-errors.patch",
+        "patches/apple-metal-sdk.patch",
+        "patches/apple-cpu-no-jit.patch",
+        "patches/exact-qmm-bias.patch",
+        "patches/exact-conv-bias.patch",
+        "patches/exact-conv-bias-nojit.patch",
+        "patches/exact-group-norm-affine.patch",
+        "patches/exact-eager-activations.patch",
+        "patches/exact-backend-stubs.patch",
+        "patches/exact-epilogue-dispatcher-tests.patch",
+        "patches/exact-dispatch-and-affine-lifetime.patch",
+        "patches/exact-qmm-empty-dimensions.patch",
+        "patches/exact-supported-dispatch.patch",
+        "patches/exact-strict-metal-output.patch",
+        "patches/exact-strict-abi-domains.patch",
+        "patches/exact-strict-indexing-domains.patch",
+        "patches/exact-conv-selector-overflow.patch",
+        "patches/exact-dispatch-parameter-domains.patch",
+        "patches/sticky-command-buffer-error.patch",
+        "patches/cpu-stream-wait-error.patch",
+        "patches/cpu-conv-border-clamp.patch",
+        "patches/completion-retirement.patch",
     ];
-    // sc-12780 idempotency guard: CMake FetchContent may re-run PATCH_COMMAND against an
-    // mlx-src that is ALREADY patched (e.g. an incremental rebuild that does not re-fetch).
-    // `git apply` is not idempotent — re-applying an applied patch fails "patch does not apply".
-    // So each patch is guarded: independent patches use a reverse-apply check; sequential exact
-    // epilogue patches that overlap files use complete-surface probes because a later patch can
-    // invalidate an earlier reverse check. An already-present patch is skipped; otherwise it is
-    // applied forward. A `required` patch that genuinely cannot apply aborts the build. This keeps
-    // re-runs a no-op while still hard-failing on a real apply failure — the point of required=true.
-    let mut script = String::from(
-        "#!/bin/sh\n\
-         # Generated by mlx-sys/build.rs. Apply each MLX source patch individually,\n\
-         # idempotently (sc-12780). cwd is the fetched mlx-src (a git repo); patches\n\
-         # live next to this script.\n\
-         d=\"$(dirname \"$0\")\"\n",
-    );
-    for (pf, required, applied_probe) in patch_files {
-        let name = std::path::Path::new(pf)
+    let mut patch_inputs = Vec::new();
+    for pf in patch_files {
+        let name = Path::new(pf)
             .file_name()
             .unwrap()
             .to_str()
             .unwrap()
-            .to_string();
+            .to_owned();
         std::fs::copy(pf, patches_dir.join(&name))
             .unwrap_or_else(|e| panic!("Failed to copy {pf}: {e}"));
-        if required {
-            let probe = applied_probe
-                .map(|probe| format!("{probe}; then\n  "))
-                .unwrap_or_else(|| {
-                    format!("git apply --reverse --check \"$d/{name}\" 2>/dev/null; then\n  ")
-                });
-            script.push_str(&format!(
-                "if {probe}\
-                 echo \"pmetal: {name} already applied; skipping\" >&2\n\
-                 elif git apply \"$d/{name}\"; then\n  :\n\
-                 else\n  \
-                 echo \"pmetal: FATAL required patch {name} (sc-12780) failed to apply\" >&2\n  \
-                 exit 1\n\
-                 fi\n"
-            ));
-        } else {
-            script.push_str(&format!(
-                "if git apply --reverse --check \"$d/{name}\" 2>/dev/null; then\n  \
-                 echo \"pmetal: {name} already applied; skipping\" >&2\n\
-                 elif git apply \"$d/{name}\" 2>/dev/null; then\n  :\n\
-                 else\n  \
-                 echo \"pmetal: {name} did not apply (best-effort, skipped)\" >&2\n\
-                 fi\n"
-            ));
-        }
+        let content = std::fs::read_to_string(pf).expect("read native patch");
+        patch_inputs.push((name, content));
     }
+    let script = patch_series::script(
+        &patch_inputs,
+        include_str!("patches/native-upstream-baseline.txt"),
+        include_str!("patches/native-patched-baseline.txt"),
+    );
     let apply_script = patches_dir.join("apply_patches.sh");
     std::fs::write(&apply_script, &script).expect("Failed to write apply_patches.sh");
 
@@ -899,12 +781,12 @@ fn prepare_mlx_c_source() -> PathBuf {
         std::fs::read_to_string(&cmake_path).expect("Failed to read CMakeLists.txt");
     let patched = cmake_content.replace(
         "GIT_TAG v0.31.1)",
-        "GIT_TAG v0.32.0\n    PATCH_COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/patches/apply_patches.sh)",
+        &patch_series::cmake_declaration(&source_fingerprint()),
     );
     std::fs::write(&cmake_path, patched).expect("Failed to write patched CMakeLists.txt");
 
     // Tell cargo to rerun if any patch changes
-    for (pf, _required, _applied_probe) in patch_files {
+    for pf in patch_files {
         println!("cargo:rerun-if-changed={pf}");
     }
 
@@ -971,7 +853,11 @@ fn source_fingerprint() -> String {
         }
     }
     let mut hasher = Sha256::new();
-    let mut files = vec![PathBuf::from("build.rs"), PathBuf::from("Cargo.toml")];
+    let mut files = vec![
+        PathBuf::from("build.rs"),
+        PathBuf::from("patch_series.rs"),
+        PathBuf::from("Cargo.toml"),
+    ];
     walk(Path::new("patches"), &mut files);
     walk(Path::new("src/mlx-c"), &mut files);
     for path in files {
