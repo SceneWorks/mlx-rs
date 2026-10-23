@@ -126,7 +126,10 @@ jobs:
           set -euo pipefail
           # Select the unique completed Debug output, not an arbitrary build-std directory.
           outputs=()
-          for manifest in target/${{ matrix.target }}/debug/build/pmetal-mlx-sys-*/out/build/lib/pmetal-mlx-prebuilt.txt; do
+          # Stable Cargo uses package-hash/out; current nightly uses package/hash/out.
+          for manifest in \
+            target/${{ matrix.target }}/debug/build/pmetal-mlx-sys-*/out/build/lib/pmetal-mlx-prebuilt.txt \
+            target/${{ matrix.target }}/debug/build/pmetal-mlx-sys/*/out/build/lib/pmetal-mlx-prebuilt.txt; do
             [ -f "$manifest" ] || continue
             outputs+=("${manifest%/build/lib/pmetal-mlx-prebuilt.txt}")
           done

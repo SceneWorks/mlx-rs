@@ -236,6 +236,15 @@ impl Stream {
         }
     }
 
+    /// Get this stream's device, independently of global or task-local defaults.
+    ///
+    /// Allocates an owned native device metadata handle, released when the returned
+    /// [`Device`] is dropped. This query does not create a stream or initialize an
+    /// execution backend.
+    pub fn get_device(&self) -> Result<Device> {
+        Device::try_from_op(|res| unsafe { mlx_sys::mlx_stream_get_device(res, self.c_stream) })
+    }
+
     /// Get the index of the stream.
     pub fn get_index(&self) -> Result<i32> {
         i32::try_from_op(|res| unsafe { mlx_sys::mlx_stream_get_index(res, self.c_stream) })

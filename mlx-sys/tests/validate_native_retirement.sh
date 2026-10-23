@@ -46,3 +46,11 @@ for fast in 0 1; do
   DEVICE=cpu MLX_METAL_FAST_SYNCH="$fast" "$build/tests/completion_retirement_tests" \
     --test-case='*completion retirement*' --no-skip
  done
+
+# Generic CPU-only cargo test users do not need a GPU. This required Metal lane
+# explicitly runs the ignored GPU metadata ABI test and rejects an empty match.
+gpu_metadata_log="$RUNNER_TEMP/stream-device-metadata-gpu.log"
+cargo test -p mlx-tests --test stream_retirement \
+  selected_stream_device_metadata_preserves_gpu_streams_under_cpu_task_local \
+  -- --exact --ignored --test-threads=1 --color never 2>&1 | tee "$gpu_metadata_log"
+grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored;' "$gpu_metadata_log"
