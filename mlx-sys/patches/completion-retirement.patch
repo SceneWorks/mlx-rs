@@ -90,7 +90,7 @@ new file mode 100644
 +
 +  void record_error(std::exception_ptr error) noexcept {
 +    std::lock_guard lock(mutex_);
-+    if (!error_) error_ = std::move(error);
++    if (!static_cast<bool>(error_)) error_ = std::move(error);
 +  }
 +
 +  std::exception_ptr error() noexcept {
