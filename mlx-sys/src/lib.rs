@@ -64,6 +64,18 @@ extern "C" {
         x: mlx_array,
         stream: mlx_stream,
     ) -> ::std::os::raw::c_int;
+    // Added by completion-retirement-c.patch. Requires matching newly built native archives.
+    // CPU/Metal: completes this stream's queued work and joins prior task/callback-owner
+    // destruction; persistent first async error, no external-alias/cache/backing guarantee.
+    pub fn mlx_pmetal_synchronize_and_retire(stream: mlx_stream) -> ::std::os::raw::c_int;
+    pub fn mlx_pmetal_retirement_fence_new(
+        out: *mut *mut ::std::os::raw::c_void,
+        stream: mlx_stream,
+    ) -> ::std::os::raw::c_int;
+    pub fn mlx_pmetal_retirement_fence_wait(
+        fence: *mut ::std::os::raw::c_void,
+    ) -> ::std::os::raw::c_int;
+    pub fn mlx_pmetal_retirement_fence_free(fence: *mut ::std::os::raw::c_void);
     // Added by eval-pending-loads-c.patch (sc-24245).
     pub fn mlx_pmetal_eval_pending_loads(outputs: mlx_vector_array) -> ::std::os::raw::c_int;
 }

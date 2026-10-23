@@ -1,0 +1,2403 @@
+diff --git a/mlx/backend/common/retirement_capture.h b/mlx/backend/common/retirement_capture.h
+new file mode 100644
+--- /dev/null
++++ b/mlx/backend/common/retirement_capture.h
+@@ -0,0 +1,12 @@
++// Copyright © 2026 pmetal contributors.
++#pragma once
++#include "mlx/retirement.h"
++namespace mlx::core::detail {
++// Submission can add owner callbacks. Capture MUST run afterward. No catch:
++// failed submission/join cannot manufacture a completed receipt or acknowledge.
++template <typename Submit, typename Capture>
++RetirementFence capture_retirement_range(Submit&& submit, Capture&& capture) {
++  submit();
++  return capture();
++}
++}
+diff --git a/mlx/retirement.h b/mlx/retirement.h
+new file mode 100644
+--- /dev/null
++++ b/mlx/retirement.h
+@@ -0,0 +1,46 @@
++// Copyright © 2026 pmetal contributors.
++#pragma once
++#include <exception>
++#include <functional>
++#include <memory>
++#include <mutex>
++#include <stdexcept>
++#include <utility>
++
++namespace mlx::core {
++
++// An immutable receipt for a range whose native owners have ALREADY retired.
++// Creating it may block/throw setup errors. wait() observes the cached result and
++// acknowledges ONLY that completed range. Dropping without wait never acks.
++class RetirementFence {
++  struct State {
++    State(std::exception_ptr e, std::function<bool()> a)
++        : error(std::move(e)), acknowledge(std::move(a)) {}
++    std::exception_ptr error;
++    std::function<bool()> acknowledge;
++    std::once_flag observed;
++    bool acknowledged{false};
++  };
++ public:
++  RetirementFence() = default;
++  static RetirementFence completed(std::exception_ptr error,
++                                   std::function<bool()> acknowledge) {
++    RetirementFence fence;
++    fence.state_ = std::make_shared<State>(std::move(error), std::move(acknowledge));
++    return fence;
++  }
++  void wait() const {
++    if (!state_) throw std::logic_error("[retirement] Empty fence.");
++    std::call_once(state_->observed, [&] {
++      state_->acknowledged = state_->acknowledge();
++    });
++    if (!state_->acknowledged) {
++      throw std::logic_error("[retirement] Cannot acknowledge unretired obligations.");
++    }
++    if (state_->error) std::rethrow_exception(state_->error);
++  }
++ private:
++  std::shared_ptr<State> state_;
++};
++
++} // namespace mlx::core
+diff --git a/mlx/backend/common/execution_outcome.h b/mlx/backend/common/execution_outcome.h
+new file mode 100644
+--- /dev/null
++++ b/mlx/backend/common/execution_outcome.h
+@@ -0,0 +1,56 @@
++// Copyright © 2026 pmetal contributors.
++#pragma once
++#include <exception>
++#include <future>
++#include <mutex>
++
++namespace mlx::core::detail {
++
++// One CPU primitive's queued execution, retained by its output completion DAG.
++// The future contains no array/Data owner. It remains failed for every alias and
++// downstream CPU/Metal consumer, independently of stream retirement bookkeeping.
++class ExecutionOutcome {
++ public:
++  ExecutionOutcome() : future_(promise_.get_future().share()) {}
++
++  std::shared_future<void> future() const { return future_; }
++
++  void record_error(std::exception_ptr error) noexcept {
++    std::lock_guard lock(mutex_);
++    if (!static_cast<bool>(error_)) error_ = std::move(error);
++  }
++
++  std::exception_ptr error() noexcept {
++    std::lock_guard lock(mutex_);
++    return error_;
++  }
++
++  template <typename Task>
++  std::exception_ptr run(Task& task) noexcept {
++    // Do not cancel already queued work on a host encoding exception. Its raw
++    // input/output pointers remain valid until the queued owner-release closure.
++    try { task(); } catch (...) { record_error(std::current_exception()); }
++    std::lock_guard lock(mutex_);
++    return error_;
++  }
++
++  // Normally queued after this primitive's tasks. A setup failure may publish
++  // an invalid result earlier ONLY while DeferredOutcomes owns its whole graph
++  // until actual queue retirement. Readiness is never a release certificate.
++  void finish() noexcept {
++    std::lock_guard lock(mutex_);
++    if (finished_) return;
++    if (error_) promise_.set_exception(error_);
++    else promise_.set_value();
++    finished_ = true;
++  }
++
++ private:
++  std::promise<void> promise_;
++  std::shared_future<void> future_;
++  std::mutex mutex_;
++  std::exception_ptr error_;
++  bool finished_{false};
++};
++
++} // namespace mlx::core::detail
+diff --git a/mlx/backend/metal/completion_retirement.h b/mlx/backend/metal/completion_retirement.h
+new file mode 100644
+--- /dev/null
++++ b/mlx/backend/metal/completion_retirement.h
+@@ -0,0 +1,198 @@
++// Copyright © 2026 pmetal contributors.
++#pragma once
++#include <condition_variable>
++#include <cstdint>
++#include <exception>
++#include <functional>
++#include <map>
++#include <memory>
++#include <mutex>
++#include <string>
++#include <utility>
++#include <vector>
++#include "mlx/retirement.h"
++
++namespace mlx::core::metal {
++
++// Host-only callback ownership/range journal (also used by CPU StreamThread).
++// No entry owns arrays. Entry allocation happens before work is published;
++// callback error recording, completion and acknowledgement do not allocate.
++class CompletionRetirement : public std::enable_shared_from_this<CompletionRetirement> {
++ public:
++  using Ticket = uint64_t;
++  enum class Kind { Execution, Callback };
++  template <typename Argument> class Callback;
++  class Record {
++   public:
++    explicit Record(std::shared_ptr<CompletionRetirement> state) : state_(std::move(state)) {}
++    ~Record() { if (ticket_) state_->cancel_reserved(ticket_); }
++    void error(std::exception_ptr error, Kind kind = Kind::Callback,
++               std::shared_ptr<std::string> key = {}) noexcept {
++      state_->record_error(ticket_, std::move(error), kind, std::move(key));
++    }
++   private:
++    friend class CompletionRetirement;
++    template <typename> friend class Callback;
++    std::shared_ptr<CompletionRetirement> state_;
++    Ticket ticket_{0};
++  };
++
++  template <typename Argument>
++  class Callback {
++   public:
++    Callback(std::shared_ptr<Record> record, std::function<void(Argument)> body)
++        : record_(std::move(record)), body_(std::move(body)) {}
++    void run(Argument argument) noexcept {
++      std::call_once(once_, [this, argument] {
++        try { body_(argument); }
++        catch (...) { record_->error(std::current_exception()); }
++        body_ = nullptr; // owner destruction BEFORE completion publication
++        record_->state_->finish(record_->ticket_);
++      });
++    }
++    // Only for a task which failed to enter its queue; never for scheduled work.
++    void cancel_unpublished() noexcept {
++      std::call_once(once_, [this] {
++        body_ = nullptr;
++        record_->state_->finish(record_->ticket_);
++      });
++    }
++   private:
++    std::shared_ptr<Record> record_;
++    std::function<void(Argument)> body_;
++    std::once_flag once_;
++  };
++
++  std::shared_ptr<Record> prepare() {
++    auto record = std::make_shared<Record>(shared_from_this());
++    std::lock_guard lock(mutex_);
++    Ticket ticket = issued_ + 1;
++    entries_.try_emplace(ticket);
++    issued_ = ticket;
++    record->ticket_ = ticket;
++    return record;
++  }
++
++  template <typename Argument>
++  std::shared_ptr<Callback<Argument>> track(std::function<void(Argument)> body,
++                                          std::shared_ptr<Record> record = {}) {
++    if (!record) record = prepare();
++    auto callback = std::make_shared<Callback<Argument>>(record, std::move(body));
++    {
++      std::lock_guard lock(mutex_);
++      auto it = entries_.find(record->ticket_);
++      if (record->state_.get() != this || it == entries_.end() || it->second.status != Status::Reserved) {
++        throw std::logic_error("[retirement] Invalid callback record.");
++      }
++      it->second.status = Status::Pending;
++    }
++    return callback;
++  }
++
++  Ticket snapshot() const { std::lock_guard lock(mutex_); return issued_; }
++  void wait(Ticket through) {
++    std::unique_lock lock(mutex_);
++    ready_.wait(lock, [&] { return complete_locked(through); });
++  }
++  std::exception_ptr error_through(Ticket through) const {
++    std::lock_guard lock(mutex_);
++    for (auto& [ticket, entry] : entries_) {
++      if (ticket > through) break;
++      if (!entry.acknowledged && entry.error) return entry.error;
++    }
++    return {};
++  }
++  std::vector<std::shared_ptr<std::string>> keys_through(Ticket through) const {
++    std::vector<std::shared_ptr<std::string>> keys;
++    std::lock_guard lock(mutex_);
++    for (auto& [ticket, entry] : entries_) {
++      if (ticket > through) break;
++      if (!entry.acknowledged && entry.key) keys.push_back(entry.key);
++    }
++    return keys;
++  }
++  bool acknowledge(Ticket through) noexcept {
++    std::lock_guard lock(mutex_);
++    if (!complete_locked(through)) return false;
++    auto end = entries_.upper_bound(through);
++    entries_.erase(entries_.begin(), end);
++    return true;
++  }
++  // An ordinary array/event error report acknowledges only that execution
++  // failure. A callback/retirement failure always requires an observed fence.
++  void acknowledge_execution(const std::shared_ptr<std::string>& key) noexcept {
++    std::lock_guard lock(mutex_);
++    for (auto it = entries_.begin(); it != entries_.end();) {
++      auto& entry = it->second;
++      if (entry.kind == Kind::Execution && entry.key == key) {
++        entry.acknowledged = true;
++        if (entry.status == Status::Complete) { it = entries_.erase(it); continue; }
++      }
++      ++it;
++    }
++  }
++  mlx::core::RetirementFence fence() {
++    auto through = snapshot();
++    wait(through);
++    auto error = error_through(through);
++    return mlx::core::RetirementFence::completed(error,
++        [state = shared_from_this(), through]() noexcept { return state->acknowledge(through); });
++  }
++
++ private:
++  enum class Status { Reserved, Pending, Complete };
++  struct Entry {
++    Status status{Status::Reserved};
++    Kind kind{Kind::Callback};
++    bool acknowledged{false};
++    std::exception_ptr error;
++    std::shared_ptr<std::string> key;
++  };
++  bool complete_locked(Ticket through) const noexcept {
++    for (auto& [ticket, entry] : entries_) {
++      if (ticket > through) break;
++      if (entry.status != Status::Complete) return false;
++    }
++    return true;
++  }
++  void record_error(Ticket ticket, std::exception_ptr error, Kind kind,
++                    std::shared_ptr<std::string> key) noexcept {
++    std::lock_guard lock(mutex_);
++    auto it = entries_.find(ticket);
++    if (it == entries_.end() || it->second.status != Status::Pending) return;
++    auto& entry = it->second;
++    // Callback failure upgrades an acknowledged execution report. It cannot
++    // disappear merely because ordinary eval consumed the transport error.
++    if (!entry.error || (entry.kind == Kind::Execution && kind == Kind::Callback)) {
++      entry.error = std::move(error);
++      entry.kind = kind;
++      entry.key = std::move(key);
++      entry.acknowledged = false;
++    }
++  }
++  void finish(Ticket ticket) noexcept {
++    {
++      std::lock_guard lock(mutex_);
++      auto it = entries_.find(ticket);
++      if (it != entries_.end()) {
++        it->second.status = Status::Complete;
++        if (!it->second.error || it->second.acknowledged) entries_.erase(it);
++      }
++    }
++    ready_.notify_all();
++  }
++  void cancel_reserved(Ticket ticket) noexcept {
++    {
++      std::lock_guard lock(mutex_);
++      auto it = entries_.find(ticket);
++      if (it != entries_.end() && it->second.status == Status::Reserved) entries_.erase(it);
++    }
++    ready_.notify_all();
++  }
++  mutable std::mutex mutex_;
++  std::condition_variable ready_;
++  Ticket issued_{0};
++  std::map<Ticket, Entry> entries_;
++};
++
++} // namespace mlx::core::metal
+diff --git a/mlx/backend/metal/commit_completion.h b/mlx/backend/metal/commit_completion.h
+new file mode 100644
+--- /dev/null
++++ b/mlx/backend/metal/commit_completion.h
+@@ -0,0 +1,22 @@
++// Copyright © 2026 pmetal contributors.
++#pragma once
++#include <exception>
++#include <type_traits>
++#include <utility>
++
++namespace mlx::core::metal {
++
++// The production commit callback uses this boundary: throwing work/accounting
++// cannot bypass no-allocation event/debug finalization. Error handling and the
++// finalizer MUST be noexcept; exceptions never cross Metal's callback ABI.
++template <typename Body, typename Completion, typename Finalize, typename OnError>
++void run_commit_completion(Body&& body, Completion&& completion,
++                           Finalize&& finalize, OnError&& on_error) noexcept {
++  static_assert(std::is_nothrow_invocable_v<Finalize>);
++  static_assert(std::is_nothrow_invocable_v<OnError, std::exception_ptr>);
++  try { body(); } catch (...) { on_error(std::current_exception()); }
++  try { completion(); } catch (...) { on_error(std::current_exception()); }
++  finalize();
++}
++
++} // namespace mlx::core::metal
+diff --git a/mlx/backend/cpu/task_outcome.h b/mlx/backend/cpu/task_outcome.h
+new file mode 100644
+--- /dev/null
++++ b/mlx/backend/cpu/task_outcome.h
+@@ -0,0 +1,6 @@
++// Copyright © 2026 pmetal contributors.
++#pragma once
++#include "mlx/backend/common/execution_outcome.h"
++namespace mlx::core::cpu {
++using TaskOutcome = mlx::core::detail::ExecutionOutcome;
++}
+diff --git a/mlx/backend/cpu/deferred_outcome.h b/mlx/backend/cpu/deferred_outcome.h
+new file mode 100644
+--- /dev/null
++++ b/mlx/backend/cpu/deferred_outcome.h
+@@ -0,0 +1,48 @@
++// Copyright © 2026 pmetal contributors.
++#pragma once
++#include <memory>
++#include <optional>
++#include <type_traits>
++#include <vector>
++#include "mlx/backend/cpu/task_outcome.h"
++
++namespace mlx::core::cpu {
++
++// Storage is allocated with the primitive outcome BEFORE any raw-pointer task is
++// queued. Only a failed setup populates it, so success-path donation is unchanged.
++// This is error custody for existing owners, not allocation admission/accounting.
++template <typename Owner>
++struct DeferredOutcome : TaskOutcome {
++  static_assert(std::is_nothrow_copy_constructible_v<Owner>);
++  void retain(const Owner& value, std::vector<Owner>&& out,
++              std::vector<Owner>&& temps) noexcept {
++    root.emplace(value);
++    outputs = std::move(out);
++    temporaries = std::move(temps);
++  }
++  std::optional<Owner> root;
++  std::vector<Owner> outputs, temporaries;
++  std::shared_ptr<DeferredOutcome> next;
++};
++
++template <typename Owner>
++class DeferredOutcomes {
++ public:
++  using Node = DeferredOutcome<Owner>;
++  void defer(std::shared_ptr<Node> node) noexcept {
++    node->next = std::move(head_);
++    head_ = std::move(node);
++  }
++  // Caller has joined actual queued work, including submitted producer waits.
++  // Destruction (and any allocator free) completes BEFORE this method returns.
++  void release() noexcept {
++    while (head_) {
++      auto node = std::move(head_);
++      head_ = std::move(node->next);
++    }
++  }
++ private:
++  std::shared_ptr<Node> head_;
++};
++
++} // namespace mlx::core::cpu
+diff --git a/mlx/backend/common/load.cpp b/mlx/backend/common/load.cpp
+--- a/mlx/backend/common/load.cpp
++++ b/mlx/backend/common/load.cpp
+@@ -54,10 +54,17 @@
+   // The stream must keep progressing and signal its fences even on a read
+   // failure. Retrieve the exception on the host in array::wait(), not on the
+   // scheduler thread (where throwing would terminate the process).
+-  auto completion = std::make_shared<LoadCompletion>();
+-  completion->add(fut);
+-  out.attach_load_completion(std::move(completion));
+-  scheduler::enqueue(stream(), [fut = std::move(fut)]() { fut.wait(); });
++  try {
++    auto completion = std::make_shared<LoadCompletion>();
++    completion->add(fut);
++    out.attach_load_completion(std::move(completion));
++    // Keep a host copy until enqueue succeeds: its failure must still join the
++    // I/O task that already holds a raw destination pointer.
++    scheduler::enqueue(stream(), [fut]() { fut.wait(); });
++  } catch (...) {
++    fut.wait();
++    throw;
++  }
+ }
+ 
+ } // namespace mlx::core
+diff --git a/mlx/load_completion.h b/mlx/load_completion.h
+--- a/mlx/load_completion.h
++++ b/mlx/load_completion.h
+@@ -4,20 +4,40 @@
+ #include <algorithm>
+ #include <exception>
+ #include <future>
++#include <functional>
+ #include <memory>
+ #include <mutex>
+ #include <vector>
+ 
+ namespace mlx::core {
+ 
+-// A load failure belongs to its evaluated arrays, not a process-global error
+-// slot. Keep it across graph detachment and repeated waits, including when an
+-// async result becomes an input to another evaluation. No array is retained.
++// A load/CPU-execution failure belongs to its evaluated arrays, not a stream or
++// process-global error slot. Keep it across graph detachment and repeated waits,
++// including when an async result becomes an input on another CPU/Metal stream.
++// CPU TaskOutcome contributes a future to this same dependency DAG. No array or
++// Data owner is retained here; retirement errors are tracked separately.
+ class LoadCompletion {
+  public:
+-  void add(std::shared_future<void> load) {
++  // Only for failed setup whose raw-work owners are already in native custody.
++  // Unlike normal read failure, it may refuse immediately without joining an
++  // unsubmitted producer; the explicit retirement fence joins/releases custody.
++  void record_setup_error(std::exception_ptr error) noexcept {
++    std::lock_guard lock(mutex_);
++    if (error) {
++      if (!error_) error_ = std::move(error);
++      failed_setup_ = true;
++    }
++  }
++
++  void check_known_error() {
++    std::exception_ptr error;
++    { std::lock_guard lock(mutex_); error = error_; }
++    if (error) std::rethrow_exception(error);
++  }
++
++  void add(std::shared_future<void> load, std::function<void()> report = {}) {
+     std::lock_guard<std::mutex> lock(mutex_);
+-    loads_.push_back(std::move(load));
++    loads_.push_back({std::move(load), std::move(report)});
+   }
+ 
+   void depend_on(const std::shared_ptr<LoadCompletion>& parent) {
+@@ -32,6 +52,7 @@
+ 
+   void wait() {
+     std::lock_guard<std::mutex> lock(mutex_);
++    if (failed_setup_) std::rethrow_exception(error_);
+     // Drain every outstanding read before surfacing an error: its destination
+     // must remain alive even if another read in the same evaluation failed.
+     for (auto& parent : parents_) {
+@@ -45,10 +66,13 @@
+     }
+     for (auto& load : loads_) {
+       try {
+-        load.get();
++        load.future.get();
+       } catch (...) {
+-        if (!error_) {
+-          error_ = std::current_exception();
++        if (!error_) error_ = std::current_exception();
++        // Reporting acknowledges transport execution errors only. The cached
++        // array failure remains and callback/retirement errors are unaffected.
++        if (load.report) {
++          try { load.report(); } catch (...) { /* keep failure; no false success */ }
+         }
+       }
+     }
+@@ -63,9 +87,14 @@
+ 
+  private:
+   std::mutex mutex_;
+-  std::vector<std::shared_future<void>> loads_;
++  struct Completion {
++    std::shared_future<void> future;
++    std::function<void()> report;
++  };
++  std::vector<Completion> loads_;
+   std::vector<std::shared_ptr<LoadCompletion>> parents_;
+   std::exception_ptr error_;
++  bool failed_setup_{false};
+ };
+ 
+ } // namespace mlx::core
+diff --git a/mlx/backend/metal/device.h b/mlx/backend/metal/device.h
+--- a/mlx/backend/metal/device.h
++++ b/mlx/backend/metal/device.h
+@@ -5,12 +5,15 @@
+ #include <Metal/Metal.hpp>
+ #include <functional>
+ #include <mutex>
++#include <optional>
+ #include <shared_mutex>
+ #include <string>
+ #include <unordered_map>
+ #include <unordered_set>
+ 
+ #include "mlx/array.h"
++#include "mlx/backend/metal/completion_retirement.h"
++#include "mlx/backend/common/execution_outcome.h"
+ #include "mlx/backend/common/metal_kernel.h"
+ #include "mlx/backend/metal/resident.h"
+ #include "mlx/device.h"
+@@ -92,14 +95,43 @@
+ 
+   void barrier();
+   void end_encoding();
++  struct FailedOwners {
++    std::optional<array> root;
++    std::vector<array> outputs;
++    std::shared_ptr<FailedOwners> next;
++  };
++  void defer_failed_owners(std::shared_ptr<FailedOwners> owners, const array& root,
++                           std::vector<array>&& outputs) noexcept {
++    owners->root.emplace(root);
++    owners->outputs = std::move(outputs);
++    owners->next = std::move(failed_owners_);
++    failed_owners_ = std::move(owners);
++  }
+   void wait_event(std::shared_ptr<EventImpl> event, uint64_t value);
+   void signal_event(std::shared_ptr<EventImpl> event, uint64_t value);
+   bool needs_commit() const;
++  bool has_pending_work() const {
++    return buffer_ops_ != 0 || encoder_ || buffer_has_handlers_ ||
++        !wait_events_.empty() || !signal_events_.empty();
++  }
+   void commit(std::function<void()> completion = nullptr);
+   void synchronize();
++  void synchronize_and_retire();
++  RetirementFence retirement_fence();
++  struct BufferOutcome : mlx::core::detail::ExecutionOutcome {
++    std::shared_ptr<std::string> report_key;
++  };
++  const std::shared_ptr<BufferOutcome>& execution_outcome() const {
++    return execution_outcome_;
++  }
++  // All Metal handlers must use this wrapper: it destroys their captured owners
++  // inside the callback, then publishes retirement independently of Metal's copies.
++  void add_completed_handler(std::function<void(MTL::CommandBuffer*)> body,
++      std::shared_ptr<CompletionRetirement::Record> record = {});
+   // pmetal: drop this encoder's sticky command-buffer error if it is the one a
+   // host wait has just reported (see clear_reported_command_buffer_error).
+-  void clear_reported_error(const std::shared_ptr<std::string>& reported);
++  void clear_reported_error(const std::shared_ptr<std::string>& reported,
++                            bool acknowledge_execution = true);
+ 
+   MTL::CommandBuffer* get_command_buffer() const {
+     return buffer_.get();
+@@ -107,14 +139,38 @@
+ 
+  private:
+   MTL::ComputeCommandEncoder* get_command_encoder();
++  void release_failed_owners() noexcept {
++    while (failed_owners_) {
++      auto node = std::move(failed_owners_);
++      failed_owners_ = std::move(node->next);
++    }
++  }
++  struct EncoderOwners {
++    NS::SharedPtr<MTL::Fence> fence;
++    std::vector<array> temporaries;
++    std::unordered_set<const void*> outputs;
++    struct FenceHash {
++      size_t operator()(const NS::SharedPtr<MTL::Fence>& value) const noexcept {
++        return std::hash<MTL::Fence*>{}(value.get());
++      }
++    };
++    std::unordered_set<NS::SharedPtr<MTL::Fence>, FenceHash> waiting_on;
++  };
++  std::shared_ptr<EncoderOwners> pending_end_;
++  std::shared_ptr<FailedOwners> failed_owners_;
+ 
+   Device& device_;
+   bool exiting_{false};
++  std::shared_ptr<BufferOutcome> execution_outcome_ =
++      std::make_shared<BufferOutcome>();
++  std::shared_ptr<CompletionRetirement> retirement_ =
++      std::make_shared<CompletionRetirement>();
+ 
+   // Buffer that stores encoded commands.
+   NS::SharedPtr<MTL::CommandQueue> queue_;
+   NS::SharedPtr<MTL::CommandBuffer> buffer_;
+   int buffer_ops_{0};
++  bool buffer_has_handlers_{false};
+   size_t buffer_sizes_{0};
+ 
+   // The events hooked to current command buffer.
+@@ -265,7 +321,7 @@
+ // pmetal: a host wait has thrown `reported`; clear it from every encoder that
+ // still carries it so later, unrelated work on those streams is not poisoned.
+ void clear_reported_command_buffer_error(
+-    const std::shared_ptr<std::string>& reported);
++    const std::shared_ptr<std::string>& reported, bool acknowledge_execution = true);
+ // pmetal: the CPU-stream half of the above (defined in event.cpp): drop every
+ // CPU stream's pending error that is `reported`.
+ void clear_reported_cpu_stream_error(
+diff --git a/mlx/backend/metal/device.cpp b/mlx/backend/metal/device.cpp
+--- a/mlx/backend/metal/device.cpp
++++ b/mlx/backend/metal/device.cpp
+@@ -1,6 +1,8 @@
+ // Copyright © 2023-2024 Apple Inc.
+ 
+ #include <atomic>
++#include <new>
++#include "mlx/backend/metal/commit_completion.h"
+ #include <cstdlib>
+ #include <sstream>
+ #include <thread>
+@@ -483,50 +485,58 @@
+     return;
+   }
+ 
+-  // Remove temporaries from inputs and outputs.
+-  for (auto& t : temporaries_) {
+-    all_outputs_.erase(t.buffer().ptr());
+-    all_inputs_.erase(t.buffer().ptr());
+-  }
+-
+-  // Keep references to the fences we waited on and put them in the completion
+-  // handler so they are not prematurely released.
+-  std::unordered_set<NS::SharedPtr<MTL::Fence>> waiting_on;
++  // Allocate/install an empty holder before moving owners or encoding fence
++  // waits. If setup throws, encoder members remain owned and retryable. Once
++  // installed, pending_end_ and the native handler retain all partial state.
++  if (!pending_end_) {
++    auto owners = std::make_shared<EncoderOwners>();
++    auto payload = retirement_->track<MTL::CommandBuffer*>(
++        [this, owners](MTL::CommandBuffer*) {
++          std::lock_guard lock(outputs_mtx_);
++          for (auto output : owners->outputs) {
++            auto it = prev_ce_outputs_.find(output);
++            if (it != prev_ce_outputs_.end() && it->second == owners->fence) {
++              prev_ce_outputs_.erase(it);
++            }
++          }
++        });
++    try {
++      buffer_->addCompletedHandler([payload](MTL::CommandBuffer* cb) { payload->run(cb); });
++    } catch (...) {
++      payload->cancel_unpublished();
++      throw;
++    }
++    buffer_has_handlers_ = true;
++    owners->fence = std::move(fence_);
++    pending_end_ = std::move(owners);
++  }
++  auto& owners = *pending_end_;
++  for (auto& temporary : temporaries_) {
++    all_outputs_.erase(temporary.buffer().ptr());
++    all_inputs_.erase(temporary.buffer().ptr());
++  }
++  owners.temporaries.insert(owners.temporaries.end(),
++      std::make_move_iterator(temporaries_.begin()),
++      std::make_move_iterator(temporaries_.end()));
++  temporaries_.clear();
++  owners.outputs.merge(all_outputs_);
+   {
+-    std::lock_guard lk(outputs_mtx_);
+-    for (auto& in : all_inputs_) {
+-      if (auto it = prev_ce_outputs_.find(in); it != prev_ce_outputs_.end()) {
+-        // If we've already waited on a fence, don't wait on it again.
+-        if (waiting_on.find(it->second) == waiting_on.end()) {
++    std::lock_guard lock(outputs_mtx_);
++    for (auto input : all_inputs_) {
++      if (auto it = prev_ce_outputs_.find(input); it != prev_ce_outputs_.end()) {
++        // Retain BEFORE encoding the wait; allocation failure cannot release a
++        // fence which is already referenced by the unretained command buffer.
++        if (it->second != owners.fence && owners.waiting_on.insert(it->second).second) {
+           encoder_->waitForFence(it->second.get());
+-          waiting_on.insert(it->second);
+         }
+       }
+     }
+-    for (auto& out : all_outputs_) {
+-      prev_ce_outputs_[out] = fence_;
+-    }
+-  }
+-
+-  encoder_->updateFence(fence_.get());
+-  buffer_->addCompletedHandler([this,
+-                                fence = std::move(fence_),
+-                                temporaries = std::move(temporaries_),
+-                                all_outputs = std::move(all_outputs_),
+-                                waiting_on = std::move(waiting_on)](
+-                                   MTL::CommandBuffer*) mutable {
+-    std::lock_guard lk(outputs_mtx_);
+-    for (auto& o : all_outputs) {
+-      if (auto it = prev_ce_outputs_.find(o); it != prev_ce_outputs_.end()) {
+-        if (it->second == fence) {
+-          prev_ce_outputs_.erase(it);
+-        }
+-      }
+-    }
+-  });
+-
++    for (auto output : owners.outputs) prev_ce_outputs_[output] = owners.fence;
++  }
++  encoder_->updateFence(owners.fence.get());
+   encoder_->endEncoding();
+   encoder_.reset();
++  pending_end_.reset();
+   needs_barrier_ = false;
+   concurrent_ = false;
+   prev_inputs_.clear();
+@@ -535,6 +545,7 @@
+   next_outputs_.clear();
+   concurrent_outputs_.clear();
+   all_inputs_.clear();
++  all_outputs_.clear();
+ }
+ 
+ void CommandEncoder::signal_event(
+@@ -567,6 +578,7 @@
+ // carrying the eval's signal event then completes successfully.
+ namespace {
+ std::atomic<bool> g_fail_next_intermediate_buffer{false};
++std::atomic<bool> g_throw_next_commit_completion{false};
+ // pmetal: debug-only test hook. Hold the failing buffer's completion handler
+ // (not the host) until a CPU stream signals an event, so the eval's later,
+ // successful buffers signal their events — and a CPU stream waits on them —
+@@ -582,97 +594,143 @@
+ #endif
+ 
+ void CommandEncoder::commit(std::function<void()> completion) {
+-  bool forced_failure = false;
+-  bool hold_handler = false;
++  bool forced_failure = false, hold_handler = false, throw_before_finalization = false;
+ #ifndef NDEBUG
++  throw_before_finalization = g_throw_next_commit_completion.exchange(false);
+   if (signal_events_.empty()) {
+     forced_failure = g_fail_next_intermediate_buffer.exchange(false);
+     hold_handler = forced_failure && g_hold_failed_handler.exchange(false);
+   }
+ #endif
++  // Allocate BEFORE moving event owners or publishing work. Failure cannot drop
++  // those owners or acknowledge a range which has not completed.
++  auto fallback_error = std::make_shared<std::string>(
++      "[METAL] Command buffer completion handler failed.");
+   auto handler_done = std::make_shared<std::atomic<bool>>(false);
+-  buffer_->addCompletedHandler(
+-      [&error_ = error_,
+-       forced_failure,
+-       hold_handler,
+-       handler_done,
+-       wait_events = std::move(wait_events_),
+-       signal_events = std::move(signal_events_),
+-       completion = std::move(completion)](MTL::CommandBuffer* cbuf) {
++  auto next_outcome = std::make_shared<BufferOutcome>();
++  auto next_buffer = NS::RetainPtr(queue_->commandBufferWithUnretainedReferences());
++  struct Owners {
++    std::vector<std::shared_ptr<EventImpl>> waits;
++    std::vector<std::tuple<std::shared_ptr<EventImpl>, uint64_t>> signals;
++    std::function<void()> completion;
++  };
++  auto owners = std::make_shared<Owners>();
++  auto record = retirement_->prepare();
++  auto payload = retirement_->track<MTL::CommandBuffer*>(
++      [&error_ = error_, record, outcome = execution_outcome_, owners,
++       forced_failure, hold_handler, throw_before_finalization,
++       fallback_error, handler_done](MTL::CommandBuffer* cbuf) {
+ #ifndef NDEBUG
+-        while (hold_handler &&
+-               !g_cpu_stream_signaled.load(std::memory_order_acquire)) {
++        while (hold_handler && !g_cpu_stream_signaled.load(std::memory_order_acquire)) {
+           std::this_thread::yield();
+         }
+ #endif
+-        // pmetal: record and propagate the error BEFORE `completion`, which
+-        // notifies the scheduler and so wakes a host thread throttled on
+-        // in-flight buffers. Upstream ran `completion` first and then wrote
+-        // the (non-atomic) `error_` while the woken host opened the next
+-        // encoder, whose `get_command_encoder()` reset it: a failed buffer in
+-        // the middle of an eval was forgotten, the buffer carrying the eval's
+-        // signal event completed cleanly, and `eval` returned corrupted
+-        // arrays as success (the Qwen-Image real-weight mismatch after a GPU
+-        // watchdog timeout).
+-        bool failed = forced_failure ||
+-            cbuf->status() == MTL::CommandBufferStatusError;
+-        std::shared_ptr<std::string> error;
+-        // If any of the waited event has error in it, poison the encoder.
+-        for (auto& event : wait_events) {
+-          if (event->error()) {
+-            error = event->error();
+-            break;
+-          }
+-        }
+-        if (!error && failed) {
+-          error = std::make_shared<std::string>(
+-              forced_failure
+-                  ? std::string(
+-                        "[METAL] Command buffer execution failed: synthetic "
+-                        "intermediate-buffer failure.")
+-                  : fmt::format(
+-                        "[METAL] Command buffer execution failed: {}.",
++        bool callback_failed = false;
++        bool hardware_failed = cbuf->status() == MTL::CommandBufferStatusError;
++        run_commit_completion(
++            [&] {
++              if (throw_before_finalization) throw std::bad_alloc();
++              std::shared_ptr<std::string> error;
++              for (auto& event : owners->waits) {
++                if (event->error()) { error = event->error(); break; }
++              }
++              if (!error && (forced_failure || hardware_failed)) {
++                error = std::make_shared<std::string>(forced_failure
++                    ? std::string("[METAL] Command buffer execution failed: synthetic intermediate-buffer failure.")
++                    : fmt::format("[METAL] Command buffer execution failed: {}.",
+                         cbuf->error()->localizedDescription()->utf8String()));
+-        }
+-        // Keep the earliest error; it stays set until a host wait reports it.
+-        if (error) {
+-          std::shared_ptr<std::string> none;
+-          std::atomic_compare_exchange_strong(&error_, &none, error);
+-        }
+-        // Poison all the signaled events while an unreported error is pending.
+-        if (auto pending = std::atomic_load(&error_)) {
+-          for (auto& [event, value] : signal_events) {
+-            event->set_error(pending);
+-          }
+-        }
+-        // Metal won't signal the events for us on error, manually signal them
+-        // to avoid infinite waiting.
+-        if (cbuf->status() == MTL::CommandBufferStatusError) {
+-          for (auto& [event, value] : signal_events) {
+-            event->signal(value);
+-          }
+-        }
+-        // pmetal: release host waits only now that any error is on the events.
+-        for (auto& [event, value] : signal_events) {
+-          event->mark_completed(value);
+-        }
+-        if (completion) {
+-          completion();
+-        }
+-        handler_done->store(true, std::memory_order_release);
+-      });
+-  auto committed = buffer_; // retained
++              }
++              if (!error) error = std::atomic_load(&error_);
++              if (error) {
++                auto failure = std::make_exception_ptr(std::runtime_error(*error));
++                outcome->record_error(failure);
++                std::atomic_store(&outcome->report_key, error);
++                record->error(failure, CompletionRetirement::Kind::Execution, error);
++                std::shared_ptr<std::string> none;
++                std::atomic_compare_exchange_strong(&error_, &none, error);
++              }
++            },
++            [&] { if (owners->completion) owners->completion(); },
++            [&]() noexcept {
++              // Persist the buffer result on arrays BEFORE host events become
++              // observable; ordinary error acknowledgement cannot erase it.
++              outcome->finish();
++              auto pending = std::atomic_load(&error_);
++              for (auto& [event, value] : owners->signals) {
++                if (pending) event->set_error(pending);
++                if (hardware_failed || callback_failed) event->signal(value);
++                event->mark_completed(value);
++              }
++              handler_done->store(true, std::memory_order_release);
++            },
++            [&](std::exception_ptr error) noexcept {
++              callback_failed = true;
++              outcome->record_error(error);
++              std::shared_ptr<std::string> none;
++              std::atomic_compare_exchange_strong(&error_, &none, fallback_error);
++              auto key = std::atomic_load(&error_);
++              std::atomic_store(&outcome->report_key, key);
++              record->error(std::move(error), CompletionRetirement::Kind::Callback, key);
++            });
++      }, record);
++  owners->waits = std::move(wait_events_);
++  owners->signals = std::move(signal_events_);
++  owners->completion = std::move(completion);
++  try {
++    buffer_->addCompletedHandler([payload](MTL::CommandBuffer* cb) { payload->run(cb); });
++  } catch (...) {
++    wait_events_ = std::move(owners->waits);
++    signal_events_ = std::move(owners->signals);
++    payload->cancel_unpublished();
++    throw;
++  }
++  buffer_has_handlers_ = true;
++  auto committed = buffer_;
+   buffer_->commit();
+-  buffer_ = NS::RetainPtr(queue_->commandBufferWithUnretainedReferences());
++  buffer_ = std::move(next_buffer);
++  execution_outcome_ = std::move(next_outcome);
+   buffer_ops_ = 0;
++  buffer_has_handlers_ = false;
+   buffer_sizes_ = 0;
+   if (forced_failure && !hold_handler) {
+     committed->waitUntilCompleted();
+-    while (!handler_done->load(std::memory_order_acquire)) {
+-      std::this_thread::yield();
+-    }
+-  }
+-}
++    while (!handler_done->load(std::memory_order_acquire)) std::this_thread::yield();
++  }
++}
++
++void CommandEncoder::add_completed_handler(
++    std::function<void(MTL::CommandBuffer*)> body,
++    std::shared_ptr<CompletionRetirement::Record> record) {
++  auto payload = retirement_->track<MTL::CommandBuffer*>(std::move(body), std::move(record));
++  try {
++    buffer_->addCompletedHandler([payload](MTL::CommandBuffer* cb) { payload->run(cb); });
++  } catch (...) {
++    payload->cancel_unpublished();
++    throw;
++  }
++  buffer_has_handlers_ = true;
++}
++
++RetirementFence CommandEncoder::retirement_fence() {
++  if (has_pending_work()) { end_encoding(); commit(); }
++  auto through = retirement_->snapshot();
++  retirement_->wait(through);
++  release_failed_owners();
++  auto error = retirement_->error_through(through);
++  auto keys = retirement_->keys_through(through);
++  // Clear only transport state here. A failed receipt is NOT acknowledged until
++  // wait() is observed, and its cached failure survives later acknowledgements.
++  auto legacy = std::atomic_exchange(&error_, std::shared_ptr<std::string>{});
++  if (legacy) keys.push_back(std::move(legacy));
++  return RetirementFence::completed(error,
++      [state = retirement_, through, keys = std::move(keys)]() noexcept {
++        if (!state->acknowledge(through)) return false;
++        for (auto& key : keys) clear_reported_command_buffer_error(key, false);
++        return true;
++      });
++}
++
++void CommandEncoder::synchronize_and_retire() { retirement_fence().wait(); }
+ 
+ void CommandEncoder::synchronize() {
+   auto pool = new_scoped_memory_pool();
+@@ -680,6 +738,8 @@
+   end_encoding();
+   commit();
+   cbuf->waitUntilCompleted();
++  retirement_->wait(retirement_->snapshot());
++  release_failed_owners();
+ 
+   auto error = std::atomic_exchange(&error_, std::shared_ptr<std::string>{});
+   if (error && !exiting_) {
+@@ -689,7 +749,8 @@
+ }
+ 
+ void CommandEncoder::clear_reported_error(
+-    const std::shared_ptr<std::string>& reported) {
++    const std::shared_ptr<std::string>& reported, bool acknowledge_execution) {
++  if (acknowledge_execution) retirement_->acknowledge_execution(reported);
+   auto expected = reported;
+   std::atomic_compare_exchange_strong(
+       &error_, &expected, std::shared_ptr<std::string>{});
+@@ -1069,14 +1130,14 @@
+ }
+ 
+ void clear_reported_command_buffer_error(
+-    const std::shared_ptr<std::string>& reported) {
++    const std::shared_ptr<std::string>& reported, bool acknowledge_execution) {
+   for (auto& [index, encoder] : get_command_encoders()) {
+-    encoder.clear_reported_error(reported);
++    encoder.clear_reported_error(reported, acknowledge_execution);
+   }
+   {
+     std::shared_lock lock(get_global_command_encoders_mutex());
+     for (auto& [index, encoder] : get_global_command_encoders()) {
+-      encoder.clear_reported_error(reported);
++      encoder.clear_reported_error(reported, acknowledge_execution);
+     }
+   }
+   clear_reported_cpu_stream_error(reported);
+@@ -1132,3 +1193,9 @@
+   mlx::core::metal::g_fail_next_intermediate_buffer.store(true);
+ }
+ #endif
++
++#ifndef NDEBUG
++extern "C" void mlx_pmetal_test_throw_next_commit_completion() {
++  mlx::core::metal::g_throw_next_commit_completion.store(true);
++}
++#endif
+diff --git a/mlx/backend/metal/eval.cpp b/mlx/backend/metal/eval.cpp
+--- a/mlx/backend/metal/eval.cpp
++++ b/mlx/backend/metal/eval.cpp
+@@ -113,38 +113,57 @@
+   auto* command_buffer = encoder.get_command_buffer();
+ 
+   auto outputs = arr.outputs();
+-  {
+-    // If the array is a tracer hold a reference
+-    // to its inputs so they don't get donated
+-    std::vector<array> inputs;
+-    if (arr.is_tracer()) {
+-      inputs = arr.inputs();
+-    }
+-
+-    debug_set_primitive_buffer_label(command_buffer, arr.primitive());
+-    arr.primitive().eval_gpu(arr.inputs(), outputs);
+-  }
+-  std::unordered_set<std::shared_ptr<array::Data>> buffers;
+-  for (auto& in : arr.inputs()) {
+-    buffers.insert(in.data_shared_ptr());
+-  }
+-  for (auto& s : arr.siblings()) {
+-    buffers.insert(s.data_shared_ptr());
+-  }
+-  // Remove the output if it was donated to by an input
+-  if (auto it = buffers.find(arr.data_shared_ptr()); it != buffers.end()) {
+-    buffers.erase(it);
+-  }
+-
+-  if (encoder.needs_commit()) {
+-    encoder.end_encoding();
+-    scheduler::notify_new_task(s);
+-    encoder.commit([s, buffers = std::move(buffers)]() {
+-      scheduler::notify_task_completion(s);
+-    });
+-  } else {
+-    command_buffer->addCompletedHandler(
+-        [buffers = std::move(buffers)](MTL::CommandBuffer* cbuf) {});
++  auto failed_owners = std::make_shared<metal::CommandEncoder::FailedOwners>();
++  auto completion = std::make_shared<LoadCompletion>();
++  completion->depend_on(arr.load_completion());
++  auto outcome = encoder.execution_outcome();
++  completion->add(outcome->future(), [outcome]() noexcept {
++    if (auto key = std::atomic_load(&outcome->report_key)) {
++      metal::clear_reported_command_buffer_error(key);
++    }
++  });
++  for (auto& out : outputs) out.attach_load_completion(completion);
++  auto retain_buffers = [&](bool failed) {
++    std::unordered_set<std::shared_ptr<array::Data>> buffers;
++    for (auto& in : arr.inputs()) {
++      buffers.insert(in.data_shared_ptr());
++    }
++    for (auto& sibling : arr.siblings()) {
++      buffers.insert(sibling.data_shared_ptr());
++    }
++    if (failed) {
++      // A primitive can throw after encoding commands. Keep partially written
++      // outputs alive too, until the caller's retirement fence.
++      for (auto& out : outputs) {
++        buffers.insert(out.data_shared_ptr());
++      }
++    } else {
++      // Preserve upstream donation behavior on successful evaluation.
++      buffers.erase(arr.data_shared_ptr());
++    }
++    encoder.add_completed_handler(
++        [buffers = std::move(buffers)](MTL::CommandBuffer*) {});
++  };
++  try {
++    // Tracer inputs cannot be donated; ordinary inputs still can.
++    {
++      std::vector<array> inputs;
++      if (arr.is_tracer()) inputs = arr.inputs();
++      debug_set_primitive_buffer_label(command_buffer, arr.primitive());
++      arr.primitive().eval_gpu(arr.inputs(), outputs);
++    }
++    retain_buffers(false);
++    if (encoder.needs_commit()) {
++      encoder.end_encoding();
++      scheduler::notify_new_task(s);
++      try { encoder.commit([s] { scheduler::notify_task_completion(s); }); }
++      catch (...) { scheduler::notify_task_completion(s); throw; }
++    }
++  } catch (...) {
++    auto error = std::current_exception();
++    encoder.defer_failed_owners(std::move(failed_owners), arr, std::move(outputs));
++    completion->record_setup_error(error);
++    std::rethrow_exception(error);
+   }
+ }
+ 
+@@ -156,9 +175,25 @@
+   encoder.commit();
+ }
+ 
++void finalize_for_retirement(Stream s) {
++  auto& encoder = metal::get_command_encoder(s);
++  // CPU-only calls must never submit blank Metal buffers or initialize a new
++  // default GPU stream. Only registered streams with already-encoded work count.
++  if (encoder.has_pending_work()) {
++    encoder.end_encoding();
++    encoder.commit();
++  }
++}
++
+ void synchronize(Stream s) {
+   metal::get_command_encoder(s).synchronize();
+ }
++
++RetirementFence retirement_fence(Stream s) {
++  return metal::get_command_encoder(s).retirement_fence();
++}
++
++void synchronize_and_retire(Stream s) { mlx::core::gpu::retirement_fence(s).wait(); }
+ 
+ void clear_streams() {
+   metal::get_command_encoders().clear();
+diff --git a/mlx/backend/metal/fence.cpp b/mlx/backend/metal/fence.cpp
+--- a/mlx/backend/metal/fence.cpp
++++ b/mlx/backend/metal/fence.cpp
+@@ -78,7 +78,7 @@
+   compute_encoder.set_bytes(f.count, 1);
+   compute_encoder.dispatch_threads(kernel_dims, kernel_dims);
+ 
+-  compute_encoder.get_command_buffer()->addCompletedHandler(
++  compute_encoder.add_completed_handler(
+       [fence_ = fence_](MTL::CommandBuffer* cbuf) {});
+ }
+ 
+@@ -129,7 +129,7 @@
+   compute_encoder.set_bytes(f.count, 1);
+   compute_encoder.dispatch_threads(kernel_dims, kernel_dims);
+ 
+-  compute_encoder.get_command_buffer()->addCompletedHandler(
++  compute_encoder.add_completed_handler(
+       [fence_ = fence_](MTL::CommandBuffer* cbuf) {});
+ }
+ 
+diff --git a/mlx/backend/gpu/eval.h b/mlx/backend/gpu/eval.h
+--- a/mlx/backend/gpu/eval.h
++++ b/mlx/backend/gpu/eval.h
+@@ -7,6 +7,7 @@
+ 
+ #include "mlx/array.h"
+ #include "mlx/stream.h"
++#include "mlx/retirement.h"
+ 
+ namespace mlx::core::gpu {
+ 
+@@ -15,7 +16,10 @@
+ void new_thread_unsafe_stream(Stream s);
+ void eval(array& arr);
+ void finalize(Stream s);
++void finalize_for_retirement(Stream s);
+ void synchronize(Stream s);
++void synchronize_and_retire(Stream s);
++RetirementFence retirement_fence(Stream s);
+ void clear_streams();
+ 
+ } // namespace mlx::core::gpu
+diff --git a/mlx/backend/no_gpu/eval.cpp b/mlx/backend/no_gpu/eval.cpp
+--- a/mlx/backend/no_gpu/eval.cpp
++++ b/mlx/backend/no_gpu/eval.cpp
+@@ -27,10 +27,18 @@
+   throw std::runtime_error("[gpu::finalize] GPU backend is not available");
+ }
+ 
++void finalize_for_retirement(Stream) {}
++
+ void synchronize(Stream) {
+   throw std::runtime_error("[gpu::synchronize]  GPU backend is not available");
+ }
+ 
++RetirementFence retirement_fence(Stream) {
++  throw std::runtime_error("[retirement_fence] Requires the Metal backend for GPU streams.");
++}
++
++void synchronize_and_retire(Stream s) { mlx::core::gpu::retirement_fence(s).wait(); }
++
+ void clear_streams() {}
+ 
+ } // namespace mlx::core::gpu
+diff --git a/mlx/backend/cuda/eval.cpp b/mlx/backend/cuda/eval.cpp
+--- a/mlx/backend/cuda/eval.cpp
++++ b/mlx/backend/cuda/eval.cpp
+@@ -81,10 +81,18 @@
+   cu::get_command_encoder(s).commit();
+ }
+ 
++void finalize_for_retirement(Stream s) { finalize(s); }
++
+ void synchronize(Stream s) {
+   nvtx3::scoped_range r("gpu::synchronize");
+   cu::get_command_encoder(s).synchronize();
+ }
++
++RetirementFence retirement_fence(Stream) {
++  throw std::runtime_error("[retirement_fence] Requires the Metal backend for GPU streams.");
++}
++
++void synchronize_and_retire(Stream s) { mlx::core::gpu::retirement_fence(s).wait(); }
+ 
+ void clear_streams() {
+   cu::get_command_encoders().clear();
+diff --git a/mlx/scheduler.cpp b/mlx/scheduler.cpp
+--- a/mlx/scheduler.cpp
++++ b/mlx/scheduler.cpp
+@@ -2,7 +2,9 @@
+ 
+ #include "mlx/scheduler.h"
+ #include "mlx/backend/cpu/eval.h"
++#include "mlx/backend/cpu/encoder.h"
+ #include "mlx/backend/gpu/eval.h"
++#include "mlx/backend/common/retirement_capture.h"
+ #include "mlx/transforms_impl.h"
+ #include "mlx/utils.h"
+ 
+@@ -22,6 +24,38 @@
+     gpu::synchronize(s);
+   }
+ }
++
++RetirementFence retirement_fence(Stream s) {
++  std::lock_guard<std::recursive_mutex> eval_lk(detail::eval_mutex());
++  return detail::capture_retirement_range(
++    [&] {
++    // Capture AFTER producer flush: it can register completion-owner obligations.
++    for (const auto& producer : get_streams()) {
++      if (producer.device == Device::gpu) gpu::finalize_for_retirement(producer);
++    }
++    }, [&]() -> RetirementFence {
++    if (s.device != Device::cpu) return gpu::retirement_fence(s);
++    auto& encoder = cpu::get_command_encoder(s);
++    auto temporaries = std::move(encoder.temporaries());
++    try {
++      scheduler::enqueue(s, [temps = temporaries]() {});
++      synchronize(s);
++    } catch (...) {
++      auto error = std::current_exception();
++      try { scheduler::scheduler().wait_for_queued_tasks(s); }
++      catch (...) {
++        encoder.temporaries() = std::move(temporaries);
++        std::rethrow_exception(error);
++      }
++      encoder.release_deferred_owners();
++      std::rethrow_exception(error); // setup failure: NO receipt and NO acknowledgement
++    }
++    encoder.release_deferred_owners();
++    return scheduler::scheduler().retirement_fence(s);
++    });
++}
++
++void synchronize_and_retire(Stream s) { retirement_fence(s).wait(); }
+ 
+ void synchronize(ThreadLocalStream s) {
+   synchronize(stream_from_thread_local_stream(s));
+@@ -45,7 +79,7 @@
+ 
+ Scheduler::~Scheduler() = default;
+ 
+-void Scheduler::enqueue(Stream s, std::function<void()> task) {
++StreamThread& Scheduler::stream_thread(Stream s) {
+   StreamThread* st = nullptr;
+   {
+     std::shared_lock lock(threads_mtx_);
+@@ -62,7 +96,28 @@
+     }
+     st = it->second.get();
+   }
+-  st->enqueue(std::move(task));
++  return *st;
++}
++
++void Scheduler::enqueue(Stream s, std::function<void()> task) {
++  stream_thread(s).enqueue(std::move(task));
++}
++
++
++
++void Scheduler::wait_for_queued_tasks(Stream s) {
++  StreamThread* st = nullptr;
++  {
++    std::shared_lock lock(threads_mtx_);
++    auto it = threads_.find(s.index);
++    if (it != threads_.end()) st = it->second.get();
++  }
++  if (st) st->wait_for_queued_tasks();
++}
++
++
++RetirementFence Scheduler::retirement_fence(Stream s) {
++  return stream_thread(s).retirement_fence();
+ }
+ 
+ // Leak the scheduler singleton on all platforms. During static destruction,
+diff --git a/mlx/scheduler.h b/mlx/scheduler.h
+--- a/mlx/scheduler.h
++++ b/mlx/scheduler.h
+@@ -4,12 +4,15 @@
+ 
+ #include <atomic>
+ #include <future>
++#include <exception>
++#include <cstdint>
+ #include <queue>
+ #include <shared_mutex>
+ #include <thread>
+ #include <unordered_map>
+ 
+ #include "mlx/api.h"
++#include "mlx/backend/metal/completion_retirement.h"
+ #include "mlx/backend/gpu/eval.h"
+ #include "mlx/device.h"
+ #include "mlx/stream.h"
+@@ -19,47 +22,66 @@
+ struct StreamThread {
+   std::mutex mtx;
+   std::queue<std::function<void()>> q;
+-  std::condition_variable cond;
++  std::condition_variable cond, retirement_cv;
+   bool stop;
++  uint64_t issued_tasks{0}, retired_tasks{0};
++  std::shared_ptr<metal::CompletionRetirement> retirement =
++      std::make_shared<metal::CompletionRetirement>();
+   std::thread thread;
+ 
+   StreamThread() : stop(false), thread(&StreamThread::thread_fn, this) {}
+-
+   ~StreamThread() {
+-    {
+-      std::lock_guard<std::mutex> lk(mtx);
+-      stop = true;
+-    }
++    { std::lock_guard lock(mtx); stop = true; }
+     cond.notify_one();
+     thread.join();
+   }
+-
++  void wait_for_queued_tasks() {
++    std::unique_lock lock(mtx);
++    auto through = issued_tasks;
++    retirement_cv.wait(lock, [&] { return retired_tasks >= through; });
++  }
++  RetirementFence retirement_fence() {
++    metal::CompletionRetirement::Ticket through;
++    {
++      std::unique_lock lock(mtx);
++      auto tasks = issued_tasks;
++      through = retirement->snapshot();
++      retirement_cv.wait(lock, [&] { return retired_tasks >= tasks; });
++    }
++    retirement->wait(through);
++    auto error = retirement->error_through(through);
++    return RetirementFence::completed(error,
++        [state = retirement, through]() noexcept { return state->acknowledge(through); });
++  }
+   void thread_fn() {
+     while (true) {
+       std::function<void()> task;
+       {
+-        std::unique_lock<std::mutex> lk(mtx);
+-        cond.wait(lk, [this] { return !this->q.empty() || this->stop; });
+-        if (q.empty() && stop) {
+-          return;
+-        }
++        std::unique_lock lock(mtx);
++        cond.wait(lock, [&] { return !q.empty() || stop; });
++        if (q.empty() && stop) return;
+         task = std::move(q.front());
+         q.pop();
+       }
+-
+-      task();
++      task(); // production payload catches callback errors and destroys its body
++      task = nullptr;
++      { std::lock_guard lock(mtx); ++retired_tasks; }
++      retirement_cv.notify_all();
+     }
+   }
+-
+   void enqueue(std::function<void()> f) {
+-    {
+-      std::lock_guard<std::mutex> lk(mtx);
+-      if (stop) {
+-        throw std::runtime_error(
+-            "Cannot enqueue work after stream is stopped.");
+-      }
+-      q.emplace(std::move(f));
++    std::unique_lock lock(mtx);
++    if (stop) throw std::runtime_error("Cannot enqueue work after stream is stopped.");
++    auto callback = retirement->track<int>([f = std::move(f)](int) { f(); });
++    try {
++      q.emplace([callback] { callback->run(0); });
++      ++issued_tasks;
++    } catch (...) {
++      lock.unlock();
++      callback->cancel_unpublished();
++      throw;
+     }
++    lock.unlock();
+     cond.notify_one();
+   }
+ };
+@@ -76,6 +98,8 @@
+   Scheduler& operator=(Scheduler&&) = delete;
+ 
+   void enqueue(Stream s, std::function<void()> task);
++  void wait_for_queued_tasks(Stream s);
++  RetirementFence retirement_fence(Stream s);
+ 
+   void notify_new_task(const Stream& stream) {
+     {
+@@ -108,6 +132,7 @@
+   }
+ 
+  private:
++  StreamThread& stream_thread(Stream s);
+   friend Stream mlx::core::new_stream(Device d);
+ 
+   int n_active_tasks_{0};
+diff --git a/mlx/stream.h b/mlx/stream.h
+--- a/mlx/stream.h
++++ b/mlx/stream.h
+@@ -5,6 +5,7 @@
+ #include <vector>
+ 
+ #include "mlx/api.h"
++#include "mlx/retirement.h"
+ #include "mlx/device.h"
+ 
+ namespace mlx::core {
+@@ -52,6 +53,16 @@
+ /* Synchronize with the provided stream. */
+ MLX_API void synchronize(Stream);
+ 
++// Complete scheduled CPU/Metal work and source-managed owner release on this
++// stream, after submitting nonempty GPU producers. A receipt is immutable;
++// wait() observes and acknowledges only its completed range. Dropping it does
++// not acknowledge. Execution failures stay on affected arrays/dependencies;
++// unrelated requests on the same stream recover. No alias/cache/backing/budget
++// guarantee. CUDA GPU is unsupported. synchronize_and_retire captures a NEW
++// range on each call; retain retirement_fence's receipt for repeated waits.
++MLX_API void synchronize_and_retire(Stream);
++MLX_API RetirementFence retirement_fence(Stream);
++
+ /* Synchronize with the stream corresponding to the current thread. */
+ MLX_API void synchronize(ThreadLocalStream);
+ 
+diff --git a/mlx/transforms.cpp b/mlx/transforms.cpp
+--- a/mlx/transforms.cpp
++++ b/mlx/transforms.cpp
+@@ -128,6 +128,7 @@
+     while (!dfs.empty()) {
+       auto& [a_ref, idx] = dfs.top();
+       auto& a = a_ref.get();
++      if (auto completion = a.load_completion()) completion->check_known_error();
+ 
+       if (idx < a.inputs().size()) {
+         // Add an input, and continue
+diff --git a/mlx/backend/cpu/eval.cpp b/mlx/backend/cpu/eval.cpp
+--- a/mlx/backend/cpu/eval.cpp
++++ b/mlx/backend/cpu/eval.cpp
+@@ -1,11 +1,16 @@
+ // Copyright © 2025 Apple Inc.
+ #include "mlx/backend/cpu/eval.h"
++#include <atomic>
++#include <new>
+ #include "mlx/backend/cpu/encoder.h"
+ #include "mlx/primitives.h"
+ #include "mlx/scheduler.h"
+ #include "mlx/utils.h"
+ 
+ namespace mlx::core::cpu {
++#ifndef NDEBUG
++namespace { std::atomic<int> fail_completion_setup_after{-1}; }
++#endif
+ 
+ void new_stream(Stream s) {
+   // pmetal (sc-12937): register in the GLOBAL encoder map (identical to
+@@ -30,30 +35,82 @@
+   auto s = arr.primitive().stream();
+ 
+   auto outputs = arr.outputs();
+-  {
+-    // If the array is a tracer hold a reference
+-    // to its inputs so they don't get donated
++  auto& encoder = cpu::get_command_encoder(s);
++  std::vector<array> temporaries;
++  auto retain_buffers = [&](bool failed) {
++    std::unordered_set<std::shared_ptr<array::Data>> buffers;
++    for (auto& in : arr.inputs()) buffers.insert(in.data_shared_ptr());
++    for (auto& sibling : arr.siblings()) buffers.insert(sibling.data_shared_ptr());
++    if (failed) {
++      for (auto& out : outputs) buffers.insert(out.data_shared_ptr());
++    } else {
++      buffers.erase(arr.data_shared_ptr());
++    }
++    encoder.dispatch([buffers = std::move(buffers),
++                      temps = temporaries]() {});
++  };
++  auto outcome = std::make_shared<EvaluationOutcome>();
++  auto completion = std::make_shared<LoadCompletion>();
++  completion->depend_on(arr.load_completion());
++  completion->add(outcome->future());
++  // Attach BEFORE dispatch as well as after: even a host-side encoding exception
++  // leaves a persistent failure on the affected output, not just on its stream.
++  for (auto& out : outputs) out.attach_load_completion(completion);
++  auto previous = encoder.set_outcome(outcome);
++  std::exception_ptr host_error;
++  try {
+     std::vector<array> inputs;
+-    if (arr.is_tracer()) {
+-      inputs = arr.inputs();
++    if (arr.is_tracer()) inputs = arr.inputs();
++    arr.primitive().eval_cpu(arr.inputs(), outputs);
++  } catch (...) {
++    host_error = std::current_exception();
++    outcome->record_error(host_error);
++  }
++  encoder.set_outcome(std::move(previous));
++  temporaries.swap(encoder.temporaries());
++  try {
++#ifndef NDEBUG
++    if (fail_completion_setup_after.load() >= 0 &&
++        fail_completion_setup_after.fetch_sub(1) == 0) throw std::bad_alloc();
++#endif
++    // Load installs its own read future. Join it without replacing either the
++    // primitive's outcome or its preexisting input dependency DAG.
++    for (auto& out : outputs) {
++      if (out.load_completion() != completion) {
++        completion->depend_on(out.load_completion());
++        out.attach_load_completion(completion);
++      }
+     }
+-    arr.primitive().eval_cpu(arr.inputs(), outputs);
++    scheduler::enqueue(s, [outcome] { outcome->finish(); });
++    retain_buffers(host_error != nullptr);
++  } catch (...) {
++    auto error = std::current_exception();
++    outcome->record_error(error);
++    for (auto& out : outputs) out.attach_load_completion(completion);
++    outcome->retain(arr, std::move(outputs), std::move(temporaries));
++    // Never wait here: a prior CPU task may depend on an encoded GPU producer
++    // which eval_impl did not reach its finalization loop to submit. No cleanup
++    // allocation or GPU submission is needed to keep these specific owners safe.
++    // Publish only failure; the explicit retirement API flushes producers, joins
++    // actual work, and then releases this per-primitive error custody.
++    encoder.defer_owners(outcome);
++    completion->record_setup_error(error);
++    outcome->finish();
++    std::rethrow_exception(error);
+   }
+-
+-  std::unordered_set<std::shared_ptr<array::Data>> buffers;
+-  for (auto& in : arr.inputs()) {
+-    buffers.insert(in.data_shared_ptr());
+-  }
+-  for (auto& s : arr.siblings()) {
+-    buffers.insert(s.data_shared_ptr());
+-  }
+-  // Remove the output if it was donated to by an input
+-  if (auto it = buffers.find(arr.data_shared_ptr()); it != buffers.end()) {
+-    buffers.erase(it);
+-  }
+-  auto& encoder = cpu::get_command_encoder(s);
+-  encoder.dispatch([buffers = std::move(buffers),
+-                    temps = std::move(encoder.temporaries())]() {});
++  if (host_error) std::rethrow_exception(host_error);
+ }
+ 
+ } // namespace mlx::core::cpu
++
++#ifndef NDEBUG
++extern "C" void mlx_pmetal_test_fail_next_cpu_completion_setup() {
++  mlx::core::cpu::fail_completion_setup_after.store(0);
++}
++#endif
++
++#ifndef NDEBUG
++extern "C" void mlx_pmetal_test_fail_cpu_completion_setup_after(int count) {
++  mlx::core::cpu::fail_completion_setup_after.store(count);
++}
++#endif
+diff --git a/mlx/backend/cpu/encoder.h b/mlx/backend/cpu/encoder.h
+--- a/mlx/backend/cpu/encoder.h
++++ b/mlx/backend/cpu/encoder.h
+@@ -6,12 +6,16 @@
+ #include <unordered_map>
+ 
+ #include "mlx/array.h"
++#include "mlx/backend/cpu/task_outcome.h"
++#include "mlx/backend/cpu/deferred_outcome.h"
+ #include "mlx/scheduler.h"
+ 
+ namespace mlx::core::cpu {
+ 
+ // Number of dispatches per scheduler task
+ constexpr int DISPATCHES_PER_TASK = 10;
++
++using EvaluationOutcome = DeferredOutcome<array>;
+ 
+ struct MLX_API CommandEncoder {
+   CommandEncoder(Stream stream) : stream_(stream) {}
+@@ -41,19 +45,41 @@
+     return temporaries_;
+   }
+ 
++  void defer_owners(std::shared_ptr<EvaluationOutcome> node) noexcept {
++    deferred_owners_.defer(std::move(node));
++  }
++  void release_deferred_owners() noexcept { deferred_owners_.release(); }
++
++
++  std::shared_ptr<TaskOutcome> set_outcome(std::shared_ptr<TaskOutcome> outcome) {
++    return std::exchange(outcome_, std::move(outcome));
++  }
++
+   template <class F, class... Args>
+   void dispatch(F&& f, Args&&... args) {
+     num_ops_ = (num_ops_ + 1) % DISPATCHES_PER_TASK;
++    bool counted = num_ops_ == 0;
+     auto task = std::bind(std::forward<F>(f), std::forward<Args>(args)...);
+-    if (num_ops_ == 0) {
+-      scheduler::notify_new_task(stream_);
+-      auto task_wrap = [s = stream_, task = std::move(task)]() mutable {
+-        task();
+-        scheduler::notify_task_completion(s);
+-      };
++    auto task_wrap = [s = stream_, task = std::move(task),
++                      outcome = outcome_, counted]() mutable {
++      try {
++        if (outcome) {
++          outcome->run(task);
++        } else {
++          task();
++        }
++      } catch (...) {
++        if (counted) scheduler::notify_task_completion(s);
++        throw;
++      }
++      if (counted) scheduler::notify_task_completion(s);
++    };
++    if (counted) scheduler::notify_new_task(stream_);
++    try {
+       scheduler::enqueue(stream_, std::move(task_wrap));
+-    } else {
+-      scheduler::enqueue(stream_, std::move(task));
++    } catch (...) {
++      if (counted) scheduler::notify_task_completion(stream_);
++      throw;
+     }
+   }
+ 
+@@ -61,6 +87,8 @@
+   Stream stream_;
+   std::vector<array> temporaries_;
+   int num_ops_{0};
++  std::shared_ptr<TaskOutcome> outcome_;
++  DeferredOutcomes<array> deferred_owners_;
+ };
+ 
+ MLX_API CommandEncoder& get_command_encoder(Stream s);
+diff --git a/mlx/backend/metal/event.cpp b/mlx/backend/metal/event.cpp
+--- a/mlx/backend/metal/event.cpp
++++ b/mlx/backend/metal/event.cpp
+@@ -1,6 +1,8 @@
+ // Copyright © 2024 Apple Inc.
+ 
+ #include <algorithm>
++#include <new>
++#include "mlx/backend/metal/commit_completion.h"
+ #include <iterator>
+ #include <mutex>
+ #include <set>
+@@ -60,7 +62,8 @@
+ CpuStreamErrors& cpu_stream_errors() {
+   // Leaked like the scheduler singleton: scheduler threads may still run
+   // tasks during static destruction.
+-  static auto* errors = new CpuStreamErrors();
++  alignas(CpuStreamErrors) static unsigned char storage[sizeof(CpuStreamErrors)];
++  static auto* errors = ::new (static_cast<void*>(storage)) CpuStreamErrors();
+   return *errors;
+ }
+ 
+@@ -312,9 +315,12 @@
+   }
+ #endif
+   if (stream.device == Device::cpu) {
+-    scheduler::enqueue(
+-        stream,
+-        [impl = std::move(impl), value = value(), index = stream.index]() {
++    auto fallback = std::make_shared<std::string>("[METAL] CPU event completion handler failed.");
++    scheduler::enqueue(stream,
++        [impl = std::move(impl), value = value(), index = stream.index, fallback] {
++          std::exception_ptr callback_error;
++          metal::run_commit_completion(
++            [&] {
+           // pmetal: resolve what can be resolved without waiting; attach the
+           // rest to this event for a host wait (see CpuStreamErrors).
+           std::vector<metal::EventImpl::Dependency> unresolved;
+@@ -338,10 +344,20 @@
+           } else if (!unresolved.empty()) {
+             impl->add_dependencies(value, std::move(unresolved));
+           }
+-          impl->signal(value);
++            }, [] {},
++            [&]() noexcept {
++              impl->signal(value);
+ #ifndef NDEBUG
+-          metal::note_cpu_stream_signal();
++              metal::note_cpu_stream_signal();
+ #endif
++            }, [&](std::exception_ptr error) noexcept {
++              callback_error = std::move(error);
++              impl->set_error(fallback);
++            });
++          // The queue's preallocated range record retains this structural
++          // failure. Signaling was completed first, so host/dependent waits
++          // cannot be stranded by dependency bookkeeping allocation failure.
++          if (callback_error) std::rethrow_exception(callback_error);
+         });
+   } else {
+     auto& encoder = metal::get_command_encoder(stream);
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -6,8 +6,21 @@
+ 
+ add_executable(tests ${PROJECT_SOURCE_DIR}/tests/tests.cpp)
+ 
++# Focused owner-retirement executable: validation builds/runs only these new
++# tests, rather than compiling every native test translation unit.
++add_executable(completion_retirement_tests
++  ${PROJECT_SOURCE_DIR}/tests/tests.cpp completion_retirement_cpu_tests.cpp)
++target_link_libraries(completion_retirement_tests PRIVATE mlx doctest)
++target_compile_options(completion_retirement_tests PRIVATE ${SANITIZER_COMPILE_FLAGS})
++target_link_options(completion_retirement_tests PRIVATE ${SANITIZER_LINK_FLAGS})
++add_test(NAME completion_retirement_tests COMMAND completion_retirement_tests)
++
+ if(MLX_BUILD_METAL OR MLX_BUILD_CUDA)
+   set(METAL_TEST_SOURCES gpu_tests.cpp)
++endif()
++
++if(MLX_BUILD_METAL)
++  target_sources(completion_retirement_tests PRIVATE completion_retirement_tests.cpp)
+ endif()
+ 
+ include(${doctest_SOURCE_DIR}/scripts/cmake/doctest.cmake)
+diff --git a/tests/completion_retirement_tests.cpp b/tests/completion_retirement_tests.cpp
+new file mode 100644
+--- /dev/null
++++ b/tests/completion_retirement_tests.cpp
+@@ -0,0 +1,375 @@
++// Metal integration definitions. Run on hosted/nax-macos-2, NEVER local GPU.
++// MLX_MAX_OPS_PER_BUFFER=2 MLX_METAL_FAST_SYNCH=1 ./tests --test-case='*completion retirement*'
++#include <atomic>
++#include <chrono>
++#include <future>
++#include <thread>
++#include "doctest/doctest.h"
++#include "mlx/mlx.h"
++#include "mlx/primitives.h"
++#include "mlx/scheduler.h"
++#include "mlx/transforms_impl.h"
++#include "mlx/backend/metal/device.h"
++#include "mlx/backend/gpu/copy.h"
++#include "mlx/backend/gpu/eval.h"
++
++using namespace mlx::core;
++using namespace std::chrono_literals;
++
++namespace {
++struct RetirementDrop {
++  std::promise<void>* entered;
++  std::shared_future<void> release;
++  std::atomic<int>* drops;
++  ~RetirementDrop() {
++    entered->set_value();
++    release.wait();
++    ++*drops;
++  }
++};
++
++class PartialCopy : public UnaryPrimitive {
++ public:
++  explicit PartialCopy(Stream stream, Event gate = {}) : UnaryPrimitive(stream), gate_(std::move(gate)) {}
++  const char* name() const override { return "PartialCopy"; }
++  void eval_cpu(const std::vector<array>&, array&) override { throw std::runtime_error("Metal test only"); }
++  void eval_gpu(const std::vector<array>& inputs, array& out) override {
++    out.set_data(allocator::malloc(out.nbytes()));
++    if (gate_.valid()) gate_.wait(stream());
++    copy_gpu_inplace(inputs[0], out, CopyType::Vector, stream());
++    throw std::runtime_error("synthetic partial encoding failure");
++  }
++ private:
++  Event gate_;
++};
++}
++
++TEST_CASE("completion retirement joins owner destructor with retained Metal block") {
++  auto s = new_stream(Device::gpu);
++  std::promise<void> entered, release;
++  auto entered_future = entered.get_future();
++  std::atomic<int> drops{0};
++  auto token = std::make_shared<RetirementDrop>();
++  token->entered = &entered;
++  token->release = release.get_future().share();
++  token->drops = &drops;
++  std::weak_ptr<RetirementDrop> weak = token;
++  NS::SharedPtr<MTL::CommandBuffer> retained;
++  {
++    std::lock_guard<std::recursive_mutex> lock(detail::eval_mutex());
++    auto& encoder = metal::get_command_encoder(s);
++    retained = NS::RetainPtr(encoder.get_command_buffer());
++    encoder.add_completed_handler([token = std::move(token)](MTL::CommandBuffer*) {});
++  }
++  // An actual submitted kernel, not merely a mocked completion flag.
++  auto out = add(array(1.0f), array(2.0f), s);
++  async_eval({out});
++  auto fence = std::async(std::launch::async, [s] { synchronize_and_retire(s); });
++  bool entered_in_time = entered_future.wait_for(10s) == std::future_status::ready;
++  bool blocked = entered_in_time && fence.wait_for(100ms) == std::future_status::timeout;
++  release.set_value(); // always unblock before assertions, including mutation failures
++  fence.get();
++  CHECK(entered_in_time);
++  CHECK(blocked);
++  CHECK(weak.expired());
++  CHECK(drops == 1);
++  CHECK(retained.get() != nullptr); // original MTL buffer/handler copies still retained
++  CHECK(out.item<float>() == 3.0f);
++  CHECK_NOTHROW(synchronize_and_retire(s));
++}
++
++TEST_CASE("completion retirement releases real eval inputs siblings and temporaries") {
++  auto s = new_stream(Device::gpu);
++  std::weak_ptr<array::Data> input_data, temporary_data;
++  array out(0.0f);
++  {
++    auto input = arange(0, 32, float32, s);
++    eval(input);
++    input_data = input.data_shared_ptr();
++    auto siblings = divmod(input, full({32}, 3.0f, float32, s), s);
++    out = add(siblings[0], siblings[1], s);
++    async_eval({out});
++  }
++  {
++    // Exercise end_encoding's temporary owner (not merely a custom callback).
++    std::lock_guard<std::recursive_mutex> lock(detail::eval_mutex());
++    auto temp = array({1.0f, 2.0f});
++    temporary_data = temp.data_shared_ptr();
++    auto& encoder = metal::get_command_encoder(s);
++    encoder.set_input_array(temp, 0); // opens the real compute encoder
++    encoder.add_temporary(std::move(temp));
++  }
++  synchronize_and_retire(s);
++  CHECK(input_data.expired());
++  CHECK(temporary_data.expired());
++  CHECK(out.size() == 32);
++}
++
++TEST_CASE("completion retirement drains real gated distinct partial Metal copy") {
++  auto s = new_stream(Device::gpu);
++  auto cpu_stream = new_stream(Device::cpu);
++  std::promise<void> release, copied;
++  auto opened = release.get_future().share();
++  auto observed = copied.get_future();
++  scheduler::enqueue(cpu_stream, [opened] { opened.wait(); });
++  Event gate(cpu_stream);
++  gate.set_value(1);
++  gate.signal(cpu_stream);
++  std::weak_ptr<array::Data> input_data, output_data;
++  float* ptr = nullptr;
++  {
++    auto input = array({1.0f, 2.0f, 3.0f});
++    input_data = input.data_shared_ptr();
++    auto out = array(input.shape(), input.dtype(), std::make_shared<PartialCopy>(s, gate), {input});
++    CHECK_THROWS_WITH_AS(eval(out), "synthetic partial encoding failure", std::runtime_error);
++    output_data = out.data_shared_ptr();
++    CHECK(out.data_shared_ptr() != input.data_shared_ptr());
++    ptr = out.data<float>();
++  }
++  CHECK_FALSE(input_data.expired());
++  CHECK_FALSE(output_data.expired());
++  // Verify the native retention BEFORE the observer adds any test-owned alias.
++  auto owner = output_data.lock();
++  metal::get_command_encoder(s).add_completed_handler(
++      [owner = std::move(owner), ptr, &copied](MTL::CommandBuffer*) {
++        if (owner && ptr[0] == 1.0f && ptr[1] == 2.0f && ptr[2] == 3.0f) copied.set_value();
++        else copied.set_exception(std::make_exception_ptr(std::runtime_error("Metal copy did not execute")));
++      });
++  auto fence = std::async(std::launch::async, [s] { synchronize_and_retire(s); });
++  bool blocked = fence.wait_for(100ms) == std::future_status::timeout;
++  release.set_value();
++  fence.get();
++  CHECK(blocked);
++  CHECK_NOTHROW(observed.get());
++  CHECK(input_data.expired());
++  CHECK(output_data.expired());
++  CHECK_NOTHROW(synchronize_and_retire(cpu_stream));
++}
++
++TEST_CASE("completion retirement flushes partial cross-stream fast-fence producers") {
++  auto producer = new_stream(Device::gpu);
++  auto consumer = new_stream(Device::gpu);
++  std::weak_ptr<array::Data> input_data, output_data;
++  {
++    auto input = arange(0, 32, float32, producer);
++    auto out = array(input.shape(), input.dtype(), std::make_shared<PartialCopy>(consumer), {input});
++    CHECK_THROWS_WITH_AS(eval(out), "synthetic partial encoding failure", std::runtime_error);
++    input_data = input.data_shared_ptr();
++    output_data = out.data_shared_ptr();
++    CHECK(out.data_shared_ptr() != input.data_shared_ptr());
++  }
++  // eval_impl never reached its final commit loop. Consumer retirement must
++  // submit the producer's already-encoded fence signal, not hang on that wait.
++  CHECK_NOTHROW(synchronize_and_retire(consumer));
++  CHECK_NOTHROW(synchronize_and_retire(producer));
++  CHECK(input_data.expired());
++  CHECK(output_data.expired());
++}
++
++TEST_CASE("CPU completion retirement never submits idle Metal buffers") {
++  auto gpu_stream = new_stream(Device::gpu);
++  auto& encoder = metal::get_command_encoder(gpu_stream);
++  auto retained = NS::RetainPtr(encoder.get_command_buffer());
++  auto* before = retained.get();
++  CHECK_FALSE(encoder.has_pending_work());
++  auto cpu_stream = new_stream(Device::cpu);
++  CHECK_NOTHROW(synchronize_and_retire(cpu_stream));
++  CHECK(encoder.get_command_buffer() == before);
++  CHECK_FALSE(encoder.has_pending_work());
++}
++
++TEST_CASE("completion retirement never submits idle selected Metal buffers") {
++  auto s = new_stream(Device::gpu);
++  auto& encoder = metal::get_command_encoder(s);
++  auto idle = NS::RetainPtr(encoder.get_command_buffer());
++  for (int i = 0; i < 3; ++i) {
++    CHECK_NOTHROW(synchronize_and_retire(s));
++    CHECK(encoder.get_command_buffer() == idle.get());
++  }
++  auto out = add(array(1.0f), array(2.0f), s);
++  async_eval({out});
++  auto replacement = NS::RetainPtr(encoder.get_command_buffer());
++  CHECK_NOTHROW(synchronize_and_retire(s));
++  CHECK(encoder.get_command_buffer() == replacement.get());
++  CHECK(out.item<float>() == 3.0f);
++}
++
++array make_throwing_cpu_output(Stream s);
++TEST_CASE("completion retirement propagates failed CPU producer to Metal consumer") {
++  auto cpu_stream = new_stream(Device::cpu);
++  auto gpu_stream = new_stream(Device::gpu);
++  auto bad = make_throwing_cpu_output(cpu_stream);
++  auto out = add(bad, array(1.0f), gpu_stream);
++  CHECK_THROWS_WITH_AS(eval(out), "synthetic CPU primitive task failure", std::runtime_error);
++  CHECK_THROWS_WITH_AS(out.wait(), "synthetic CPU primitive task failure", std::runtime_error);
++  CHECK_THROWS_WITH_AS(bad.wait(), "synthetic CPU primitive task failure", std::runtime_error);
++  auto independent = add(array(2.0f), array(3.0f), gpu_stream);
++  CHECK_NOTHROW(eval(independent));
++  CHECK(independent.item<float>() == 5.0f);
++  CHECK_NOTHROW(synchronize_and_retire(cpu_stream));
++  CHECK_NOTHROW(synchronize_and_retire(gpu_stream));
++}
++
++#ifndef NDEBUG
++extern "C" void mlx_pmetal_test_fail_next_intermediate_command_buffer();
++TEST_CASE("completion retirement preserves failed GPU arrays and recovers same stream") {
++  auto s = new_stream(Device::gpu);
++  auto bad = add(array({1.0f, 2.0f}), array({3.0f, 4.0f}), s);
++  {
++    std::lock_guard<std::recursive_mutex> lock(detail::eval_mutex());
++    gpu::eval(bad); // actual production per-buffer outcome attached to this array
++    auto& encoder = metal::get_command_encoder(s);
++    encoder.end_encoding();
++    mlx_pmetal_test_fail_next_intermediate_command_buffer();
++    encoder.commit();
++  }
++  CHECK_THROWS_AS(bad.wait(), std::runtime_error); // ordinary execution report ack
++  CHECK_THROWS_AS(bad.wait(), std::runtime_error);
++  auto child = add(bad, array(1.0f), s);
++  CHECK_THROWS_AS(eval(child), std::runtime_error);
++  auto valid = add(array(2.0f), array(3.0f), s);
++  CHECK_NOTHROW(eval(valid));
++  CHECK(valid.item<float>() == 5.0f);
++  CHECK_NOTHROW(synchronize_and_retire(s));
++  CHECK_THROWS_AS(bad.wait(), std::runtime_error);
++}
++
++#endif
++
++#ifndef NDEBUG
++extern "C" void mlx_pmetal_test_throw_next_commit_completion();
++TEST_CASE("completion retirement finalizes throwing callback and caches observed range") {
++  auto s = new_stream(Device::gpu);
++  Event done(s); done.set_value(1);
++  std::atomic<int> completion_calls{0};
++  int active_before = scheduler::n_active_tasks();
++  auto bad = add(array(1.0f), array(2.0f), s);
++  {
++    std::lock_guard<std::recursive_mutex> lock(detail::eval_mutex());
++    gpu::eval(bad);
++    auto& encoder = metal::get_command_encoder(s);
++    done.signal(s); encoder.end_encoding(); scheduler::notify_new_task(s);
++    mlx_pmetal_test_throw_next_commit_completion();
++    encoder.commit([&] { ++completion_calls; scheduler::notify_task_completion(s); });
++  }
++  CHECK_THROWS_AS(done.wait(), std::runtime_error);
++  CHECK_THROWS_AS(bad.wait(), std::bad_alloc);
++  { auto unobserved = retirement_fence(s); }
++  auto failed = retirement_fence(s);
++  CHECK_THROWS_AS(failed.wait(), std::bad_alloc);
++  CHECK_THROWS_AS(failed.wait(), std::bad_alloc);
++  auto valid = add(array(2.0f), array(3.0f), s);
++  CHECK_NOTHROW(eval(valid)); CHECK(valid.item<float>() == 5.0f);
++  CHECK_NOTHROW(synchronize_and_retire(s));
++  CHECK_THROWS_AS(failed.wait(), std::bad_alloc);
++  CHECK_THROWS_AS(bad.wait(), std::bad_alloc);
++  CHECK(completion_calls == 1);
++  CHECK(scheduler::n_active_tasks() <= active_before);
++}
++
++extern "C" void mlx_pmetal_test_fail_cpu_completion_setup_after(int count);
++TEST_CASE("completion retirement resolves CPU setup failure behind unsubmitted mixed producers") {
++  auto producer = new_stream(Device::gpu);
++  auto middle_cpu = new_stream(Device::cpu);
++  auto middle_gpu = new_stream(Device::gpu);
++  auto consumer = new_stream(Device::cpu);
++  auto& first_encoder = metal::get_command_encoder(producer);
++  auto& gpu_encoder = metal::get_command_encoder(middle_gpu);
++  NS::SharedPtr<MTL::CommandBuffer> first_unsubmitted, unsubmitted;
++  std::weak_ptr<array::Data> first_data, middle_data, input_data, output_data;
++  float* ptr = nullptr;
++  std::promise<bool> copied;
++  auto observed = copied.get_future();
++  {
++    // Materialize equal-shaped constants BEFORE arming the hook: there are
++    // exactly two CPU primitives in the actual GPU -> CPU -> GPU -> CPU graph.
++    auto one = full({32}, 1.0f, float32, Device::cpu);
++    auto two = full({32}, 2.0f, float32, Device::cpu);
++    auto three = full({32}, 3.0f, float32, Device::cpu);
++    eval(one, two, three);
++    auto first = arange(0, 32, float32, producer);
++    auto middle = add(first, one, middle_cpu);
++    auto input = add(middle, two, middle_gpu);
++    auto out = add(input, three, consumer);
++    mlx_pmetal_test_fail_cpu_completion_setup_after(1);
++    CHECK_THROWS_AS(eval(out), std::bad_alloc);
++    CHECK(first_encoder.has_pending_work());
++    CHECK(gpu_encoder.has_pending_work());
++    first_unsubmitted = NS::RetainPtr(first_encoder.get_command_buffer());
++    unsubmitted = NS::RetainPtr(gpu_encoder.get_command_buffer());
++    first_data = first.data_shared_ptr();
++    middle_data = middle.data_shared_ptr();
++    input_data = input.data_shared_ptr();
++    output_data = out.data_shared_ptr();
++    CHECK(out.data_shared_ptr() != input.data_shared_ptr());
++    ptr = out.data<float>();
++    // The parent's CPU outcome is still pending behind an unsubmitted GPU
++    // producer. Failed-setup refusal must not wait on that parent future.
++    CHECK_THROWS_AS(out.wait(), std::bad_alloc);
++    auto refused = add(out, three, consumer);
++    CHECK_THROWS_AS(eval(refused), std::bad_alloc);
++  }
++  CHECK(first_encoder.get_command_buffer() == first_unsubmitted.get());
++  CHECK(gpu_encoder.get_command_buffer() == unsubmitted.get());
++  CHECK_FALSE(first_data.expired());
++  CHECK_FALSE(middle_data.expired());
++  CHECK_FALSE(input_data.expired());
++  CHECK_FALSE(output_data.expired());
++  auto owner = output_data.lock();
++  scheduler::enqueue(consumer, [owner = std::move(owner), ptr, &copied] {
++    copied.set_value(owner && ptr[0] == 6.0f && ptr[31] == 37.0f);
++  });
++  CHECK_NOTHROW(synchronize_and_retire(consumer));
++  CHECK_NOTHROW(synchronize_and_retire(producer));
++  CHECK_NOTHROW(synchronize_and_retire(middle_cpu));
++  CHECK_NOTHROW(synchronize_and_retire(middle_gpu));
++  CHECK(observed.get());
++  CHECK(first_data.expired());
++  CHECK(middle_data.expired());
++  CHECK(input_data.expired());
++  CHECK(output_data.expired());
++}
++#endif
++
++TEST_CASE("completion retirement allows GPU CPU GPU chain in one command buffer") {
++  auto gpu_stream = new_stream(Device::gpu);
++  auto cpu_stream = new_stream(Device::cpu);
++  auto one = full({32}, 1.0f, float32, Device::cpu); eval(one);
++  auto first = arange(0, 32, float32, gpu_stream);
++  auto middle = add(first, one, cpu_stream);
++  auto last = add(middle, one, gpu_stream);
++  CHECK_NOTHROW(eval(last));
++  auto expected = arange(2, 34, float32, Device::cpu);
++  CHECK(array_equal(last, expected, Device::cpu).item<bool>());
++  CHECK_NOTHROW(synchronize_and_retire(cpu_stream));
++  CHECK_NOTHROW(synchronize_and_retire(gpu_stream));
++}
++
++#ifndef NDEBUG
++extern "C" void mlx_pmetal_test_fail_next_intermediate_command_buffer_until_cpu_signal();
++TEST_CASE("completion retirement captures callback tickets created by producer flush") {
++  auto s = new_stream(Device::gpu);
++  auto cpu_stream = new_stream(Device::cpu);
++  std::promise<void> release;
++  auto opened = release.get_future().share();
++  scheduler::enqueue(cpu_stream, [opened] { opened.wait(); });
++  Event signal(cpu_stream); signal.set_value(1); signal.signal(cpu_stream);
++  {
++    auto input = array({1.0f, 2.0f, 3.0f});
++    auto partial = array(input.shape(), input.dtype(), std::make_shared<PartialCopy>(s), {input});
++    CHECK_THROWS_AS(eval(partial), std::runtime_error);
++  }
++  mlx_pmetal_test_fail_next_intermediate_command_buffer_until_cpu_signal();
++  auto capture = std::async(std::launch::async, [s] { return retirement_fence(s); });
++  bool blocked = capture.wait_for(100ms) == std::future_status::timeout;
++  release.set_value();
++  auto failed = capture.get();
++  CHECK(blocked); // late commit callback was registered by flush, not before it
++  CHECK_THROWS_AS(failed.wait(), std::runtime_error);
++  CHECK_THROWS_AS(failed.wait(), std::runtime_error);
++  auto valid = add(array(2.0f), array(3.0f), s);
++  CHECK_NOTHROW(eval(valid)); CHECK(valid.item<float>() == 5.0f);
++  CHECK_NOTHROW(synchronize_and_retire(s));
++  CHECK_NOTHROW(synchronize_and_retire(cpu_stream));
++}
++#endif
+diff --git a/tests/completion_retirement_cpu_tests.cpp b/tests/completion_retirement_cpu_tests.cpp
+new file mode 100644
+--- /dev/null
++++ b/tests/completion_retirement_cpu_tests.cpp
+@@ -0,0 +1,229 @@
++// Native CPU integration definitions (no GPU/weights required).
++#include <algorithm>
++#include <atomic>
++#include <chrono>
++#include <future>
++#include "doctest/doctest.h"
++#include "mlx/mlx.h"
++#include "mlx/primitives.h"
++#include "mlx/scheduler.h"
++#include "mlx/backend/cpu/encoder.h"
++#include "mlx/backend/cpu/copy.h"
++using namespace mlx::core;
++using namespace std::chrono_literals;
++
++namespace {
++struct CpuRetirementDrop {
++  std::promise<void>* entered;
++  std::shared_future<void> release;
++  std::atomic<int>* drops;
++  ~CpuRetirementDrop() { entered->set_value(); release.wait(); ++*drops; }
++};
++class CpuPartialCopy : public UnaryPrimitive {
++ public:
++  CpuPartialCopy(Stream s, std::shared_future<void> gate) : UnaryPrimitive(s), gate_(std::move(gate)) {}
++  const char* name() const override { return "CpuPartialCopy"; }
++  void eval_gpu(const std::vector<array>&, array&) override { throw std::runtime_error("CPU test only"); }
++  void eval_cpu(const std::vector<array>& inputs, array& out) override {
++    out.set_data(allocator::malloc(out.nbytes()));
++    cpu::get_command_encoder(stream()).dispatch([gate = gate_] { gate.wait(); });
++    copy_cpu_inplace(inputs[0], out, CopyType::Vector, stream());
++    throw std::runtime_error("synthetic partial CPU encoding failure");
++  }
++ private:
++  std::shared_future<void> gate_;
++};
++class CpuTaskFailure : public UnaryPrimitive {
++ public:
++  explicit CpuTaskFailure(Stream s) : UnaryPrimitive(s) {}
++  const char* name() const override { return "CpuTaskFailure"; }
++  void eval_gpu(const std::vector<array>&, array&) override { throw std::runtime_error("CPU test only"); }
++  void eval_cpu(const std::vector<array>&, array& out) override {
++    out.set_data(allocator::malloc(out.nbytes()));
++    cpu::get_command_encoder(stream()).dispatch([ptr = out.data<float>(), n = out.size()] {
++      std::fill_n(ptr, n, 1.0f);
++      throw std::runtime_error("synthetic CPU primitive task failure");
++    });
++  }
++};
++class CpuLoadFailure : public UnaryPrimitive {
++ public:
++  explicit CpuLoadFailure(Stream s) : UnaryPrimitive(s) {}
++  const char* name() const override { return "CpuLoadFailure"; }
++  void eval_gpu(const std::vector<array>&, array&) override { throw std::runtime_error("CPU test only"); }
++  void eval_cpu(const std::vector<array>&, array& out) override {
++    out.set_data(allocator::malloc(out.nbytes()));
++    std::promise<void> promise;
++    auto completion = std::make_shared<LoadCompletion>();
++    completion->add(promise.get_future().share());
++    promise.set_exception(std::make_exception_ptr(std::runtime_error("synthetic CPU read failure")));
++    out.attach_load_completion(std::move(completion));
++  }
++};
++}
++
++// Also used by the Metal integration case to prove CPU -> GPU outcome propagation.
++array make_throwing_cpu_output(Stream s) {
++  return array({4}, float32, std::make_shared<CpuTaskFailure>(s), {});
++}
++
++TEST_CASE("CPU completion retirement joins prior task destructor") {
++  auto s = new_stream(Device::cpu);
++  std::promise<void> entered, release;
++  auto seen = entered.get_future();
++  std::atomic<int> drops{0};
++  auto owner = std::make_shared<CpuRetirementDrop>();
++  owner->entered = &entered; owner->release = release.get_future().share(); owner->drops = &drops;
++  std::weak_ptr<CpuRetirementDrop> weak = owner;
++  scheduler::enqueue(s, [owner = std::move(owner)] {});
++  bool entered_in_time = seen.wait_for(10s) == std::future_status::ready;
++  auto fence = std::async(std::launch::async, [s] { synchronize_and_retire(s); });
++  bool blocked = entered_in_time && fence.wait_for(100ms) == std::future_status::timeout;
++  release.set_value();
++  fence.get();
++  CHECK(entered_in_time);
++  CHECK(blocked);
++  CHECK(weak.expired());
++  CHECK(drops == 1);
++  CHECK_NOTHROW(synchronize_and_retire(s));
++}
++
++TEST_CASE("CPU completion retirement releases real Data and leftover encoder temporaries") {
++  auto s = new_stream(Device::cpu);
++  std::weak_ptr<array::Data> input_data, temporary_data;
++  array out(0.0f);
++  {
++    auto input = array({1.0f, 2.0f, 3.0f});
++    input_data = input.data_shared_ptr();
++    out = add(input, input, s);
++    async_eval({out});
++    auto temp = array({4.0f, 5.0f});
++    temporary_data = temp.data_shared_ptr();
++    cpu::get_command_encoder(s).add_temporary(std::move(temp));
++  }
++  synchronize_and_retire(s);
++  CHECK(input_data.expired());
++  CHECK(temporary_data.expired());
++  CHECK(out.itemsize() == sizeof(float));
++}
++
++TEST_CASE("CPU completion retirement drains a real gated distinct partial copy") {
++  auto s = new_stream(Device::cpu);
++  std::promise<void> release, copied;
++  auto opened = release.get_future().share();
++  auto observed = copied.get_future();
++  std::weak_ptr<array::Data> input_data, output_data;
++  float* ptr = nullptr;
++  {
++    auto input = array({1.0f, 2.0f, 3.0f});
++    input_data = input.data_shared_ptr();
++    auto out = array(input.shape(), input.dtype(), std::make_shared<CpuPartialCopy>(s, opened), {input});
++    CHECK_THROWS_WITH_AS(eval(out), "synthetic partial CPU encoding failure", std::runtime_error);
++    output_data = out.data_shared_ptr();
++    CHECK(out.data_shared_ptr() != input.data_shared_ptr());
++    ptr = out.data<float>();
++  }
++  CHECK_FALSE(input_data.expired());
++  CHECK_FALSE(output_data.expired());
++  // Check native retention BEFORE adding this test's observer owner. The queued
++  // observer then verifies that real distinct-output copy work actually ran.
++  auto owner = output_data.lock();
++  scheduler::enqueue(s, [owner = std::move(owner), ptr, &copied] {
++    if (owner && ptr[0] == 1.0f && ptr[1] == 2.0f && ptr[2] == 3.0f) copied.set_value();
++    else copied.set_exception(std::make_exception_ptr(std::runtime_error("CPU copy did not execute")));
++  });
++  auto fence = std::async(std::launch::async, [s] {
++    try { synchronize_and_retire(s); return true; }
++    catch (...) { return false; }
++  });
++  bool blocked = fence.wait_for(100ms) == std::future_status::timeout;
++  release.set_value();
++  CHECK(fence.get()); // owners retire; failed value remains a per-array outcome
++  CHECK(blocked);
++  CHECK_NOTHROW(observed.get());
++  CHECK(input_data.expired());
++  CHECK(output_data.expired());
++}
++
++TEST_CASE("CPU completion retirement caches failed callback receipt and reuses same stream") {
++  auto s = new_stream(Device::cpu);
++  scheduler::enqueue(s, [] { throw std::runtime_error("synthetic CPU task failure"); });
++  { auto unobserved = retirement_fence(s); }
++  auto failed = retirement_fence(s);
++  CHECK_THROWS_WITH_AS(failed.wait(), "synthetic CPU task failure", std::runtime_error);
++  CHECK_THROWS_WITH_AS(failed.wait(), "synthetic CPU task failure", std::runtime_error);
++  auto valid = add(array(2.0f), array(3.0f), s);
++  CHECK_NOTHROW(eval(valid));
++  CHECK(valid.item<float>() == 5.0f);
++  CHECK_NOTHROW(synchronize_and_retire(s));
++  CHECK_THROWS_WITH_AS(failed.wait(), "synthetic CPU task failure", std::runtime_error);
++}
++
++TEST_CASE("CPU completion retirement records read error without poisoning independent eval") {
++  auto s = new_stream(Device::cpu);
++  auto bad = array({2}, float32, std::make_shared<CpuLoadFailure>(s), {});
++  CHECK_THROWS_WITH_AS(eval(bad), "synthetic CPU read failure", std::runtime_error);
++  auto clean = add(array(2.0f), array(3.0f), s);
++  CHECK_NOTHROW(eval(clean));
++  CHECK(clean.item<float>() == 5.0f);
++  CHECK_NOTHROW(synchronize_and_retire(s));
++  CHECK_NOTHROW(synchronize_and_retire(s));
++}
++
++TEST_CASE("CPU completion retirement failed synchronous output refuses every later wait") {
++  auto s = new_stream(Device::cpu);
++  auto bad = make_throwing_cpu_output(s);
++  CHECK_THROWS_WITH_AS(eval(bad), "synthetic CPU primitive task failure", std::runtime_error);
++  for (int i = 0; i < 3; ++i) {
++    CHECK_THROWS_WITH_AS(bad.wait(), "synthetic CPU primitive task failure", std::runtime_error);
++    CHECK_THROWS_WITH_AS(eval(bad), "synthetic CPU primitive task failure", std::runtime_error);
++  }
++  auto clean = add(array(2.0f), array(3.0f), s);
++  CHECK_NOTHROW(eval(clean));
++  CHECK(clean.item<float>() == 5.0f);
++  CHECK_NOTHROW(synchronize_and_retire(s));
++}
++
++TEST_CASE("CPU completion retirement propagates producer failure to another CPU stream") {
++  auto producer = new_stream(Device::cpu);
++  auto consumer = new_stream(Device::cpu);
++  auto bad = make_throwing_cpu_output(producer);
++  auto derived = add(bad, array(1.0f), consumer);
++  CHECK_THROWS_WITH_AS(eval(derived), "synthetic CPU primitive task failure", std::runtime_error);
++  CHECK_THROWS_WITH_AS(derived.wait(), "synthetic CPU primitive task failure", std::runtime_error);
++  CHECK_THROWS_WITH_AS(bad.wait(), "synthetic CPU primitive task failure", std::runtime_error);
++  auto independent = add(array(3.0f), array(4.0f), consumer);
++  CHECK_NOTHROW(eval(independent));
++  CHECK(independent.item<float>() == 7.0f);
++  CHECK_NOTHROW(synchronize_and_retire(producer));
++  CHECK_NOTHROW(synchronize_and_retire(consumer));
++}
++
++#ifndef NDEBUG
++extern "C" void mlx_pmetal_test_fail_next_cpu_completion_setup();
++TEST_CASE("CPU completion retirement retains specific owners after setup bad_alloc") {
++  auto s = new_stream(Device::cpu);
++  std::weak_ptr<array::Data> input_data, output_data;
++  {
++    auto input = array({1.0f, 2.0f, 3.0f});
++    input_data = input.data_shared_ptr();
++    auto out = add(input, input, s);
++    mlx_pmetal_test_fail_next_cpu_completion_setup();
++    CHECK_THROWS_AS(eval(out), std::bad_alloc);
++    output_data = out.data_shared_ptr();
++    CHECK_THROWS_AS(out.wait(), std::bad_alloc);
++    CHECK_THROWS_AS(out.wait(), std::bad_alloc);
++  }
++  // No allocating cleanup was required on the failing host path. Its outcome
++  // already had storage for these exact owners before raw-pointer dispatch.
++  CHECK_FALSE(input_data.expired());
++  CHECK_FALSE(output_data.expired());
++  CHECK_NOTHROW(synchronize_and_retire(s));
++  CHECK(input_data.expired());
++  CHECK(output_data.expired());
++  auto clean = add(array(2.0f), array(3.0f), s);
++  CHECK_NOTHROW(eval(clean));
++  CHECK(clean.item<float>() == 5.0f);
++  CHECK_NOTHROW(synchronize_and_retire(s));
++}
++#endif

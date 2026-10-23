@@ -35,6 +35,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     strategy:
+      max-parallel: 1
       fail-fast: false
       matrix:
         include:

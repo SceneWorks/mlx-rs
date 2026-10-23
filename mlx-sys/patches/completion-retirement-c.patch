@@ -1,0 +1,68 @@
+diff --git a/mlx/c/stream.cpp b/mlx/c/stream.cpp
+--- a/mlx/c/stream.cpp
++++ b/mlx/c/stream.cpp
+@@ -71,6 +71,44 @@
+   }
+   return 0;
+ }
++// CPU/Metal completed-range receipts. Creation joins owners; only wait observes
++// and acknowledges the captured range. Free/drop without wait never acks.
++extern "C" int mlx_pmetal_retirement_fence_new(void** out, mlx_stream stream) {
++  try {
++    auto fence = std::make_unique<mlx::core::RetirementFence>();
++    *fence = mlx::core::retirement_fence(mlx_stream_get_(stream));
++    *out = fence.release();
++  } catch (const std::exception& e) {
++    mlx_error(e.what()); return 1;
++  } catch (...) {
++    mlx_error("[retirement_fence] Unknown capture error."); return 1;
++  }
++  return 0;
++}
++extern "C" int mlx_pmetal_retirement_fence_wait(void* fence) {
++  try {
++    static_cast<mlx::core::RetirementFence*>(fence)->wait();
++  } catch (const std::exception& e) {
++    mlx_error(e.what()); return 1;
++  } catch (...) {
++    mlx_error("[retirement_fence] Unknown completion error."); return 1;
++  }
++  return 0;
++}
++extern "C" void mlx_pmetal_retirement_fence_free(void* fence) {
++  delete static_cast<mlx::core::RetirementFence*>(fence);
++}
++extern "C" int mlx_pmetal_synchronize_and_retire(mlx_stream stream) {
++  try {
++    mlx::core::synchronize_and_retire(mlx_stream_get_(stream));
++  } catch (const std::exception& e) {
++    mlx_error(e.what()); return 1;
++  } catch (...) {
++    mlx_error("[synchronize_and_retire] Unknown completion error."); return 1;
++  }
++  return 0;
++}
++
+ extern "C" int mlx_synchronize(mlx_stream stream) {
+   try {
+     mlx::core::synchronize(mlx_stream_get_(stream));
+diff --git a/mlx/c/stream.h b/mlx/c/stream.h
+--- a/mlx/c/stream.h
++++ b/mlx/c/stream.h
+@@ -61,6 +61,16 @@
+  * Synchronize with the provided stream.
+  */
+ int mlx_synchronize(mlx_stream stream);
++/* CPU/Metal: creation synchronously joins the captured range, without executing
++ * an unscheduled graph. Wait observes immutable cached status and acknowledges
++ * ONLY that completed range. Dropping/freeing without wait never acknowledges.
++ * Failed arrays/dependencies retain execution errors independently; success is
++ * owner retirement, not result validity/cache/backing/process-footprint proof. */
++int mlx_pmetal_retirement_fence_new(void** out, mlx_stream stream);
++int mlx_pmetal_retirement_fence_wait(void* fence);
++void mlx_pmetal_retirement_fence_free(void* fence);
++/* Capture + observe a NEW range on every call. CUDA GPU is unsupported. */
++int mlx_pmetal_synchronize_and_retire(mlx_stream stream);
+ /**
+  * Returns the default stream on the given device.
+  */

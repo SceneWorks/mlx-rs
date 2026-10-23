@@ -32,6 +32,7 @@ jobs:
     runs-on: macos-15
     timeout-minutes: 120
     strategy:
+      max-parallel: 1
       fail-fast: false
       matrix:
         include:
@@ -86,6 +87,8 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           key: ${{ matrix.target }}-${{ hashFiles('**/Cargo.toml') }}
+      - name: Check manifest-keyed link selection
+        run: python3 -I mlx-sys/tests/run_cross_apple_link_selection.py --work-dir "$RUNNER_TEMP/cross-apple-link-selection"
       - name: Build pmetal-mlx-sys for ${{ matrix.target }}
         run: |
           export "${{ matrix.deployment_env }}=18.0"
@@ -121,17 +124,30 @@ jobs:
       - name: Link a real binary for ${{ matrix.target }}
         run: |
           set -euo pipefail
-          # A -Z build-std run can leave multiple pmetal-mlx-sys `out` directories behind. Pick
-          # the one that owns the staged C example instead of whichever directory `find` sees
-          # first; only the completed native build-script output contains this file and the
-          # static archives linked below.
-          example=$(find target/${{ matrix.target }} -type f \
-            -path '*pmetal-mlx-sys*/out/mlx-c-staged/examples/example.c' -print -quit)
-          if [ -z "$example" ]; then
-            echo "::error::no completed pmetal-mlx-sys build output for ${{ matrix.target }}"
-            exit 1
-          fi
-          out=${example%/mlx-c-staged/examples/example.c}
+          # Select the unique completed Debug output, not an arbitrary build-std directory.
+          outputs=()
+          # Stable Cargo uses package-hash/out; current nightly uses package/hash/out.
+          for manifest in \
+            target/${{ matrix.target }}/debug/build/pmetal-mlx-sys-*/out/build/lib/pmetal-mlx-prebuilt.txt \
+            target/${{ matrix.target }}/debug/build/pmetal-mlx-sys/*/out/build/lib/pmetal-mlx-prebuilt.txt; do
+            [ -f "$manifest" ] || continue
+            outputs+=("${manifest%/build/lib/pmetal-mlx-prebuilt.txt}")
+          done
+          [ "${#outputs[@]}" -eq 1 ] || { echo "::error::expected one completed native output, found ${#outputs[@]}"; exit 1; }
+          out=${outputs[0]}
+          manifest="$out/build/lib/pmetal-mlx-prebuilt.txt"
+          grep -qx 'schema=1' "$manifest"
+          grep -qx 'target=${{ matrix.target }}' "$manifest"
+          grep -qx 'build_type=Debug' "$manifest"
+          grep -qx 'deployment_target=18.0' "$manifest"
+          grep -qx 'features=accelerate,metal' "$manifest"
+          key=$(sed -n 's/^fingerprint=//p' "$manifest")
+          [[ "$key" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::invalid native fingerprint"; exit 1; }
+          gguf="$out/build/_deps/pmetal-$key/mlx-build/mlx/io/libgguflib.a"
+          [ -f "$gguf" ] || { echo "::error::missing manifest-keyed gguf archive: $gguf"; exit 1; }
+          [ -f "$out/mlx-c-staged/examples/example.c" ]
+          [ -f "$out/build/lib/libmlx.a" ]
+          [ -f "$out/build/lib/libmlxc.a" ]
           sdk=$(xcrun --sdk ${{ matrix.sdk }} --show-sdk-path)
           # Empty on the device SDKs, which export everything metal-cpp references.
           shim=$(find "$out" -name 'libmlx_metal_cpp_absent.a' -print -quit)
@@ -139,7 +155,7 @@ jobs:
             -target ${{ matrix.clang_target }} -isysroot "$sdk" \
             "$out/mlx-c-staged/examples/example.c" -I"$out/mlx-c-staged" -o link-probe \
             "$out/build/lib/libmlxc.a" "$out/build/lib/libmlx.a" \
-            "$out/build/_deps/mlx-build/mlx/io/libgguflib.a" $shim \
+            "$gguf" $shim \
             -lc++ -lobjc \
             -framework Metal -framework Foundation -framework QuartzCore -framework Accelerate
           file link-probe

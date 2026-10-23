@@ -171,6 +171,50 @@ impl Stream {
         }
     }
 
+    /// Complete one current CPU/Metal retirement range and return its durable receipt.
+    ///
+    /// This call blocks: under MLX's evaluation lock it first submits already-encoded
+    /// GPU producers (never idle Metal buffers), THEN captures/joins this stream's
+    /// completion obligations. CPU queue closures, encoder temporaries/error custody,
+    /// and Metal input/sibling/temporary/fence/event captures are destroyed before a
+    /// receipt is returned, even if Metal retains copies of outer handlers.
+    ///
+    /// Call [`RetirementFence::wait`] to observe its cached status and acknowledge only
+    /// its captured, completed range. Dropping an unobserved failed receipt does not
+    /// clear the failure. Rewaiting the same failed receipt always fails; later ranges
+    /// on the SAME user-selected stream can recover after observed acknowledgement.
+    /// Ordinary CPU execution/load/setup failures remain on affected arrays/dependencies,
+    /// not a global retirement poison. GPU buffer outcomes also remain failed on old
+    /// arrays after ordinary execution-error reports or range acknowledgement.
+    ///
+    /// A creation `Err` means setup/submission/join did not produce a completed receipt:
+    /// no retirement credit and no acknowledgement of unretired work. Always fence
+    /// relevant streams even when scheduling failed; failed setup can retain owners.
+    /// Fence every relevant producer too. This does not evaluate an unscheduled graph,
+    /// free external/Rust aliases, evict allocator caches/backing, reduce process
+    /// footprint, or perform allocation admission. CUDA GPU retirement is unsupported.
+    /// Requires matching new native archives; old prebuilts cannot supply this ABI.
+    #[track_caller]
+    pub fn retirement_fence(&self) -> Result<RetirementFence> {
+        let mut raw = std::ptr::null_mut();
+        <()>::try_from_op(|_| unsafe {
+            mlx_sys::mlx_pmetal_retirement_fence_new(&mut raw, self.c_stream)
+        })?;
+        Ok(RetirementFence {
+            raw: std::ptr::NonNull::new(raw).expect("native retirement fence returned null"),
+        })
+    }
+
+    /// Capture and observe a NEW retirement range (convenience form).
+    ///
+    /// Each call captures a new range; use [`Self::retirement_fence`] to retain and
+    /// repeatedly wait on the SAME receipt. Success certifies owner retirement, not
+    /// numerical/result validity: affected arrays still report execution/load failures.
+    #[track_caller]
+    pub fn synchronize_and_retire(&self) -> Result<()> {
+        self.retirement_fence()?.wait()
+    }
+
     /// Get the underlying C pointer.
     pub fn as_ptr(&self) -> mlx_sys::mlx_stream {
         self.c_stream
@@ -192,6 +236,15 @@ impl Stream {
         }
     }
 
+    /// Get this stream's device, independently of global or task-local defaults.
+    ///
+    /// Allocates an owned native device metadata handle, released when the returned
+    /// [`Device`] is dropped. This query does not create a stream or initialize an
+    /// execution backend.
+    pub fn get_device(&self) -> Result<Device> {
+        Device::try_from_op(|res| unsafe { mlx_sys::mlx_stream_get_device(res, self.c_stream) })
+    }
+
     /// Get the index of the stream.
     pub fn get_index(&self) -> Result<i32> {
         i32::try_from_op(|res| unsafe { mlx_sys::mlx_stream_get_index(res, self.c_stream) })
@@ -211,6 +264,37 @@ impl Stream {
             mlx_sys::mlx_string_free(mlx_str);
             result
         }
+    }
+}
+
+/// Durable completed retirement range. Creation already joined its owners;
+/// `wait` observes/acknowledges its immutable result, never submits GPU work.
+#[derive(Debug)]
+pub struct RetirementFence {
+    raw: std::ptr::NonNull<std::ffi::c_void>,
+}
+
+// SAFETY: native receipt status is immutable; observation/acknowledgement uses
+// std::call_once and the range journal's mutex. It holds no live array owners.
+unsafe impl Send for RetirementFence {}
+unsafe impl Sync for RetirementFence {}
+
+impl RetirementFence {
+    /// Observe this completed range and explicitly acknowledge only its captured
+    /// obligations. A cached failure remains an error on every repeated wait;
+    /// acknowledgement permits later independent ranges on the same stream.
+    #[track_caller]
+    pub fn wait(&self) -> Result<()> {
+        <()>::try_from_op(|_| unsafe {
+            mlx_sys::mlx_pmetal_retirement_fence_wait(self.raw.as_ptr())
+        })
+    }
+}
+
+impl Drop for RetirementFence {
+    fn drop(&mut self) {
+        // Freeing without wait is intentionally NOT acknowledgement.
+        unsafe { mlx_sys::mlx_pmetal_retirement_fence_free(self.raw.as_ptr()) };
     }
 }
 
