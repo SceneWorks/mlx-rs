@@ -260,6 +260,7 @@ impl Stream {
 
 /// Durable completed retirement range. Creation already joined its owners;
 /// `wait` observes/acknowledges its immutable result, never submits GPU work.
+#[derive(Debug)]
 pub struct RetirementFence {
     raw: std::ptr::NonNull<std::ffi::c_void>,
 }
