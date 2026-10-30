@@ -22,8 +22,9 @@ pub enum LoadProgressEvent {
         /// Size of the opened file in bytes.
         total_bytes: u64,
     },
-    /// All currently scheduled reads are idle, including after a read error.
-    /// Further lazy tensor reads may begin later.
+    /// This evaluation token's reads are idle, including after a read error.
+    /// A callback shared across tokens must balance Started/Idle events: another token from the
+    /// same file may still be active, and further lazy tensor reads may begin later.
     Idle,
 }
 
