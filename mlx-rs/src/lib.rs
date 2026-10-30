@@ -283,6 +283,8 @@
 #[macro_use]
 pub mod macros; // Must be first to ensure the other modules can use the macros
 
+pub mod load_progress;
+
 mod array;
 pub mod builder;
 mod device;

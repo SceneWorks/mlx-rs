@@ -76,6 +76,33 @@ impl Array {
         Ok((data, metadata))
     }
 
+    /// Load lazy safetensors arrays with a per-reader actual-byte callback.
+    ///
+    /// Header reads occur now; payload reads are reported when the arrays are evaluated.
+    /// The reader retains `progress` until its last lazy array/read is released.
+    #[default_device(device = "cpu")]
+    pub fn load_safetensors_with_progress_device(
+        path: impl AsRef<Path>,
+        progress: crate::load_progress::LoadProgress,
+        stream: impl AsRef<Stream>,
+    ) -> Result<HashMap<String, Array>, IoError> {
+        SafeTensors::load_device_with_progress(path.as_ref(), stream, Some(progress))?
+            .data()
+            .map_err(Into::into)
+    }
+
+    /// Load lazy safetensors arrays and metadata with per-reader actual-byte progress.
+    #[allow(clippy::type_complexity)]
+    #[default_device(device = "cpu")]
+    pub fn load_safetensors_with_metadata_and_progress_device(
+        path: impl AsRef<Path>,
+        progress: crate::load_progress::LoadProgress,
+        stream: impl AsRef<Stream>,
+    ) -> Result<(HashMap<String, Array>, HashMap<String, String>), IoError> {
+        let safe = SafeTensors::load_device_with_progress(path.as_ref(), stream, Some(progress))?;
+        Ok((safe.data()?, safe.metadata()?))
+    }
+
     /// Save array to a binary file in `.npy`format.
     ///
     /// # Params

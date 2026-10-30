@@ -24,6 +24,14 @@ impl Drop for SafeTensors {
 
 impl SafeTensors {
     pub(crate) fn load_device(path: &Path, stream: impl AsRef<Stream>) -> Result<Self, IoError> {
+        Self::load_device_with_progress(path, stream, None)
+    }
+
+    pub(crate) fn load_device_with_progress(
+        path: &Path,
+        stream: impl AsRef<Stream>,
+        progress: Option<crate::load_progress::LoadProgress>,
+    ) -> Result<Self, IoError> {
         if !path.is_file() {
             return Err(IoError::NotFile);
         }
@@ -41,7 +49,25 @@ impl SafeTensors {
         let filepath = CString::new(path_str)?;
 
         SafeTensors::try_from_op(|(res_0, res_1)| unsafe {
-            mlx_sys::mlx_load_safetensors(res_0, res_1, filepath.as_ptr(), stream.as_ref().as_ptr())
+            if let Some(progress) = progress {
+                mlx_sys::mlx_pmetal_load_safetensors_progress(
+                    res_0,
+                    res_1,
+                    filepath.as_ptr(),
+                    stream.as_ref().as_ptr(),
+                    crate::load_progress::report,
+                    progress.into_context(),
+                    crate::load_progress::capture,
+                    crate::load_progress::release,
+                )
+            } else {
+                mlx_sys::mlx_load_safetensors(
+                    res_0,
+                    res_1,
+                    filepath.as_ptr(),
+                    stream.as_ref().as_ptr(),
+                )
+            }
         })
         .map_err(Into::into)
     }

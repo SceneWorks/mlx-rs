@@ -1,0 +1,52 @@
+--- a/mlx/c/io.cpp
++++ b/mlx/c/io.cpp
+@@ -7,6 +7,8 @@
+ #include "mlx/c/error.h"
+ #include "mlx/c/private/mlx.h"
+ #include "mlx/io.h"
++#include "mlx/io/load.h"
++#include <filesystem>
+ 
+ extern "C" int
+ mlx_load_reader(mlx_array* res, mlx_io_reader in_stream, const mlx_stream s) {
+@@ -114,3 +116,40 @@
+   }
+   return 0;
+ }
++
++// The caller transfers one context reference unconditionally, including on failure.
++// Reader ownership retains it through lazy graph evaluation and queued I/O.
++extern "C" int mlx_pmetal_load_safetensors_progress(
++    mlx_map_string_to_array* data,
++    mlx_map_string_to_string* metadata,
++    const char* file,
++    const mlx_stream stream,
++    void (*callback)(void*, uint64_t, uint64_t, int),
++    void* context,
++    void* (*capture)(void*),
++    void (*release)(void*)) {
++  try {
++    std::shared_ptr<void> owner(context, release);
++    const uint64_t total = std::filesystem::file_size(file);
++    auto progress = std::make_shared<mlx::core::io::ReadProgress>(
++        total,
++        [owner, callback](uint64_t bytes, uint64_t total, int event) {
++          callback(owner.get(), bytes, total, event);
++        },
++        [owner, callback, capture, release, total]() {
++          std::shared_ptr<void> evaluation(capture(owner.get()), release);
++          return std::make_shared<mlx::core::io::ReadProgress>(
++              total, [evaluation, callback](uint64_t bytes, uint64_t total, int event) {
++                callback(evaluation.get(), bytes, total, event);
++              });
++        });
++    auto reader = std::make_shared<mlx::core::io::ParallelFileReader>(file, progress);
++    auto [arrays, info] = mlx::core::load_safetensors(reader, mlx_stream_get_(stream));
++    mlx_map_string_to_array_set_(*data, arrays);
++    mlx_map_string_to_string_set_(*metadata, info);
++  } catch (std::exception& e) {
++    mlx_error(e.what());
++    return 1;
++  }
++  return 0;
++}

@@ -1,0 +1,196 @@
+diff --git a/mlx/backend/common/load.cpp b/mlx/backend/common/load.cpp
+index 869c926..6d420b5 100644
+--- a/mlx/backend/common/load.cpp
++++ b/mlx/backend/common/load.cpp
+@@ -29,13 +29,17 @@ namespace mlx::core {
+ 
+ void Load::eval_cpu(const std::vector<array>& inputs, array& out) {
+   out.set_data(allocator::malloc(out.nbytes()));
++  // Capture on the eval caller's thread. The immutable token belongs to this Load,
++  // never to a mutable reader/global current request on an I/O pool thread.
++  auto progress = reader_->capture_read_progress();
+   auto read_task = [out_ptr = out.data<char>(),
+                     size = out.size(),
+                     itemsize = out.itemsize(),
+                     offset = offset_,
+                     reader = reader_,
++                    progress = std::move(progress),
+                     swap_endianness_ = swap_endianness_]() mutable {
+-    reader->read(out_ptr, size * itemsize, offset);
++    reader->read_with_progress(out_ptr, size * itemsize, offset, progress);
+     if (swap_endianness_) {
+       switch (itemsize) {
+         case 2:
+diff --git a/mlx/io/load.cpp b/mlx/io/load.cpp
+index 79d5727..0e75652 100644
+--- a/mlx/io/load.cpp
++++ b/mlx/io/load.cpp
+@@ -349,6 +349,7 @@ ThreadPool& ParallelFileReader::thread_pool() {
+ }
+ 
+ void ParallelFileReader::read(char* data, size_t n) {
++  ReadProgress::Scope reading(progress_);
+   while (n != 0) {
+     auto m = ::read(fd_, data, std::min(n, static_cast<size_t>(INT32_MAX)));
+     if (m <= 0) {
+@@ -356,13 +357,20 @@ void ParallelFileReader::read(char* data, size_t n) {
+       msg << "[read] Unable to read " << n << " bytes from file.";
+       throw std::runtime_error(msg.str());
+     }
++    if (progress_) progress_->advance(m);
+     data += m;
+     n -= m;
+   }
+ }
+ 
+ void ParallelFileReader::read(char* data, size_t n, size_t offset) {
+-  auto readfn = [fd = fd_, file = label()](
++  read_with_progress(data, n, offset, progress_);
++}
++
++void ParallelFileReader::read_with_progress(
++    char* data, size_t n, size_t offset, std::shared_ptr<ReadProgress> progress) {
++  ReadProgress::Scope reading(progress);
++  auto readfn = [fd = fd_, file = label(), progress = std::move(progress)](
+                     size_t offset, size_t size, char* buffer) {
+     while (size != 0) {
+       auto m = pread(fd, buffer, size, offset);
+@@ -380,6 +388,7 @@ void ParallelFileReader::read(char* data, size_t n, size_t offset) {
+         msg << " errno=" << error;
+         throw std::system_error(error, std::generic_category(), msg.str());
+       }
++      if (progress) progress->advance(m);
+       buffer += m;
+       size -= m;
+       offset += m;
+diff --git a/mlx/io/load.h b/mlx/io/load.h
+index 2e13efe..eda42f5 100644
+--- a/mlx/io/load.h
++++ b/mlx/io/load.h
+@@ -3,6 +3,8 @@
+ #pragma once
+ 
+ #include <memory>
++#include <functional>
++#include <mutex>
+ #include <sstream>
+ 
+ #include <fcntl.h>
+@@ -29,6 +31,8 @@ namespace io {
+ 
+ ThreadPool& thread_pool();
+ 
++class ReadProgress;
++
+ class Reader {
+  public:
+   virtual bool is_open() const = 0;
+@@ -39,6 +43,12 @@ class Reader {
+       std::ios_base::seekdir way = std::ios_base::beg) = 0;
+   virtual void read(char* data, size_t n) = 0;
+   virtual void read(char* data, size_t n, size_t offset) = 0;
++  // Called synchronously by Load::eval_cpu, before any I/O task is queued.
++  virtual std::shared_ptr<ReadProgress> capture_read_progress() { return nullptr; }
++  virtual void read_with_progress(char* data, size_t n, size_t offset,
++                                  std::shared_ptr<ReadProgress> progress) {
++    read(data, n, offset);
++  }
+   virtual std::string label() const = 0;
+   virtual ~Reader() = default;
+ };
+@@ -56,11 +66,51 @@ class Writer {
+   virtual ~Writer() = default;
+ };
+ 
++// Per-reader ownership: lazy Load primitives and their queued reads retain this state.
++// Events: 0=begin active reads, 1=successful bytes, 2=all current reads idle.
++class ReadProgress {
++ public:
++  using Callback = std::function<void(uint64_t, uint64_t, int)>;
++  using Capture = std::function<std::shared_ptr<ReadProgress>()>;
++  ReadProgress(uint64_t total, Callback callback, Capture capture = {})
++      : total_(total), callback_(std::move(callback)), capture_(std::move(capture)) {}
++  std::shared_ptr<ReadProgress> capture() const {
++    return capture_ ? capture_() : nullptr;
++  }
++  void begin() {
++    std::lock_guard<std::mutex> lock(mutex_);
++    if (active_++ == 0) callback_(0, total_, 0);
++  }
++  void advance(uint64_t bytes) {
++    std::lock_guard<std::mutex> lock(mutex_);
++    callback_(bytes, total_, 1);
++  }
++  void end() {
++    std::lock_guard<std::mutex> lock(mutex_);
++    if (--active_ == 0) callback_(0, total_, 2);
++  }
++  struct Scope {
++    std::shared_ptr<ReadProgress> progress;
++    explicit Scope(std::shared_ptr<ReadProgress> p) : progress(std::move(p)) {
++      if (progress) progress->begin();
++    }
++    ~Scope() { if (progress) progress->end(); }
++  };
++ private:
++  uint64_t total_;
++  Callback callback_;
++  Capture capture_;
++  std::mutex mutex_;
++  size_t active_{0};
++};
++
+ class ParallelFileReader : public Reader {
+  public:
+-  explicit ParallelFileReader(std::string file_path)
++  explicit ParallelFileReader(
++      std::string file_path,
++      std::shared_ptr<ReadProgress> progress = nullptr)
+       : fd_(open(file_path.c_str(), O_RDONLY | O_BINARY)),
+-        label_(std::move(file_path)) {}
++        label_(std::move(file_path)), progress_(std::move(progress)) {}
+ 
+   ~ParallelFileReader() override {
+     close(fd_);
+@@ -96,6 +146,12 @@ class ParallelFileReader : public Reader {
+   void read(char* data, size_t n) override;
+ 
+   void read(char* data, size_t n, size_t offset) override;
++  void read_with_progress(char* data, size_t n, size_t offset,
++                          std::shared_ptr<ReadProgress> progress) override;
++  std::shared_ptr<ReadProgress> capture_read_progress() override {
++    auto captured = progress_ ? progress_->capture() : nullptr;
++    return captured ? captured : progress_;
++  }
+ 
+   std::string label() const override {
+     return "file " + label_;
+@@ -106,6 +162,7 @@ class ParallelFileReader : public Reader {
+   static ThreadPool& thread_pool();
+   int fd_;
+   std::string label_;
++  std::shared_ptr<ReadProgress> progress_;
+ };
+ 
+ class FileWriter : public Writer {
+diff --git a/mlx/io/safetensors.cpp b/mlx/io/safetensors.cpp
+index a8d8627..06e12a0 100644
+--- a/mlx/io/safetensors.cpp
++++ b/mlx/io/safetensors.cpp
+@@ -29,6 +29,7 @@ using json = nlohmann::json;
+ #define ST_U64 "U64"
+ #define ST_F8_E4M3 "F8_E4M3"
+ #define ST_F8_E8M0 "F8_E8M0"
++#define ST_F8_E5M2 "F8_E5M2"
+ 
+ // Note: Complex numbers aren't in the spec yet so this could change -
+ // https://github.com/huggingface/safetensors/issues/389
+@@ -98,6 +99,8 @@ Dtype dtype_from_safetensor_str(std::string_view str) {
+     return complex64;
+   } else if (str == ST_F8_E4M3) {
+     return uint8;
++  } else if (str == ST_F8_E5M2) {
++    return uint8;
+   } else if (str == ST_F8_E8M0) {
+     return uint8;
+   } else {
