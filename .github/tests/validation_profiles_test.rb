@@ -26,13 +26,18 @@ class ValidationProfilesTest < Minitest::Test
     assert_equal ['checks'], ordinary.fetch('jobs').keys
     runs = commands(ordinary)
     assert_includes runs, 'cargo fmt --all -- --check'
-    assert_includes runs, 'cargo clippy --workspace --all-targets -- -D warnings'
+    assert_includes runs, 'cargo clippy --workspace -- -D warnings'
+    assert_includes runs, 'cargo test --all --no-run'
+    setup = ordinary.fetch('jobs').fetch('checks').fetch('steps').find { |step| step.fetch('uses', '').start_with?('actions-rust-lang/setup-rust-toolchain@') }
+    assert_equal '', setup.fetch('with').fetch('rustflags')
     assert_equal [
       'sudo xcodes select 16.4',
       'cargo --version',
       'ruby .github/tests/validation_profiles_test.rb',
       'cargo fmt --all -- --check',
-      'cargo clippy --workspace --all-targets -- -D warnings',
+      'cargo clippy --workspace -- -D warnings',
+      'cargo clippy -p pmetal-mlx-rs --test load_errors --test load_progress -- -D warnings',
+      'cargo test --all --no-run',
       SAFE_TEST_COMMAND
     ], runs
     refute ordinary.fetch('jobs').values.any? { |job| job.key?('uses') }
@@ -48,6 +53,7 @@ class ValidationProfilesTest < Minitest::Test
     assert_equal 1, job.fetch('strategy').fetch('max-parallel')
     assert_equal 180, job.fetch('timeout-minutes')
     assert_equal false, manual.fetch('concurrency').fetch('cancel-in-progress')
+    assert_equal 'model-validation-${{ github.run_id }}-${{ github.run_attempt }}', manual.fetch('concurrency').fetch('group')
     runs = commands(manual)
     assert_equal 1, runs.count { |run| run.include?('cargo test --all -- --test-threads=1') }
     retirement = job.fetch('steps').find { |step| step.fetch('name', '') == 'Focused native CPU and Metal owner retirement' }

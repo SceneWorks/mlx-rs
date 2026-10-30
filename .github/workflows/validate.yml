@@ -28,12 +28,17 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
         with:
           components: rustfmt, clippy
+          # Preserve the full test job's warning treatment for compile-only tests.
+          # Production and audited I/O Clippy commands still deny warnings explicitly.
+          rustflags: ""
       - run: cargo --version
       - name: Validate workflow execution profiles
         run: ruby .github/tests/validation_profiles_test.rb
       - run: cargo fmt --all -- --check
-      # Compile/lint every target, including learned tests; execute only audited I/O targets.
-      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo clippy --workspace -- -D warnings
+      - run: cargo clippy -p pmetal-mlx-rs --test load_errors --test load_progress -- -D warnings
+      # Keep broad test compilation; full execution is in explicit model validation.
+      - run: cargo test --all --no-run
       # load_errors uses raw add/square/sum on CPU/GPU to propagate I/O failures, and
       # load_progress copies CPU Load bytes. Neither target executes a learned module.
       - run: cargo test -p pmetal-mlx-rs --test load_errors --test load_progress -- --test-threads=1

@@ -10,7 +10,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: model-validation-${{ github.ref }}
+  group: model-validation-${{ github.run_id }}-${{ github.run_attempt }}
   cancel-in-progress: false
 
 jobs:
