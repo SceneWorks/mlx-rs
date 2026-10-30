@@ -563,6 +563,20 @@ fn prepare_mlx_c_source() -> PathBuf {
     );
     println!("cargo:rerun-if-changed=patches/eval-pending-loads-c.patch");
 
+    // Reader-owned byte callbacks survive lazy/asynchronous Load evaluation.
+    let progress_patch =
+        std::fs::canonicalize("patches/load-progress-c.patch").expect("find load-progress-c.patch");
+    let status = Command::new("patch")
+        .arg("-p1")
+        .arg("-d")
+        .arg(&staged)
+        .arg("-i")
+        .arg(&progress_patch)
+        .status()
+        .expect("apply load-progress-c.patch");
+    assert!(status.success(), "load-progress-c.patch failed to apply");
+    println!("cargo:rerun-if-changed=patches/load-progress-c.patch");
+
     // Additive Metal completion-owner retirement ABI. Bindgen still reads the
     // pristine submodule; src/lib.rs declares the extension explicitly.
     let retirement_c_patch = std::fs::canonicalize("patches/completion-retirement-c.patch")
@@ -729,6 +743,7 @@ fn prepare_mlx_c_source() -> PathBuf {
         "patches/thread-shared-streams.patch",
         "patches/thread-safe-eval.patch",
         "patches/load-completion-errors.patch",
+        "patches/load-progress.patch",
         "patches/apple-metal-sdk.patch",
         "patches/apple-cpu-no-jit.patch",
         "patches/exact-qmm-bias.patch",

@@ -25,12 +25,23 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      validation_only:
+        description: Run explicit full model validation without building or publishing archives
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: write
 
 jobs:
+  model-validation:
+    if: github.event_name == 'workflow_dispatch' && inputs.validation_only == true
+    uses: ./.github/workflows/model-validation.yml
+
   build:
+    if: github.event_name != 'workflow_dispatch' || inputs.validation_only != true
     name: ${{ matrix.deployment_target }} ${{ matrix.build_type }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90

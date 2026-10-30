@@ -102,6 +102,10 @@ source:mlx/fast_primitives.h
 d1921a5e9ecca35f681b4eb8e4087b286bb10003f5f31899e5c4899670a59496
 source:mlx/io/load.cpp
 024e730dee5fda338033f44c3630a8ef8d6c450e6d05f12f522e9925666d4527
+source:mlx/io/load.h
+d06ec3889bd19113894ca30a612b14db72b041a7192752d946cfe238efe20ad2
+source:mlx/io/safetensors.cpp
+dc56aec7a4520be470aa5a0081fcf97b118d6230a5ebf5cdd361cb0a5ab5b27c
 source:mlx/load_completion.h
 MISSING
 source:mlx/ops.cpp

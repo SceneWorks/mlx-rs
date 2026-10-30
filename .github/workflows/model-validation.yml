@@ -1,0 +1,87 @@
+name: model-validation
+
+# Full learned tests are explicit/manual work. The registered prebuilt workflow can
+# call this file on an unmerged branch via validation_only, without publishing archives.
+on:
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: model-validation-${{ github.run_id }}-${{ github.run_attempt }}
+  cancel-in-progress: false
+
+jobs:
+  tests:
+    # Defense in depth: even an accidental future push/PR caller cannot execute this job.
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 180
+    strategy:
+      max-parallel: 1
+      matrix:
+        runner: [macos-15]
+        rust: [1.85.0, stable]
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          submodules: true
+      - run: sudo xcodes select 16.4
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+        with:
+          cache: false
+          toolchain: ${{ matrix.rust }}
+          rustflags: "" # Preserve the existing full-suite profile.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: ${{ matrix.rust }}-${{ matrix.runner }}-${{ hashFiles('**/Cargo.toml') }}
+      - name: Record source, platform, toolchain and fixture identity
+        run: |
+          set -euo pipefail
+          mkdir -p validation-evidence
+          {
+            git rev-parse HEAD
+            git submodule status --recursive
+            rustc -Vv
+            cargo -V
+            sw_vers
+            uname -a
+            xcodebuild -version
+            xcrun --show-sdk-version
+            sysctl hw.model hw.ncpu
+            printf 'backend=MLX (Accelerate + Metal defaults)\n'
+            printf 'device_selection=per-test CPU/GPU/default, preserved by exact test sources\n'
+            printf 'DEVICE=%s\nMLX_METAL_FAST_SYNCH=%s\nMACOSX_DEPLOYMENT_TARGET=%s\n' \
+              "${DEVICE-<unset>}" "${MLX_METAL_FAST_SYNCH-<unset>}" "${MACOSX_DEPLOYMENT_TARGET-<unset>}"
+          } | tee validation-evidence/identity.txt
+          system_profiler SPDisplaysDataType -json > validation-evidence/devices.json
+          git ls-files -s \
+            > validation-evidence/fixture-sources.txt
+      # Preserve the full workspace command and MSRV/stable matrix. No skipped NN tests,
+      # name filters or replacement campaign; a failed/partial suite is not acceptance.
+      - name: Full workspace tests
+        run: |
+          set -euo pipefail
+          cargo test --all -- --test-threads=1 2>&1 | tee validation-evidence/workspace-tests.log
+      - name: Focused native CPU and Metal owner retirement
+        if: matrix.rust == 'stable'
+        run: |
+          set -euo pipefail
+          bash mlx-sys/tests/validate_native_retirement.sh 2>&1 | tee validation-evidence/native-retirement.log
+      - name: Preserve resolved dependencies and native source receipts
+        if: always()
+        run: |
+          set -euo pipefail
+          mkdir -p validation-evidence
+          if [ -f Cargo.lock ]; then cp Cargo.lock validation-evidence/Cargo.lock; fi
+          find target/debug/build -name pmetal-mlx-prebuilt.txt -print -exec cat {} \; \
+            > validation-evidence/native-receipts.txt
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: model-validation-${{ github.sha }}-${{ matrix.rust }}-${{ matrix.runner }}
+          path: validation-evidence
+          if-no-files-found: error
+          retention-days: 14

@@ -79,3 +79,17 @@ extern "C" {
     // Added by eval-pending-loads-c.patch (sc-24245).
     pub fn mlx_pmetal_eval_pending_loads(outputs: mlx_vector_array) -> ::std::os::raw::c_int;
 }
+
+// Added by load-progress-c.patch. Ownership of context is transferred even on error.
+extern "C" {
+    pub fn mlx_pmetal_load_safetensors_progress(
+        data: *mut mlx_map_string_to_array,
+        metadata: *mut mlx_map_string_to_string,
+        file: *const ::std::os::raw::c_char,
+        stream: mlx_stream,
+        callback: unsafe extern "C" fn(*mut ::std::os::raw::c_void, u64, u64, i32),
+        context: *mut ::std::os::raw::c_void,
+        capture: unsafe extern "C" fn(*mut ::std::os::raw::c_void) -> *mut ::std::os::raw::c_void,
+        release: unsafe extern "C" fn(*mut ::std::os::raw::c_void),
+    ) -> ::std::os::raw::c_int;
+}

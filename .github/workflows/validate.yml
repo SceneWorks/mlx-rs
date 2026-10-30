@@ -28,40 +28,17 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
         with:
           components: rustfmt, clippy
+          # Preserve the full test job's warning treatment for compile-only tests.
+          # Production and audited I/O Clippy commands still deny warnings explicitly.
+          rustflags: ""
       - run: cargo --version
-      - run: cargo fmt -- --check
-      - run: cargo clippy -- -D warnings
-
-  tests:
-    # One hosted slot at a time: checks first, then the two toolchains serially.
-    needs: checks
-    runs-on: ${{ matrix.runner }}
-    # Cold MLX C++ build + single-threaded test suite; see checks job note.
-    timeout-minutes: 180
-    strategy:
-      max-parallel: 1
-      matrix:
-        runner: [macos-15]
-        rust: [1.85.0, stable]
-    steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
-        with:
-          submodules: true
-      - run: sudo xcodes select 16.4
-      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
-        with:
-          cache: false
-          toolchain: ${{ matrix.rust }}
-          rustflags: "" # Disable when we're ready
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-        with:
-          key: ${{ matrix.rust }}-${{ matrix.runner }}-${{ hashFiles('**/Cargo.toml') }}
-      # yoke-derive 0.8.4 fixes the 0.8.3 MSRV regression and declares rust-version.
-      # Let resolver = "3" select it with its matching yoke dependency.
-      - run: cargo test --all -- --test-threads=1 # MLX is not thread safe
-      # Deep production owner/destructor tests must execute, not merely remain
-      # definitions behind the ordinary MLX_BUILD_TESTS=OFF build. Reuse the
-      # existing stable job; no additional runner/matrix/campaign.
-      - name: Focused native CPU and Metal owner retirement
-        if: matrix.rust == 'stable'
-        run: bash mlx-sys/tests/validate_native_retirement.sh
+      - name: Validate workflow execution profiles
+        run: ruby .github/tests/validation_profiles_test.rb
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace -- -D warnings
+      - run: cargo clippy -p pmetal-mlx-rs --test load_errors --test load_progress -- -D warnings
+      # Keep broad test compilation; full execution is in explicit model validation.
+      - run: cargo test --all --no-run
+      # load_errors uses raw add/square/sum on CPU/GPU to propagate I/O failures, and
+      # load_progress copies CPU Load bytes. Neither target executes a learned module.
+      - run: cargo test -p pmetal-mlx-rs --test load_errors --test load_progress -- --test-threads=1
